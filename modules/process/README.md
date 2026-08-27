@@ -8,19 +8,19 @@
 
 ## 负责什么
 
-- 进程入口（未来的 `main`）：命令行/环境解析、部署配置装载、按固定顺序初始化与析构全部模块。
-- 配置装载与编译：把人类可读配置经 Schema 校验、按 `Engine -> Platform -> Server -> Product -> Environment -> User/Session` 固定层级合并，编译为**不可变配置快照**并分发给各模块；生产环境只接受带 Hash/签名的版本切换，切换在 Tick 边界原子生效（切换时机由 [pacing](../pacing/README.md) 协调）。
-- 信号处理：SIGTERM/SIGINT 触发优雅关闭流程；不可捕获信号（SIGKILL）依赖崩溃恢复路径兜底。
-- 退出码约定：按"正常退出 / 优雅维护退出 / 配置或校验失败 / 进程级故障"分类，供进程管理器与运维脚本判定重启策略。
-- 进程级 Watchdog：汇聚各模块心跳（Slot 级 Watchdog 归 [world-slot](../world-slot/README.md)），判定进程整体失活并触发自愈或退出。
-- 崩溃处置：安装 panic hook；进程级故障（OOM、Stack Overflow、CoreCLR 崩溃、Native UB）发生时写 crash marker、触发 Failure Bundle 装配（经 [observability](../observability/README.md)），下次启动时进入恢复流程（见 [modules/README.md](../README.md) §6.5）。
+- 进程入口（未来的 `main`）：命令行/环境解析、部署配置装载、按固定顺序初始化与析构全部模块；组装期完成全部类型化端口接线（如 auth 的 `ReplayStorm` 到 transport、host-runtime 的监督事件到本模块）。
+- 配置装载与编译：把人类可读配置经 Schema 校验、按 `Engine -> Platform -> Server -> Product -> Environment -> User/Session` 固定层级合并，编译为**不可变配置快照**并分发给各模块；生产环境只接受带 Hash/签名的版本切换，切换请求经 [world-slot](../world-slot/README.md) 聚合命令送达，由其 Simulation Owner Thread 在 Tick Barrier 上原子应用（Tick 边界事实由 [pacing](../pacing/README.md) 的判定结果供给，无回调注册）。
+- 信号处理：SIGTERM/SIGINT 触发优雅关闭流程（对聚合根下发 `QuiesceForShutdown`）；不可捕获信号（SIGKILL）依赖崩溃恢复路径兜底。
+- 退出码约定：按"正常退出 / 优雅维护退出 / 配置或校验失败 / 进程级故障"分类，供进程管理器与运维脚本判定重启策略；退出证据经 [control-plane-adapter](../control-plane-adapter/README.md) 报告（`ReadyToExit` 是控制面激活目标实例的前置证据，架构源 ADR-012）。
+- 进程级 Watchdog：汇聚各模块心跳与 [host-runtime](../host-runtime/README.md) 的 `TaskPanicked` 监督事件（Slot 级 Watchdog 归 [world-slot](../world-slot/README.md)；阈值属 SRV-D-016），判定进程整体失活并触发自愈或退出。
+- 崩溃处置：安装 panic hook；进程级故障（OOM、Stack Overflow、CoreCLR 崩溃、Native UB，`FaultClass.ProcessFault`）发生时写 crash marker、触发 Failure Bundle 装配（经 [observability](../observability/README.md)），下次启动时进入恢复流程（见 [modules/README.md](../README.md) §6.5）。
 
 ## 明确不负责什么
 
-- 不做任何网络 IO、Envelope 解析或连接管理（归 [network](../network/README.md)）。
+- 不做任何网络 IO、Envelope 解析或连接管理（归 [transport](../transport/README.md)）。
 - 不定义配置格式契约与 Table Reader（归 `LumioGameRuntime`，架构源 ADR-010）；本模块只做装载、校验、编排与分发。
 - 不拥有 Tick 触发（归 [pacing](../pacing/README.md)）、CoreCLR 生命周期（归 [coreclr-host](../coreclr-host/README.md)）、Slot 状态机（归 [world-slot](../world-slot/README.md)）。
-- 不决定维护命令语义与滚动更新状态（归 [maintenance](../maintenance/README.md)、[release-router](../release-router/README.md)）；进程只是被编排的执行单元。
+- 不决定维护命令语义与滚动更新状态（归 [maintenance-agent](../maintenance-agent/README.md)、[release-agent](../release-agent/README.md)）；进程只是被编排的执行单元。
 
 ## 拥有的状态与资源
 
@@ -37,18 +37,18 @@
 
 ## 上游与下游依赖
 
-- **上游（调用本模块）**：操作系统进程管理器/容器编排（外部）；无仓内上游。
-- **下游（本模块调用）**：作为组装根按序初始化全部模块；运行期只依赖 [host-profiles](../host-profiles/README.md)（Preset 解析）与 [observability](../observability/README.md)（事件与 Failure Bundle）。
+- **上游（调用本模块）**：操作系统进程管理器/容器编排（外部，经 [control-plane-adapter](../control-plane-adapter/README.md) 的命令通道与信号）；无仓内上游。
+- **下游（本模块调用）**：作为组装根按序初始化全部模块；运行期依赖 [host-profiles](../host-profiles/README.md)（Preset 解析）、[host-runtime](../host-runtime/README.md)（监督事件汇聚）、[world-slot](../world-slot/README.md)（关闭/配置切换的聚合命令）、[control-plane-adapter](../control-plane-adapter/README.md)（状态上报）与 [observability](../observability/README.md)（事件与 Failure Bundle）。
 
 ## 生命周期与状态机
 
 ```text
-Starting    — 配置编译、observability 初始化、host-profiles 解析
-Ready       — release-router/coreclr-host/world-slot 初始化完成
-Serving     — network 监听、session 开放 Admission
-Draining    — 收到关闭信号或维护指令，停止新接入
+Starting    — 配置编译、host-runtime 初始化（最早）、observability 初始化、host-profiles 解析
+Ready       — release-agent/coreclr-host/world-slot 初始化完成
+Serving     — transport 监听、Host Admission Gate 开启（world-slot）
+Draining    — 收到关闭信号或维护指令，聚合根关闸停止新接入
 Stopping    — 落盘完成，逐模块析构
-Exited      — 按分类退出码退出
+Exited      — 按分类退出码退出，退出证据已报告
 任一活动状态 -> Faulted — 写证据后按故障处置退出
 ```
 
@@ -99,4 +99,5 @@ Exited      — 按分类退出码退出
 
 ## 尚未批准的决策门
 
-- 无本模块专属决策门。受 D-005（恢复窗口影响关闭落盘等待策略）与 SRV-D-010（Graceful deadline 决定 Draining 上限）间接约束；进程级 Watchdog 心跳阈值随 SRV-D-003 的测量结论一并确认（登记见 [modules/README.md](../README.md) §11.2）。
+- **SRV-D-016**（进程级 Watchdog 心跳源、失活窗口与自愈动作）：临时默认值为全部具名线程心跳 + 10 秒失活窗口 + 失活即按进程级故障退出；与 SRV-D-003（Slot 级）分别测量确认。登记见 [modules/README.md](../README.md) §11.2。
+- 受 D-005（恢复窗口影响关闭落盘等待策略）与 SRV-D-010（Graceful 宽限窗口决定 Draining 上限）间接约束。

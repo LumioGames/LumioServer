@@ -9,8 +9,8 @@
 
 `LumioServer` 是 Rust Dedicated Server Host 与网络基础设施，拥有连接、Release Pool、WorldSlot、Host pacing、CoreCLR Hosting、滚动更新和维护生命周期。
 
-- 当前架构基线是 `LGE-V1.0-2026-08-27`；公共架构与契约的唯一来源是 `LumioGameEngineArchitecture`，本仓只保存只读镜像。
-- 本仓拥有进程、连接、路由和运维编排，不拥有 ECS/Voxel 内部权威状态或 Gameplay 语义。
+- 当前架构基线是 `LGE-V1.2-2026-08-27`；公共架构与契约的唯一来源是 `LumioGameEngineArchitecture`，本仓只保存只读镜像。
+- 本仓拥有进程、连接、Release 身份代理和运维编排（集群期望状态归外部控制面），不拥有 ECS/Voxel 内部权威状态或 Gameplay 语义。
 - 开工前先读 [`repository-architecture.md`](knowledge/standards/repository-architecture.md)；详细模块边界见根 [`README.md`](../README.md)。
 
 ## 调度核心

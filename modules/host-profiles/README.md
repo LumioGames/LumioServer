@@ -17,7 +17,7 @@
 
 ## 明确不负责什么
 
-- 不实现任何传输（归 [network](../network/README.md)）；本模块只声明该 Profile 使用哪类传输 Adapter。
+- 不实现任何传输（归 [transport](../transport/README.md)）；本模块只声明该 Profile 使用哪类传输 Adapter。
 - 不定义 Capability Schema（归架构源）；不新增 Capability 语义——新增能力位必须先在架构源走 ADR/Schema 流程。
 - 不做 Gameplay 分支：Gameplay 只读取 Role、Capability 和 Port。
 - 不拥有 Client 侧 Preset（`MobileLocal` 的 Client 实现归 `LumioClient`）；本模块只关心其中 Server Role 的含义。
@@ -36,7 +36,7 @@
 
 ## 上游与下游依赖
 
-- **上游**：[process](../process/README.md)（启动装配）、[network](../network/README.md)（传输/故障注入 Profile）、[auth](../auth/README.md)（权限相关能力位）、[coreclr-host](../coreclr-host/README.md)（Native/Runtime 能力位）、[session](../session/README.md)（激活前匹配，经 release-router 的 Capability 校验链）。
+- **上游**：[process](../process/README.md)（启动装配）、[transport](../transport/README.md)（传输/故障注入 Profile）、[auth](../auth/README.md)（权限相关能力位）、[coreclr-host](../coreclr-host/README.md)（Native/Runtime 能力位）、[session](../session/README.md)（激活前匹配，经 [release-agent](../release-agent/README.md) 的 Capability 校验链）。
 - **下游**：仅 [observability](../observability/README.md)（记录匹配失败事件）。本模块不得回调任何上层模块。
 
 ## 生命周期与状态机

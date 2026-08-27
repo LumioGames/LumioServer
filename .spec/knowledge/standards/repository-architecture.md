@@ -11,12 +11,12 @@ metadata:
 ## 规范来源与优先级
 
 - Agent 的开发流程、测试政策和交付规则以 `.spec/` 为权威。
-- 模块边界以根 [`README.md`](../../../README.md) 为本仓入口；共享架构以 `LumioGameEngineArchitecture` 的 `LGE-V1.0-2026-08-27` 为唯一来源，本仓 [`架构镜像`](../../../docs/architecture/LumioGameEngine_Architecture_v1.0.md) 只读。
+- 模块边界以根 [`README.md`](../../../README.md) 为本仓入口（模块地图见 [`modules/README.md`](../../../modules/README.md)）；共享架构以 `LumioGameEngineArchitecture` 的 `LGE-V1.2-2026-08-27` 为唯一来源，本仓 [`架构镜像`](../../../docs/architecture/LumioGameEngine_Architecture_v1.2.md) 只读。
 - 冲突时不得在 Host 内自行改写公共 Envelope/Release/Capability；先在架构源完成 ADR、Schema、Fixture 和新 Baseline。
 
 ## 所有权边界
 
-- 本仓拥有进程、连接、Endpoint、Admission、Release Pool 路由、WorldSlot、Host Wall Clock/pacing、CoreCLR Hosting、滚动更新、维护和资源配额。
+- 本仓拥有进程、连接、Endpoint、Admission、本 Pool 成员状态与健康检查、WorldSlot 聚合根、Host Wall Clock/pacing、CoreCLR Hosting、滚动更新与维护的本进程侧执行、资源配额；集群期望状态（Pool 存在性、Release 指派、实例替换）归外部控制面（架构源 ADR-012）。
 - Runtime 拥有 Tick 内语义与 ECS/Coordinator，VoxelEngine 拥有 Voxel 状态，Game 拥有玩法；Host 只驱动与编排，不直接改权威领域状态。
 - 网络回调只进入有界队列；权威变化在 Runtime 固定 Tick Barrier 应用。
 - LocalEmbedded 可以绕过 Socket/TLS/OS 网络栈，但不能绕过 Schema、Codec、Envelope、权限、大小限制、队列或 Tick 交付。
