@@ -1,108 +1,168 @@
 # LumioServer
 
-> Rust Dedicated Server Host、网络基础设施与服务器生命周期编排。
+> Rust Dedicated Server Host、网络基础设施、Release Pool、WorldSlot 和服务器运维生命周期。
 
-## 定位
+## 架构基线
 
-`LumioServer` 拥有服务器唯一进程入口、Connection/Session、World Slot、网络传输和 CoreCLR Hosting。装入同一 `GameReleaseId` 的 Server Gameplay、配置和内容后，它才成为具体游戏的 Dedicated Server。
+- Baseline：`LGE-V1.0-2026-08-27`
+- 唯一架构源：`LumioGameEngineArchitecture`
+- 本地镜像：[`docs/architecture/LumioGameEngine_Architecture_v1.0.md`](docs/architecture/LumioGameEngine_Architecture_v1.0.md)
 
-它也提供可被 `LocalEmbedded` 使用的 Server Role Host；Local 是同进程双角色，不是共享 ECS World，也不是 Listen Server。
+`LumioServer` 拥有服务器进程、连接、Release 路由、WorldSlot、Host Pacing、CoreCLR Hosting、滚动更新和强制维护。它加载稳定 Runtime 与 Server Gameplay，但不拥有 ECS/Voxel 内部状态，也不定义 Gameplay 语义。
 
-总架构基线见 [`docs/architecture/LumioGameEngine_Architecture_v0.3.md`](docs/architecture/LumioGameEngine_Architecture_v0.3.md)。
+## Architecture Gate
 
-Dedicated Server Host、网络、进程治理和 CoreCLR Hosting 统一使用 Rust；Server Gameplay 通过 CoreCLR 以 C# 热更程序集加载，不能把具体玩法编译进 Rust Host。
+ReleaseCatalog/Manifest、Envelope、Maintenance、Logging Event、Host Capability 和失败恢复契约以 `LumioGameEngineArchitecture` 为唯一来源。网络、路由、滚动更新或维护命令变更必须补齐正向/失败 Fixture，并在架构源执行 `python3 tools/lumio_contract.py validate`；目标 Pool 之外的产品/Release 不得被默认影响。
 
 ## 拥有的状态与生命周期
 
-- 进程、监听 Endpoint、Connection、Session、认证状态、重连窗口、限流和背压状态。
-- `WorldSlot -> SimulationSession` 生命周期、Tick Clock、资源预算和优雅停服状态。
-- 每个 Session 的 Server `GameWorld`、权威 `VoxelWorld`、Replication Context、Snapshot Metadata 和 Migration 状态（数据由 Runtime/Voxel Port 拥有）。
-- CoreCLR、Stable Runtime、Server Gameplay Assembly 的启动、激活、热更和升级编排状态。
+- 进程、监听 Endpoint、认证、Connection、Session Admission、重连窗口、限流和背压。
+- `ReleaseCatalog`、Release Pool、健康检查、路由、Drain、Rollback 和维护状态。
+- `WorldSlotHost`、资源配额、Watchdog、Persistence Host 和 Crash Recovery 编排。
+- CoreCLR、稳定 Runtime、Server Gameplay Assembly 的启动、激活、重载和关闭流程。
+- Host Wall Clock、Tick pacing、Ingress/Egress 队列和运维状态。
+
+Runtime 拥有 Logical Tick、GameWorld 和 Coordinator；VoxelEngine 拥有 VoxelWorld；Server 保存句柄、Context、Snapshot 元数据和编排状态，不直接访问内部 Storage。
+
+## 子模块
+
+| 子模块 | 责任 | 首批状态 |
+| --- | --- | --- |
+| `process` | 进程入口、信号、退出码、Crash/Watchdog | P0 |
+| `network` | Reactor、Envelope、可靠性、分片、认证和限流 | P0 |
+| `session` | Admission、Connection、重连和 Session 路由 | P0 |
+| `release-router` | Catalog、Pool、健康检查、版本固定和路由 | P1 |
+| `world-slot` | Slot 生命周期、Quota、隔离和诊断 | P0 |
+| `pacing` | Wall Clock、Tick 驱动、暂停和 Deadline | P0 |
+| `coreclr-host` | 稳定 Runtime、ALC、Gameplay 启停和异常转换 | P0 |
+| `persistence-host` | Snapshot/WAL/Command Log、Checkpoint 和恢复 | P1 |
+| `maintenance` | 滚动更新、Drain、强制维护、踢人和回滚 | P1 |
+| `observability` | Async Log Sink、Audit、Metrics、Trace、Failure Bundle | P1 |
+| `headless` | DS/Local/Split Process/Bot Test Host | P1 |
 
 ## 职责
 
-- 启动配置、Endpoint、端口监听、World Slot、资源预算、Watchdog、Health、日志、Metrics 和 Crash 信息。
-- Connection/Session、握手、超时、重连、可靠/不可靠通道、Buffer Pool、限流和背压。
-- RPC 传输信封、MessageId、RequestId、路由、优先级、包大小和流控校验；Gameplay Payload 保持不透明。
-- 统一加载 `LumioCoreEngine` 平台 Native 包，创建 VoxelWorld Port，并托管 `LumioGameRuntime`/CoreCLR。
-- 驱动权威 Server `GameWorld` Tick、Cross-World Prepare/Commit、Snapshot/Replication 和生产升级顺序。
-- 提供 DS、LocalEmbedded Server Role、Split-Process Test Host 和 Bot Test Endpoint。
+- 启动配置、Endpoint、WorldSlot、健康检查、资源预算、Watchdog、日志和 Metrics。
+- 收包、Envelope/Release/权限校验、可靠/不可靠通道、Ack、重传、分片、认证、防重放和背压。
+- 将网络/IO/Native Completion 通过有界 Queue/Batch 交给 Runtime Tick，网络线程不得调用 Gameplay。
+- 统一加载一个 `LumioCoreEngine` 平台包、托管 Runtime 和 Server Gameplay ALC。
+- 驱动 Host Wall Clock；在 Runtime 规定的 Phase 入口调用逻辑 Tick。
+- 编排 Release Catalog、版本池、Session 排空、强制维护、Snapshot/WAL 落盘和恢复。
+- 提供 Dedicated、LocalEmbedded Server Role、LocalSplitProcess、Headless Bot Endpoint。
 
 ## 明确不负责什么
 
-- 不决定技能、物品、战斗、建筑、经济或其他 Gameplay 语义。
-- 不创建、销毁或直接访问 ECS Storage；只驱动 Runtime API 和生成契约。
-- 不实现 Voxel Chunk/Mutation 内部逻辑，不直接链接多个 NativeCore/VoxelEngine 动态库。
-- 不持有 Client Gameplay、Renderer 或 `LumioGame` 源码，不把网络线程直接调用 Hot Gameplay。
-- 不替玩法作者判断 Server/Client 状态是否兼容；只校验 Manifest、Schema、ABI 和 Migration Hook。
+- 不决定技能、物品、战斗、建筑、经济、任务或其他 Gameplay 语义。
+- 不创建、销毁或直接访问 ECS Storage；只调用 Runtime API 和生成契约。
+- 不实现 Voxel Chunk/Mutation 内部逻辑，不加载第二套 Native 包。
+- 不拥有 Logical Tick Phase、Replication Mapping、Client Prediction 机制或 Game Content。
+- 不在网络线程直接调用 Hot Gameplay，不把第三方网络类型写入稳定契约。
 
-## 对外产物与契约
+## 线程、队列与资源治理
 
-- `lumio-server` DS 可执行文件、容器镜像、配置模板和平台包。
-- Connection/Session、RPC Envelope、Endpoint、Health/Metrics、WorldSlot 和 Host API 契约。
-- `ServerHostManifest`：Core Engine、Runtime、网络协议、CoreCLR、GameRelease、平台和 Artifact Hash。
-- LocalEmbedded/Headless Host、Replay/Command Stream、资源预算和故障注入工具。
+```text
+Network Reactor(s)
+  -> bounded per-session Ingress
+  -> Simulation Owner Thread per active WorldSlot
+  -> bounded Native Job Pool / Completion Queue
+  -> IO/Persistence workers
+  -> bounded Egress Queue
+  -> Network Send
+```
+
+每个队列都有容量、优先级、满载动作和 Metrics；可靠积压超阈值时降级或断开，不能无限增长。Native Completion 只在 Tick Barrier 应用。V1 建议一个 active WorldSlot/进程，保留多 Slot 接口但明确共享故障域；OOM、CoreCLR 崩溃和 Native UB 按进程级故障处理。
+
+## Network 与 Session 契约
+
+Envelope 至少包含 `ProtocolVersion、Length、Sequence、SessionId、ProductId、GameReleaseId、MessageType、Reliability、Integrity、TraceId`。Transport ACK 和 Replication Baseline ACK 分开；未知 Baseline、Gap、旧 Revision、Schema/Release 不匹配进入稳定错误和 Full Resync/拒绝路径。
+
+Session 一旦建立就固定 `ProductId + GameReleaseId`。Server 只保存远端 Client 的 Connection/Replication Context；Client ReplicaWorld 不属于 Server WorldSlot 的物理对象。
+
+## Release Catalog、滚动更新与维护
+
+`ReleaseCatalog` 是签名版本清单，记录 `ProductId + GameReleaseId`、Artifact、Capability、Endpoint、Pool 状态和兼容判定。一个进程/Runtime 只加载一个 Release，但同一集群/机器可运行多个 Release Pool，因此 A 1.1 与 BOE 2.1 可以并行服务。
+
+滚动更新状态：
+
+```text
+Published -> Verified -> Warmup -> Serving
+Old Serving -> Draining -> Empty -> Retired
+任一阶段 -> Rollback / Faulted
+```
+
+新 Pool 健康检查通过后接收新 Session；旧 Pool 停止新接入并服务已有 Session，直到自然排空、显式迁移或期限到达。V1 不要求在线 Session 无感跨 Release 迁移。
+
+维护命令携带 `ProductId + GameReleaseId + ReleasePoolId` 作用域，默认不影响其他产品/Release；命令分为两种：`Graceful` 停止新接入、广播原因/截止时间、排空事务并完成 Snapshot/WAL/Audit 落盘，超时后以 `MaintenanceKick` 踢出目标 Pool 的全部剩余连接；`Forced` 立即停止新输入和 Tick 提交，尽最大努力写入 WAL/Failure Bundle 后广播 `MaintenanceKick` 并踢出目标 Pool 的全部用户。恢复时只重放带有 WAL 提交标记的命令，未提交命令视为未生效。两种模式都关闭目标旧实例、启动目标 Release，并将断开、失败和恢复动作写入 Audit/Failure Bundle。
+
+## CoreCLR、Hot Reload 与故障隔离
+
+一个进程只启动一个稳定 CoreCLR；Server Gameplay 使用 Collectible ALC 和 Runtime `GameplayModuleScope`。Host 负责 Quiesce、Cancel、Drain、Dispose、Root 验证和卸载。可捕获 Gameplay Exception 可隔离为 Session Fault；Stack Overflow、OOM、CoreCLR 崩溃和 Native UB 是进程级故障，必须从最近有效 Snapshot 恢复或重启。
+
+## 持久化、日志与配置
+
+- Persistence Host 以版本化 Snapshot + WAL/Command Log 为基础；本地文件/目录权威，备份对象存储/数据库通过 Adapter。
+- 权威确认前按部署策略保证可恢复；Checkpoint 使用校验、压缩、原子替换和保留策略。
+- Server 使用成熟 Rust 日志生态的异步多线程 Sink；Error/Fatal 有同步应急落盘。
+- Diagnostic、Audit、Txn Journal、Command Log、Metrics、Trace 分开保存，共享 Product/Release/Pool/Maintenance/Session/World/Tick/Txn/Trace 关联。
+- 配置在启动时编译并生成不可变快照；生产只通过签名版本显式切换，不能在半 Tick 中修改。
 
 ## Source / Compile-Time Dependencies
 
-- Rust toolchain、网络/IO/日志基础 crates。
-- `LumioCoreEngine` 统一 Native 平台产物和生成 Header；不直接以源码形式依赖 `LumioNativeCore` 或 `LumioVoxelEngine`。
-- `LumioGameRuntime` 的稳定 Managed Host/ABI；不编译依赖 `LumioClient` 或 `LumioGame` 源码。
+- Rust toolchain、网络/IO/日志基础 crates 和平台 SDK。
+- `LumioCoreEngine` 统一 Native 包与生成 Header；不直接依赖 NativeCore/VoxelEngine 源码。
+- `LumioGameRuntime` 稳定 Managed Host/ABI；不编译依赖 Client 或 Game 实现源码。
+- Release/Gameplay Payload 只通过版本化契约消费。
 
 ## Generated Contract Dependencies
 
-消费 RPC Envelope、MessageId、Endpoint、Core Engine Capability、Voxel Port 和 Game Gameplay Contract 的生成物。Gameplay Payload 由 Game 定义并由网络层按长度、版本和权限做不透明转发。
+消费 Root ABI、Capability、Error、RPC Envelope、MessageId、Host、Voxel Port 和 Game Gameplay Contract 生成物。Server 只验证长度、版本、权限和 Hash，不重新定义 Component/Mapping Schema。
 
 ## Runtime Loading Relationships
 
 ```text
 lumio-server / LocalEmbedded ServerRoleHost
-  -> LumioCoreEngine (one unified native package)
-  -> LumioGameRuntime stable host + CoreCLR
-  -> ServerGameplay.dll + Game Config/Content
-  -> Server GameWorld + authoritative VoxelWorld
+  -> ReleaseCatalog + CoreEngine Loader (one package)
+  -> stable Runtime + CoreCLR
+  -> ServerGameplay.dll + Config/Content
+  -> Server GameWorld/VoxelWorld handles
 ```
-
-网络线程、IO 线程和 Rust Job 线程通过 Typed Queue/Batch 与托管 Tick 交互，不直接进入 Hot Gameplay。
 
 ## Release Composition Relationships
 
-DS 发行包由 `LumioGame` 锁定并组装：Server Host、一个 CoreEngine 平台包、Runtime、Server Gameplay Assembly、生成契约、配置、内容、Manifest 和签名。Server 与 Client 必须使用同一 `GameReleaseId` 同步换包；Server 负责编排升级、失败恢复和启动拒绝。
+`LumioGame` 组装 Server Host、CoreEngine、Runtime、Server Gameplay、生成契约、Config/Content、Migration、Manifest 和签名。Server 负责启动校验、Release 路由、升级、维护和失败恢复，不负责玩法兼容语义。
 
 ## Room Modes / Host Profiles
 
-| RoomMode | Host Profile | Endpoint/进程关系 |
-| --- | --- | --- |
-| `Online` | `PublicDedicatedServer` | 公共 DS Endpoint。 |
-| `Online` | `PlayerHostedDedicatedServer` | 玩家启动的独立 DS 进程 Endpoint。 |
-| `Online` | `LocalhostDedicatedServer` | 本机独立 DS 进程 Endpoint。 |
-| `Singleplayer` | `LocalEmbedded` | 同一进程实例化 Server Role，通过 InMemoryTransport 对接 Client Role。 |
-
-玩家选择的是 `RoomMode + HostProfile`；Endpoint 只区分 DS 发现/位置，不改变 Gameplay 代码。移动端第一阶段可加入远程 DS，但不启动 Player-hosted DS。
+支持 `PublicDedicatedServer`、`PlayerHostedDedicatedServer`、`LocalhostDedicatedServer` 和 `LocalEmbedded` Server Role；测试 Host 还包括 `PureHeadless`、`NativeHeadless`、`LocalSplitProcess`、`RemoteDS`。Listen Server 不是 V1 目标；Player-hosted 始终是独立 DS 进程。
 
 ## Headless Test Surface
 
-- DS 启停、WorldSlot/Session、握手、重连、超时、限流、背压、包大小和故障注入。
-- `LocalEmbedded`、`LocalSplitProcess`、`RemoteDS`、Bot 连接和网络抖动测试。
-- 服务器 Tick/Replication/资源预算、CPU/内存/网络 p95/p99 和约 100 名真实玩家基线。
-- Core Engine/Runtime/Game Manifest 校验、Hot Reload、Migration、崩溃恢复和 Replay 重放。
+- DS 启停、Admission、握手、重连、Session/WorldSlot、Tick pacing、Quota、Watchdog 和维护。
+- Wire Envelope、可靠性、分片、Ack、限流、背压、认证、防重放和网络故障注入。
+- LocalEmbedded 的同 Codec/同权限/有界队列保真度，以及 LocalSplitProcess 端口/进程隔离。
+- Release Catalog、Hash/Signature/Capability 拒绝、滚动更新、Drain、强制踢人和 Rollback。
+- Snapshot/WAL 恢复、磁盘满、OOM、CoreCLR/ALC/Native 故障、日志背压和 Failure Bundle。
+- 1/10/25/50/100/150/200 玩家 Workload，记录 Tick p50/p95/p99、CPU、RSS、GC、队列和网络。
 
 ## Version / Manifest
 
-- Server Host、网络协议、CoreCLR Host 和 Game Release 分别记录版本；生产包使用不可变 Hash。
-- 启动校验 Server/Client `GameReleaseId`、Gameplay Schema、Runtime API、Core Engine ABI/Capability 和 Voxel Migration。
-- Endpoint 元数据不改变 Release 兼容矩阵；拒绝不匹配客户端并记录可诊断错误。
+`ServerHostManifest` 至少包含 Product/GameRelease、Server Host、Runtime、CoreEngine、Network/Replication Protocol、Platform、Artifact Hash、Capability、Config/Content、Migration、Signature 和 SBOM。握手和启动精确校验；不匹配时返回稳定错误。
+
+## 开源优先与供应链
+
+优先采用成熟开源的 Reactor、TLS、日志、配置、序列化、指标和进程治理框架。依赖通过 Adapter 隔离，锁定版本/Commit，检查许可证、漏洞、SBOM、AOT、确定性和性能；默认优先宽松许可证。
 
 ## 开发规范
 
-- 服务器权威 Tick 是唯一提交 Gameplay 结果的入口；网络回调只入队命令。
-- 所有资源预算、队列长度、Session 状态和失败路径必须有 Metrics 与 Headless 测试。
-- 不在 Host 层复制 Gameplay 规则；用生成契约做长度、版本、权限和能力校验。
-- 升级顺序固定为停接入、冻结 Tick、导出 Snapshot、执行 Game/Voxel Migration、校验 Manifest、启动新 Release。
-- LocalEmbedded 必须走与 DS 相同的 Server Role API 和消息边界，以保证测试与生产路径一致。
+- Host 只负责时钟、进程、连接和编排；权威状态变更必须进入 Runtime Tick Barrier。
+- 网络回调只入有界队列，错误映射为可重试、可拒绝、可致命三类。
+- 升级不覆盖旧 Release/Snapshot；所有操作可审计、可恢复、可回放。
+- 资源配额、队列和维护超时必须有 Metrics 与故障测试。
 
-## 当前阶段任务
+## 当前阶段与开发节奏
 
-- 建立 CoreEngine 单包加载、CoreCLR Hosting、Server Role 和 LocalEmbedded 最小闭环。
-- 实现 Connection/Session/WorldSlot、InMemoryTransport、Replay 和故障注入 Headless 测试。
-- 冻结 DS Host Manifest、Endpoint、升级编排和 100 玩家性能基线。
+1. **Architecture Gate**：冻结 Host/Runtime 所有权、线程/队列、Envelope、Manifest、维护状态机。
+2. **Foundation**：实现进程、Reactor、CoreCLR Smoke、WorldSlot 单实例和有界队列。
+3. **Vertical Slice**：接入 Runtime/Voxel/Game，跑通 LocalEmbedded、Snapshot/WAL、Release 拒绝和 Replay。
+4. **Production Hardening**：Release Pool 滚动更新、强制维护、Crash Recovery、RemoteDS、Soak 和 100 人基线。
+5. **P2**：多 Slot 共享、自动扩缩、Server HybridCLR、跨服和 Sharding；不改变 V1 Session 版本固定规则。
