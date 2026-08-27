@@ -26,19 +26,22 @@ Runtime 拥有 Logical Tick、GameWorld 和 Coordinator；VoxelEngine 拥有 Vox
 
 ## 子模块
 
+模块架构总入口见 [modules/README.md](modules/README.md)（模块地图、依赖方向、线程/队列拓扑、核心流程与决策门）；各模块边界契约在各自 README。
+
 | 子模块 | 责任 | 首批状态 |
 | --- | --- | --- |
-| `process` | 进程入口、信号、退出码、Crash/Watchdog | P0 |
-| `network` | Reactor、Envelope、可靠性、分片、认证和限流 | P0 |
-| `session` | Admission、Connection、重连和 Session 路由 | P0 |
-| `release-router` | Catalog、Pool、健康检查、版本固定和路由 | P1 |
-| `world-slot` | Slot 生命周期、Quota、隔离和诊断 | P0 |
-| `pacing` | Wall Clock、Tick 驱动、暂停和 Deadline | P0 |
-| `coreclr-host` | 稳定 Runtime、ALC、Gameplay 启停和异常转换 | P0 |
-| `persistence-host` | Snapshot/WAL/Command Log、Checkpoint 和恢复 | P1 |
-| `maintenance` | 滚动更新、Drain、强制维护、踢人和回滚 | P1 |
-| `observability` | Async Log Sink、Audit、Metrics、Trace、Failure Bundle | P1 |
-| `headless` | DS/Local/Split Process/Bot Test Host | P1 |
+| [`process`](modules/process/README.md) | 进程入口、信号、退出码、配置快照、Crash/Watchdog | P0 |
+| [`network`](modules/network/README.md) | Reactor、Envelope、可靠性、分片、限流和背压 | P0 |
+| [`auth`](modules/auth/README.md) | 认证、票据、防重放和连接级权限 | P0 |
+| [`session`](modules/session/README.md) | Admission、Connection、重连和 Session 路由 | P0 |
+| [`release-router`](modules/release-router/README.md) | Catalog、Pool、健康检查、版本固定和路由 | P1 |
+| [`world-slot`](modules/world-slot/README.md) | Slot 生命周期、Quota、隔离和诊断 | P0 |
+| [`pacing`](modules/pacing/README.md) | Wall Clock、Tick 驱动、暂停和 Deadline | P0 |
+| [`coreclr-host`](modules/coreclr-host/README.md) | 稳定 Runtime、ALC、Gameplay 启停和异常转换 | P0 |
+| [`persistence-host`](modules/persistence-host/README.md) | Snapshot/WAL/Command Log、Checkpoint 和恢复 | P1 |
+| [`maintenance`](modules/maintenance/README.md) | 滚动更新、Drain、强制维护、踢人和回滚 | P1 |
+| [`observability`](modules/observability/README.md) | Async Log Sink、Audit、Metrics、Trace、Failure Bundle | P1 |
+| [`host-profiles`](modules/host-profiles/README.md) | Capability/Preset、LocalEmbedded 保真、DS/Split/Bot 测试 Host 组装 | P1 |
 
 ## 职责
 
