@@ -1,0 +1,122 @@
+[
+  {
+    "module": "process",
+    "priority": "P0",
+    "layer": "组装根",
+    "crate": "lumio-server-process（同一 package：薄 `lib` + `lumio-server` binary）",
+    "responsibility": "进程入口、配置、信号、进程级 Watchdog、显式端口接线、退出",
+    "task_count": 3
+  },
+  {
+    "module": "host-runtime",
+    "priority": "P0",
+    "layer": "基础",
+    "crate": "lumio-host-runtime",
+    "responsibility": "单调时钟、Timer 投递、取消树、监督、有界执行/端口",
+    "task_count": 3
+  },
+  {
+    "module": "transport",
+    "priority": "P0",
+    "layer": "平台",
+    "crate": "lumio-transport",
+    "responsibility": "连接注册表、Envelope 机械校验、Ingress/Egress、carrier adapters",
+    "task_count": 4
+  },
+  {
+    "module": "auth",
+    "priority": "P0",
+    "layer": "平台",
+    "crate": "lumio-auth",
+    "responsibility": "不透明凭据验证、防重放、principal/grant、认证审计事实",
+    "task_count": 2
+  },
+  {
+    "module": "session",
+    "priority": "P0",
+    "layer": "编排",
+    "crate": "lumio-session",
+    "responsibility": "ServerConnectionSession、接纳 saga、Release 固定、重连、opaque handle",
+    "task_count": 3
+  },
+  {
+    "module": "world-slot",
+    "priority": "P0",
+    "layer": "编排",
+    "crate": "lumio-world-slot",
+    "responsibility": "WorldSlotHost 聚合根、epoch、Gate、owner thread、FaultClass 裁决",
+    "task_count": 4
+  },
+  {
+    "module": "pacing",
+    "priority": "P0",
+    "layer": "平台",
+    "crate": "lumio-pacing",
+    "responsibility": "单调 deadline 到 TickPermit；不拥有 Logical Tick",
+    "task_count": 2
+  },
+  {
+    "module": "coreclr-host",
+    "priority": "P0",
+    "layer": "平台",
+    "crate": "lumio-coreclr-host",
+    "responsibility": "官方 CoreCLR hosting、generated ABI、Managed owner-thread 入口",
+    "task_count": 3
+  },
+  {
+    "module": "release-agent",
+    "priority": "P1",
+    "layer": "编排",
+    "crate": "lumio-release-agent",
+    "responsibility": "本进程 Release 校验、ExactRelease、本地 member/health",
+    "task_count": 2
+  },
+  {
+    "module": "persistence-host",
+    "priority": "P1",
+    "layer": "平台",
+    "crate": "lumio-persistence-host",
+    "responsibility": "Snapshot/WAL/Txn/Cmd durable path、ack、checkpoint/recovery",
+    "task_count": 4
+  },
+  {
+    "module": "maintenance-agent",
+    "priority": "P1",
+    "layer": "编排",
+    "crate": "lumio-maintenance-agent",
+    "responsibility": "已验证维护命令的本进程退役编排、双 durable ack",
+    "task_count": 2
+  },
+  {
+    "module": "control-plane-adapter",
+    "priority": "P1",
+    "layer": "平台",
+    "crate": "lumio-control-plane-adapter",
+    "responsibility": "命令验证/fencing/idempotency与本地证据上报",
+    "task_count": 2
+  },
+  {
+    "module": "observability",
+    "priority": "P1",
+    "layer": "基础",
+    "crate": "lumio-observability",
+    "responsibility": "Diagnostic、Audit durable、Metrics/Trace、Failure Bundle",
+    "task_count": 3
+  },
+  {
+    "module": "host-profiles",
+    "priority": "P1",
+    "layer": "基础",
+    "crate": "lumio-host-profiles",
+    "responsibility": "Capability/Preset 到 immutable composition plan",
+    "task_count": 2
+  },
+  {
+    "module": "protocol-dispatch",
+    "priority": "封锁",
+    "layer": "编排",
+    "crate": "无 crate；不得创建 `Cargo.toml`、`src/` 或可编译 target",
+    "responsibility": "D-009 前零实现、零 API、零依赖",
+    "task_count": 1
+  }
+]

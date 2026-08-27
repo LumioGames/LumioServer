@@ -1,0 +1,107 @@
+{
+  "baseline": "LGE-V1.2-2026-08-27",
+  "generated_at": "2026-08-27",
+  "checks": {
+    "module_sections": {
+      "ok": true,
+      "errors": []
+    },
+    "task_format": {
+      "ok": true,
+      "errors": []
+    },
+    "wave_dependencies": {
+      "ok": true,
+      "errors": []
+    },
+    "same_wave_file_disjoint": {
+      "ok": true,
+      "errors": []
+    },
+    "unique_task_slugs": {
+      "ok": true
+    },
+    "module_count": {
+      "ok": true
+    },
+    "blocked_protocol_dispatch": {
+      "ok": true
+    },
+    "forbidden_tokens": {
+      "ok": true,
+      "hits": {
+        "TODO": [],
+        "TBD": [],
+        "status_completed": [],
+        "legacy_release_router": [],
+        "legacy_module_path_network": [],
+        "legacy_module_path_maintenance": []
+      }
+    },
+    "queue_contract_shape": {
+      "ok": true
+    },
+    "public_contract_owner": {
+      "ok": true
+    },
+    "local_links": {
+      "ok": true,
+      "errors": []
+    },
+    "compile_dag_acyclic": {
+      "ok": true,
+      "topological_order": [
+        "maintenance-agent",
+        "session",
+        "world-slot",
+        "persistence-host",
+        "pacing",
+        "coreclr-host",
+        "release-agent",
+        "control-plane-adapter",
+        "transport",
+        "auth",
+        "observability",
+        "host-runtime",
+        "host-profiles"
+      ]
+    },
+    "all_modules_have_task_or_block_guard": {
+      "ok": true,
+      "counts": {
+        "process": 3,
+        "host-runtime": 3,
+        "transport": 4,
+        "auth": 2,
+        "session": 3,
+        "world-slot": 4,
+        "pacing": 2,
+        "coreclr-host": 3,
+        "release-agent": 2,
+        "persistence-host": 4,
+        "maintenance-agent": 2,
+        "control-plane-adapter": 2,
+        "observability": 3,
+        "host-profiles": 2,
+        "protocol-dispatch": 1
+      }
+    },
+    "secret_scan": {
+      "ok": true,
+      "hits": {
+        "private_key": [],
+        "openai_style_key": [],
+        "jwt": []
+      }
+    }
+  },
+  "counts": {
+    "total_files": 73,
+    "module_designs": 15,
+    "task_cards": 51,
+    "queues_registered": 37,
+    "waves": 17,
+    "max_wave": 16
+  },
+  "ok": true
+}

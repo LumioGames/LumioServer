@@ -1,0 +1,376 @@
+{
+  "baseline": "LGE-V1.2-2026-08-27",
+  "compile_edges": [
+    {
+      "from": "maintenance-agent",
+      "to": "world-slot"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "session"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "release-agent"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "transport"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "persistence-host"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "control-plane-adapter"
+    },
+    {
+      "from": "session",
+      "to": "auth"
+    },
+    {
+      "from": "session",
+      "to": "release-agent"
+    },
+    {
+      "from": "session",
+      "to": "world-slot"
+    },
+    {
+      "from": "session",
+      "to": "transport"
+    },
+    {
+      "from": "release-agent",
+      "to": "transport"
+    },
+    {
+      "from": "release-agent",
+      "to": "control-plane-adapter"
+    },
+    {
+      "from": "world-slot",
+      "to": "coreclr-host"
+    },
+    {
+      "from": "world-slot",
+      "to": "pacing"
+    },
+    {
+      "from": "world-slot",
+      "to": "persistence-host"
+    },
+    {
+      "from": "world-slot",
+      "to": "transport"
+    },
+    {
+      "from": "transport",
+      "to": "host-profiles"
+    },
+    {
+      "from": "transport",
+      "to": "host-runtime"
+    },
+    {
+      "from": "transport",
+      "to": "observability"
+    },
+    {
+      "from": "auth",
+      "to": "host-profiles"
+    },
+    {
+      "from": "auth",
+      "to": "host-runtime"
+    },
+    {
+      "from": "auth",
+      "to": "observability"
+    },
+    {
+      "from": "pacing",
+      "to": "host-profiles"
+    },
+    {
+      "from": "pacing",
+      "to": "host-runtime"
+    },
+    {
+      "from": "pacing",
+      "to": "observability"
+    },
+    {
+      "from": "coreclr-host",
+      "to": "host-profiles"
+    },
+    {
+      "from": "coreclr-host",
+      "to": "host-runtime"
+    },
+    {
+      "from": "coreclr-host",
+      "to": "observability"
+    },
+    {
+      "from": "persistence-host",
+      "to": "host-profiles"
+    },
+    {
+      "from": "persistence-host",
+      "to": "host-runtime"
+    },
+    {
+      "from": "persistence-host",
+      "to": "observability"
+    },
+    {
+      "from": "control-plane-adapter",
+      "to": "host-profiles"
+    },
+    {
+      "from": "control-plane-adapter",
+      "to": "host-runtime"
+    },
+    {
+      "from": "control-plane-adapter",
+      "to": "observability"
+    },
+    {
+      "from": "session",
+      "to": "host-profiles"
+    },
+    {
+      "from": "session",
+      "to": "host-runtime"
+    },
+    {
+      "from": "session",
+      "to": "observability"
+    },
+    {
+      "from": "release-agent",
+      "to": "host-profiles"
+    },
+    {
+      "from": "release-agent",
+      "to": "host-runtime"
+    },
+    {
+      "from": "release-agent",
+      "to": "observability"
+    },
+    {
+      "from": "world-slot",
+      "to": "host-profiles"
+    },
+    {
+      "from": "world-slot",
+      "to": "host-runtime"
+    },
+    {
+      "from": "world-slot",
+      "to": "observability"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "host-profiles"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "host-runtime"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "observability"
+    },
+    {
+      "from": "observability",
+      "to": "host-runtime"
+    }
+  ],
+  "command_edges": [
+    {
+      "from": "外部控制面",
+      "to": "control-plane-adapter",
+      "contract": "签名/受信输入"
+    },
+    {
+      "from": "control-plane-adapter",
+      "to": "maintenance-agent",
+      "contract": "VerifiedMaintenanceCommand"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "world-slot",
+      "contract": "QuiesceForMaintenance / Resume（带 SlotEpoch）"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "session",
+      "contract": "KickRemaining"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "transport",
+      "contract": "Broadcast MaintenanceKick / Disconnect"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "release-agent",
+      "contract": "PoolMemberTransition（本地成员）"
+    },
+    {
+      "from": "process",
+      "to": "world-slot",
+      "contract": "QuiesceForShutdown / ConfigActivation"
+    },
+    {
+      "from": "world-slot",
+      "to": "pacing",
+      "contract": "Start/Pause/Resume/StopPacing"
+    },
+    {
+      "from": "world-slot",
+      "to": "coreclr-host",
+      "contract": "CoreCLR native bootstrap control + Owner-thread Managed entry"
+    },
+    {
+      "from": "world-slot",
+      "to": "persistence-host",
+      "contract": "PersistSnapshot / AppendWal / Checkpoint effect"
+    },
+    {
+      "from": "world-slot",
+      "to": "session",
+      "contract": "IsolateSession（仅 Runtime 见证 SessionLocalProven）"
+    },
+    {
+      "from": "session",
+      "to": "auth",
+      "contract": "Authenticate / Authorize"
+    },
+    {
+      "from": "session",
+      "to": "release-agent",
+      "contract": "MatchRelease"
+    },
+    {
+      "from": "session",
+      "to": "world-slot",
+      "contract": "Reserve/Bind/ReleaseSession"
+    },
+    {
+      "from": "session",
+      "to": "transport",
+      "contract": "Bind/Unbind/Disconnect"
+    },
+    {
+      "from": "定时语义所有者",
+      "to": "host-runtime",
+      "contract": "RegisterTimer / Cancel"
+    }
+  ],
+  "event_ack_edges": [
+    {
+      "from": "transport",
+      "to": "world-slot",
+      "contract": "IngressBatch（owner thread 拉取）"
+    },
+    {
+      "from": "transport",
+      "to": "session",
+      "contract": "HandshakeReady / ConnectionClosed（connId, epoch）"
+    },
+    {
+      "from": "pacing",
+      "to": "world-slot",
+      "contract": "TickPermit / pacing health"
+    },
+    {
+      "from": "coreclr-host",
+      "to": "world-slot",
+      "contract": "Managed result / ErrorCode + optional Runtime FaultClass witness"
+    },
+    {
+      "from": "world-slot",
+      "to": "session",
+      "contract": "GateStateChanged / SlotFaulted / admission ack"
+    },
+    {
+      "from": "world-slot",
+      "to": "maintenance-agent",
+      "contract": "Quiesce progress ack（带 epoch）"
+    },
+    {
+      "from": "world-slot",
+      "to": "process",
+      "contract": "Shutdown quiesce progress / ReadyToStop"
+    },
+    {
+      "from": "session",
+      "to": "maintenance-agent",
+      "contract": "DrainProgress / terminal ack"
+    },
+    {
+      "from": "persistence-host",
+      "to": "world-slot",
+      "contract": "CommitAck / DiskPressure"
+    },
+    {
+      "from": "persistence-host",
+      "to": "maintenance-agent",
+      "contract": "PersistenceCommitAck"
+    },
+    {
+      "from": "observability",
+      "to": "maintenance-agent",
+      "contract": "AuditDurableAck / AuditBackpressure"
+    },
+    {
+      "from": "observability",
+      "to": "world-slot",
+      "contract": "AuditBackpressure"
+    },
+    {
+      "from": "auth",
+      "to": "transport",
+      "contract": "ReplayStorm（process 组装期 typed bridge；无 compile reverse edge）"
+    },
+    {
+      "from": "host-runtime",
+      "to": "定时语义所有者",
+      "contract": "TimerFired（目标 inbox）"
+    },
+    {
+      "from": "host-runtime",
+      "to": "process",
+      "contract": "TaskPanicked / supervision terminal"
+    },
+    {
+      "from": "maintenance-agent",
+      "to": "control-plane-adapter",
+      "contract": "Progress / ReadyToExit"
+    },
+    {
+      "from": "release-agent",
+      "to": "control-plane-adapter",
+      "contract": "Health / Identity"
+    },
+    {
+      "from": "process",
+      "to": "control-plane-adapter",
+      "contract": "Lifecycle / exit evidence"
+    },
+    {
+      "from": "control-plane-adapter",
+      "to": "外部控制面",
+      "contract": "本地 status/evidence"
+    }
+  ],
+  "composition_root": "process",
+  "blocked_modules": [
+    "protocol-dispatch"
+  ]
+}

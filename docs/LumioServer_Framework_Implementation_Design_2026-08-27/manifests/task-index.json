@@ -1,0 +1,1381 @@
+[
+  {
+    "slug": "establish-cargo-workspace-and-rust-standards",
+    "title": "建立 Cargo Workspace 与 Rust 质量基线",
+    "wave": 0,
+    "module": "repository",
+    "objective": "一次性创建可解析、可 lint、可测试但不含生产行为的 workspace 骨架，并把首次 Rust 引入要求回写到 code-style/testing 标准。",
+    "files": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "rust-toolchain.toml",
+      "rustfmt.toml",
+      ".cargo/config.toml",
+      "clippy.toml",
+      "deny.toml",
+      "nextest.toml",
+      ".spec/knowledge/standards/code-style.md",
+      ".spec/knowledge/standards/testing.md",
+      "modules/process/Cargo.toml",
+      "modules/process/src/lib.rs",
+      "modules/process/src/main.rs",
+      "tools/xtask/Cargo.toml",
+      "tools/xtask/src/main.rs"
+    ],
+    "dependencies": [],
+    "consumes": [
+      "仓库现有 15 个模块 README 与 `.spec` 标准"
+    ],
+    "produces": [
+      "可供各模块并行增加代码的锁定 workspace；Rust 标准回写"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "add-architecture-policy-xtask",
+    "title": "实现架构与依赖守卫 xtask",
+    "wave": 1,
+    "module": "repository",
+    "objective": "把模块 DAG、旧名、禁止线程 API、Queue Matrix 登记和 protocol-dispatch 封锁变成机器检查。",
+    "files": [
+      "tools/xtask/src/policy.rs",
+      "tools/xtask/src/dag.rs",
+      "tools/xtask/src/queues.rs",
+      "tools/xtask/src/source_scan.rs",
+      ".spec/guards/module-dag.toml",
+      ".spec/guards/queue-contracts.toml",
+      "tests/policy/invalid_cycle.toml",
+      "tests/policy/invalid_queue.toml"
+    ],
+    "dependencies": [
+      "establish-cargo-workspace-and-rust-standards"
+    ],
+    "consumes": [
+      "modules/README 编译/命令/事件图与 Queue Contract Matrix"
+    ],
+    "produces": [
+      "`cargo xtask policy check` 与 mutation fixtures"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "add-lumio-host-testkit",
+    "title": "建立非生产 Reference Host 测试支撑",
+    "wave": 1,
+    "module": "testkit",
+    "objective": "创建仅 dev-dependency 可用的受控时钟、故障注入、typed port probe、fixture loader，不被生产模块依赖。",
+    "files": [
+      "crates/lumio-host-testkit/Cargo.toml",
+      "crates/lumio-host-testkit/src/lib.rs",
+      "crates/lumio-host-testkit/src/clock.rs",
+      "crates/lumio-host-testkit/src/fault.rs",
+      "crates/lumio-host-testkit/src/ports.rs",
+      "crates/lumio-host-testkit/src/fixtures.rs",
+      "crates/lumio-host-testkit/src/assertions.rs",
+      "crates/lumio-host-testkit/tests/self_test.rs"
+    ],
+    "dependencies": [
+      "establish-cargo-workspace-and-rust-standards"
+    ],
+    "consumes": [
+      "上游 fixtures 与 host-runtime 将定义的 supplier-neutral测试接口"
+    ],
+    "produces": [
+      "`lumio-host-testkit` dev crate"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "consume-upstream-generated-contract-artifacts",
+    "title": "接入三个只读生成契约包",
+    "wave": 1,
+    "module": "contracts",
+    "objective": "建立架构公共契约、Managed Host ABI、Core Engine contract 的只读消费边界与 lock manifest，禁止手写第二套 Schema。",
+    "files": [
+      "generated/lumio-architecture-contracts/Cargo.toml",
+      "generated/lumio-architecture-contracts/src/lib.rs",
+      "generated/lumio-managed-host-contracts/Cargo.toml",
+      "generated/lumio-managed-host-contracts/src/lib.rs",
+      "generated/lumio-core-engine-contracts/Cargo.toml",
+      "generated/lumio-core-engine-contracts/src/lib.rs",
+      "contracts/architecture-contracts.lock.toml",
+      "contracts/managed-host-contracts.lock.toml",
+      "contracts/core-engine-contracts.lock.toml",
+      "tools/xtask/src/contracts.rs"
+    ],
+    "dependencies": [
+      "establish-cargo-workspace-and-rust-standards"
+    ],
+    "consumes": [
+      "`LGE-V1.2-2026-08-27` 架构源产物；GameRuntime Managed ABI；CoreEngine contract"
+    ],
+    "produces": [
+      "三个只读 generated crates与 contract verification command"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "guard-protocol-dispatch-block",
+    "title": "固化 protocol-dispatch 零实现封锁",
+    "wave": 2,
+    "module": "protocol-dispatch",
+    "objective": "以README+policy manifest+mutation fixture禁止创建crate/src/API/依赖边，直到D-009完整解锁条件成立。",
+    "files": [
+      "modules/protocol-dispatch/README.md",
+      ".spec/guards/protocol-dispatch-blocked.toml",
+      "tests/policy/invalid_protocol_dispatch.toml"
+    ],
+    "dependencies": [
+      "add-architecture-policy-xtask",
+      "consume-upstream-generated-contract-artifacts"
+    ],
+    "consumes": [
+      "D-009 gate、generated V1 messageType set"
+    ],
+    "produces": [
+      "机器可验证的零实现封锁"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-host-profile-resolution-and-capability-matching",
+    "title": "实现 Profile 解析、Capability 匹配和 Composition Plan",
+    "wave": 2,
+    "module": "host-profiles",
+    "objective": "将 generated HostCapability、配置和 preset 纯函数化为 immutable plan，零一等模块依赖。",
+    "files": [
+      "modules/host-profiles/Cargo.toml",
+      "modules/host-profiles/src/lib.rs",
+      "modules/host-profiles/src/preset.rs",
+      "modules/host-profiles/src/capability.rs",
+      "modules/host-profiles/src/budget.rs",
+      "modules/host-profiles/src/composition.rs",
+      "modules/host-profiles/src/validation.rs",
+      "modules/host-profiles/src/error.rs",
+      "modules/host-profiles/tests/capability_fixture_test.rs",
+      "modules/host-profiles/tests/composition_matrix_test.rs",
+      "modules/host-profiles/tests/no_module_dependency_test.rs"
+    ],
+    "dependencies": [
+      "consume-upstream-generated-contract-artifacts"
+    ],
+    "consumes": [
+      "generated HostCapability、配置输入"
+    ],
+    "produces": [
+      "`ValidatedHostCompositionPlan`、`ConfiguredBudgets`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-host-runtime-bounded-ports",
+    "title": "实现有界 MPSC/SPSC 端口原语",
+    "wave": 2,
+    "module": "host-runtime",
+    "objective": "以 crossbeam-channel/rtrb 封装 supplier-neutral 点到点端口，并强制 owner/producer/consumer/capacity/full/close 元数据。",
+    "files": [
+      "modules/host-runtime/Cargo.toml",
+      "modules/host-runtime/src/lib.rs",
+      "modules/host-runtime/src/port.rs",
+      "modules/host-runtime/src/spsc.rs",
+      "modules/host-runtime/src/error.rs",
+      "modules/host-runtime/tests/port_contract_test.rs",
+      "modules/host-runtime/tests/loom_port_close_test.rs"
+    ],
+    "dependencies": [
+      "consume-upstream-generated-contract-artifacts",
+      "add-lumio-host-testkit"
+    ],
+    "consumes": [
+      "Queue Contract Matrix行"
+    ],
+    "produces": [
+      "`BoundedSender/Receiver<T>`、`SpscProducer/Consumer<T>`、`PortSpec`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "synchronize-implementation-mapping-docs",
+    "title": "同步模块 README 到实现映射与已知漂移",
+    "wave": 2,
+    "module": "repository",
+    "objective": "只修正文档到实现映射，不改架构：消除 process 通用回调、coreclr 全调用线程表述、host-profiles 反向依赖和旧模块名残留。",
+    "files": [
+      "modules/README.md",
+      "modules/process/README.md",
+      "modules/coreclr-host/README.md",
+      "modules/host-profiles/README.md",
+      "modules/persistence-host/README.md"
+    ],
+    "dependencies": [
+      "add-architecture-policy-xtask"
+    ],
+    "consumes": [
+      "已冻结模块 README 与 modules/README优先级规则"
+    ],
+    "produces": [
+      "实现映射一致的 README集"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-coreclr-generated-abi-contract-facade",
+    "title": "实现 CoreCLR Generated ABI Facade 与 Thread Tokens",
+    "wave": 3,
+    "module": "coreclr-host",
+    "objective": "只读消费Managed/Core generated contracts，定义host state、control/owner-thread token和无fault裁决的结果类型。",
+    "files": [
+      "modules/coreclr-host/Cargo.toml",
+      "modules/coreclr-host/src/lib.rs",
+      "modules/coreclr-host/src/state.rs",
+      "modules/coreclr-host/src/contracts.rs",
+      "modules/coreclr-host/src/thread_affinity.rs",
+      "modules/coreclr-host/src/commands.rs",
+      "modules/coreclr-host/src/events.rs",
+      "modules/coreclr-host/src/error.rs",
+      "modules/coreclr-host/tests/abi_conformance_test.rs",
+      "modules/coreclr-host/tests/thread_affinity_test.rs"
+    ],
+    "dependencies": [
+      "consume-upstream-generated-contract-artifacts",
+      "implement-host-runtime-bounded-ports"
+    ],
+    "consumes": [
+      "generated NativeManagedAbi/Core contract"
+    ],
+    "produces": [
+      "CoreClr state/commands/events/tokens、ABI validator"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-host-profile-fault-decorator-declarations",
+    "title": "实现故障 Profile 声明与生产禁用守卫",
+    "wave": 3,
+    "module": "host-profiles",
+    "objective": "增加仅描述、不执行的 deterministic fault plan，并阻止测试 adapter进入生产 composition。",
+    "files": [
+      "modules/host-profiles/src/fault_profile.rs",
+      "modules/host-profiles/tests/fault_profile_test.rs"
+    ],
+    "dependencies": [
+      "implement-host-profile-resolution-and-capability-matching"
+    ],
+    "consumes": [
+      "HostCompositionPlan"
+    ],
+    "produces": [
+      "`FaultDecoratorPlan`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-host-runtime-clock-and-timer-delivery",
+    "title": "实现单调时钟与到期命令投递",
+    "wave": 3,
+    "module": "host-runtime",
+    "objective": "使用 Tokio time/DelayQueue 实现可取消 timer，目标是 typed `TimerDeliveryPort`，不执行业务回调。",
+    "files": [
+      "modules/host-runtime/src/clock.rs",
+      "modules/host-runtime/src/timer.rs",
+      "modules/host-runtime/src/timer_delivery.rs",
+      "modules/host-runtime/tests/timer_delivery_test.rs"
+    ],
+    "dependencies": [
+      "implement-host-runtime-bounded-ports"
+    ],
+    "consumes": [
+      "`PortSpec`、Tokio官方time"
+    ],
+    "produces": [
+      "`MonotonicClock`、`TimerService`、`TimerFired`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-observability-diagnostic-metrics-trace-pipeline",
+    "title": "实现脱敏诊断、Metrics 与 Trace Pipeline",
+    "wave": 3,
+    "module": "observability",
+    "objective": "使用 tracing/metrics 成熟生态建立入队前脱敏、总预算有界的 diagnostic pipeline 和供应商隔离 facade。",
+    "files": [
+      "modules/observability/Cargo.toml",
+      "modules/observability/src/lib.rs",
+      "modules/observability/src/event.rs",
+      "modules/observability/src/redaction.rs",
+      "modules/observability/src/diagnostic.rs",
+      "modules/observability/src/metrics.rs",
+      "modules/observability/src/trace.rs",
+      "modules/observability/src/sinks/mod.rs",
+      "modules/observability/src/sinks/console.rs",
+      "modules/observability/src/sinks/rolling_file.rs",
+      "modules/observability/src/error.rs",
+      "modules/observability/tests/redaction_test.rs",
+      "modules/observability/tests/diagnostic_saturation_test.rs"
+    ],
+    "dependencies": [
+      "implement-host-runtime-bounded-ports",
+      "consume-upstream-generated-contract-artifacts"
+    ],
+    "consumes": [
+      "generated LoggingEvent、PortSpec"
+    ],
+    "produces": [
+      "`DiagnosticEmitter`、`MetricRecorder`、`TraceEmitter`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-pacing-state-and-decision-core",
+    "title": "实现 Pacing 状态机与纯决策函数",
+    "wave": 3,
+    "module": "pacing",
+    "objective": "定义不含Logical TickId的 scheduler state、deadline/overrun纯函数和typed commands。",
+    "files": [
+      "modules/pacing/Cargo.toml",
+      "modules/pacing/src/lib.rs",
+      "modules/pacing/src/config.rs",
+      "modules/pacing/src/state.rs",
+      "modules/pacing/src/decision.rs",
+      "modules/pacing/src/commands.rs",
+      "modules/pacing/src/permit.rs",
+      "modules/pacing/src/error.rs",
+      "modules/pacing/tests/decision_property_test.rs"
+    ],
+    "dependencies": [
+      "implement-host-runtime-bounded-ports",
+      "implement-host-profile-resolution-and-capability-matching"
+    ],
+    "consumes": [
+      "PacingConfig、MonotonicInstant"
+    ],
+    "produces": [
+      "`PacingCommand`、`TickPermit`、`PacingDecision`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-persistence-local-filesystem-atomic-store",
+    "title": "实现本地文件原子存储 Adapter",
+    "wave": 3,
+    "module": "persistence-host",
+    "objective": "组合tempfile/rustix/fs4实现storage root锁、同目录staging、write/fsync/replace/dir fsync和crash points。",
+    "files": [
+      "modules/persistence-host/Cargo.toml",
+      "modules/persistence-host/src/lib.rs",
+      "modules/persistence-host/src/config.rs",
+      "modules/persistence-host/src/storage/mod.rs",
+      "modules/persistence-host/src/storage/local_fs.rs",
+      "modules/persistence-host/src/storage/fault_injected.rs",
+      "modules/persistence-host/src/error.rs",
+      "modules/persistence-host/tests/atomic_snapshot_test.rs"
+    ],
+    "dependencies": [
+      "implement-host-runtime-bounded-ports",
+      "consume-upstream-generated-contract-artifacts"
+    ],
+    "consumes": [
+      "DurableStorage SPI需求、SnapshotHeader"
+    ],
+    "produces": [
+      "`LocalFsStorage` 与 fault-injected adapter"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-release-catalog-manifest-verification",
+    "title": "实现 ReleaseCatalog/Manifest 一致性与 ExactRelease Predicate",
+    "wave": 3,
+    "module": "release-agent",
+    "objective": "验证configured gameReleaseId、Catalog、Manifest和artifact hashes，提供session exact-match结果。",
+    "files": [
+      "modules/release-agent/Cargo.toml",
+      "modules/release-agent/src/lib.rs",
+      "modules/release-agent/src/identity.rs",
+      "modules/release-agent/src/catalog.rs",
+      "modules/release-agent/src/manifest.rs",
+      "modules/release-agent/src/verifier.rs",
+      "modules/release-agent/src/matching.rs",
+      "modules/release-agent/src/commands.rs",
+      "modules/release-agent/src/events.rs",
+      "modules/release-agent/src/error.rs",
+      "modules/release-agent/tests/release_fixture_test.rs",
+      "modules/release-agent/tests/exact_match_test.rs"
+    ],
+    "dependencies": [
+      "consume-upstream-generated-contract-artifacts",
+      "implement-host-runtime-bounded-ports"
+    ],
+    "consumes": [
+      "generated ReleaseCatalog/Manifest、artifact evidence"
+    ],
+    "produces": [
+      "`VerifiedReleaseBundle`、`ReleaseMatchResult`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-transport-vendor-neutral-envelope-core",
+    "title": "实现 Transport Vendor-neutral Envelope Core",
+    "wave": 3,
+    "module": "transport",
+    "objective": "定义supplier-neutral连接值、generated Envelope gate、codec/carrier SPI、permission reference和无业务dispatch边界。",
+    "files": [
+      "modules/transport/Cargo.toml",
+      "modules/transport/src/lib.rs",
+      "modules/transport/src/endpoint.rs",
+      "modules/transport/src/connection.rs",
+      "modules/transport/src/envelope.rs",
+      "modules/transport/src/codec.rs",
+      "modules/transport/src/permission.rs",
+      "modules/transport/src/commands.rs",
+      "modules/transport/src/events.rs",
+      "modules/transport/src/ports.rs",
+      "modules/transport/src/error.rs",
+      "modules/transport/tests/envelope_fixture_test.rs"
+    ],
+    "dependencies": [
+      "consume-upstream-generated-contract-artifacts",
+      "implement-host-runtime-bounded-ports"
+    ],
+    "consumes": [
+      "generated ReplicationEnvelope/IDs"
+    ],
+    "produces": [
+      "Transport values、`EnvelopeCodec`/`ByteCarrier` SPI、commands/events"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-auth-behavior-core-and-verifier-port",
+    "title": "实现 Auth 行为 Core 与不透明 Verifier Port",
+    "wave": 4,
+    "module": "auth",
+    "objective": "定义 opaque credential、auth request/result、secret-safe verifier SPI和串行服务，不选择D-011 wire/算法。",
+    "files": [
+      "modules/auth/Cargo.toml",
+      "modules/auth/src/lib.rs",
+      "modules/auth/src/credential.rs",
+      "modules/auth/src/verifier.rs",
+      "modules/auth/src/identity.rs",
+      "modules/auth/src/commands.rs",
+      "modules/auth/src/events.rs",
+      "modules/auth/src/service.rs",
+      "modules/auth/src/audit.rs",
+      "modules/auth/src/error.rs",
+      "modules/auth/src/adapters/injected.rs",
+      "modules/auth/tests/behavior_contract_test.rs",
+      "modules/auth/tests/secret_redaction_test.rs"
+    ],
+    "dependencies": [
+      "implement-host-runtime-bounded-ports",
+      "implement-observability-diagnostic-metrics-trace-pipeline"
+    ],
+    "consumes": [
+      "opaque handshake body、AuthRequest"
+    ],
+    "produces": [
+      "`CredentialVerifier`、`AuthenticateCommand`、`AuthEvent`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-coreclr-lifecycle-and-fault-passthrough",
+    "title": "实现 CoreCLR/Runtime/Gameplay Scope 生命周期与 Witness 转交",
+    "wave": 4,
+    "module": "coreclr-host",
+    "objective": "建立纯生命周期reducer、ManagedTickPort、scope load/unload效果和异常/witness passthrough。",
+    "files": [
+      "modules/coreclr-host/src/host.rs",
+      "modules/coreclr-host/src/runtime_scope.rs",
+      "modules/coreclr-host/src/gameplay_scope.rs",
+      "modules/coreclr-host/src/invocation.rs",
+      "modules/coreclr-host/src/fault.rs",
+      "modules/coreclr-host/tests/fault_passthrough_test.rs",
+      "modules/coreclr-host/tests/unload_soak_test.rs"
+    ],
+    "dependencies": [
+      "implement-coreclr-generated-abi-contract-facade",
+      "implement-host-runtime-clock-and-timer-delivery"
+    ],
+    "consumes": [
+      "CoreClr commands/tokens、generated Managed API"
+    ],
+    "produces": [
+      "`CoreClrHost` lifecycle reducer、`ManagedTickPort`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-host-runtime-supervision-cancellation-and-join",
+    "title": "实现结构化监督、取消、执行预算与 Join",
+    "wave": 4,
+    "module": "host-runtime",
+    "objective": "建立统一的 task/thread supervisor、CancellationScope、bounded executor permits、heartbeat 和 join barrier。",
+    "files": [
+      "modules/host-runtime/src/runtime.rs",
+      "modules/host-runtime/src/cancellation.rs",
+      "modules/host-runtime/src/supervision.rs",
+      "modules/host-runtime/src/thread.rs",
+      "modules/host-runtime/src/executor.rs",
+      "modules/host-runtime/src/join.rs",
+      "modules/host-runtime/src/backoff.rs",
+      "modules/host-runtime/tests/supervision_test.rs"
+    ],
+    "dependencies": [
+      "implement-host-runtime-clock-and-timer-delivery"
+    ],
+    "consumes": [
+      "bounded ports、TimerService"
+    ],
+    "produces": [
+      "`HostRuntime`、`TaskSupervisor`、`ThreadSupervisor`、`CancellationScope`、`JoinReport`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-observability-audit-durable-pipeline",
+    "title": "实现独立 Audit Durable Pipeline 与 Ack",
+    "wave": 4,
+    "module": "observability",
+    "objective": "建立与 diagnostic 完全分离的有界 audit writer、durability policy、序列和显式 durable ack。",
+    "files": [
+      "modules/observability/src/audit.rs",
+      "modules/observability/src/sinks/local_audit.rs",
+      "modules/observability/src/commands.rs",
+      "modules/observability/src/events.rs",
+      "modules/observability/tests/audit_durability_test.rs"
+    ],
+    "dependencies": [
+      "implement-observability-diagnostic-metrics-trace-pipeline",
+      "implement-host-runtime-clock-and-timer-delivery"
+    ],
+    "consumes": [
+      "AuditRecord、DurabilityPolicy"
+    ],
+    "produces": [
+      "`AuditWriterPort`、`AuditDurableAck`、`AuditAvailability`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-pacing-timer-driven-scheduler",
+    "title": "实现 Timer 驱动的 Permit Scheduler",
+    "wave": 4,
+    "module": "pacing",
+    "objective": "接入 host-runtime TimerService 和SPSC permit，不自建线程或catch-up backlog。",
+    "files": [
+      "modules/pacing/src/scheduler.rs",
+      "modules/pacing/src/metrics.rs",
+      "modules/pacing/tests/paused_clock_test.rs",
+      "modules/pacing/tests/permit_backpressure_test.rs"
+    ],
+    "dependencies": [
+      "implement-pacing-state-and-decision-core",
+      "implement-host-runtime-clock-and-timer-delivery"
+    ],
+    "consumes": [
+      "TimerService、SpscProducer<TickPermit>"
+    ],
+    "produces": [
+      "可运行 `PacingController`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-process-config-lifecycle-and-explicit-components",
+    "title": "实现 Process 配置、生命周期与显式 Components",
+    "wave": 4,
+    "module": "process",
+    "objective": "建立配置合并/schema校验、ProcessLifecycle和具体Components/Factories结构，禁止通用hook/service locator。",
+    "files": [
+      "modules/process/src/application.rs",
+      "modules/process/src/components.rs",
+      "modules/process/src/config.rs",
+      "modules/process/src/exit.rs",
+      "modules/process/src/error.rs",
+      "modules/process/tests/startup_order_test.rs"
+    ],
+    "dependencies": [
+      "implement-host-profile-resolution-and-capability-matching",
+      "implement-observability-diagnostic-metrics-trace-pipeline",
+      "implement-coreclr-generated-abi-contract-facade",
+      "implement-release-catalog-manifest-verification"
+    ],
+    "consumes": [
+      "CLI/config/profile/generated contract locks"
+    ],
+    "produces": [
+      "ProcessApplication core、ProcessConfigSnapshot、Components"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-auth-replay-grant-revocation-and-epoch",
+    "title": "实现重放、Grant、撤销与 Epoch 竞态",
+    "wave": 5,
+    "module": "auth",
+    "objective": "组合 bounded LRU+monotonic expiry，产出 immutable PermissionGrant并拒绝旧connection/grant epoch。",
+    "files": [
+      "modules/auth/src/replay.rs",
+      "modules/auth/src/permission.rs",
+      "modules/auth/tests/replay_property_test.rs",
+      "modules/auth/tests/grant_epoch_race_test.rs"
+    ],
+    "dependencies": [
+      "implement-auth-behavior-core-and-verifier-port",
+      "implement-host-runtime-clock-and-timer-delivery"
+    ],
+    "consumes": [
+      "VerifierResult、MonotonicClock"
+    ],
+    "produces": [
+      "`PermissionGrant`、replay/revocation reducer"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-control-plane-behavior-core",
+    "title": "实现 Control Plane 验证、Fencing 与幂等行为 Core",
+    "wave": 5,
+    "module": "control-plane-adapter",
+    "objective": "在不选择D-010通道/wire/算法的前提下，定义opaque frame、authenticator SPI、fencing/idempotency和verified typed output。",
+    "files": [
+      "modules/control-plane-adapter/Cargo.toml",
+      "modules/control-plane-adapter/src/lib.rs",
+      "modules/control-plane-adapter/src/frame.rs",
+      "modules/control-plane-adapter/src/authenticator.rs",
+      "modules/control-plane-adapter/src/fencing.rs",
+      "modules/control-plane-adapter/src/idempotency.rs",
+      "modules/control-plane-adapter/src/commands.rs",
+      "modules/control-plane-adapter/src/channel.rs",
+      "modules/control-plane-adapter/src/service.rs",
+      "modules/control-plane-adapter/src/error.rs",
+      "modules/control-plane-adapter/tests/fencing_test.rs",
+      "modules/control-plane-adapter/tests/verification_order_test.rs"
+    ],
+    "dependencies": [
+      "implement-host-runtime-bounded-ports",
+      "implement-observability-audit-durable-pipeline",
+      "consume-upstream-generated-contract-artifacts"
+    ],
+    "consumes": [
+      "generated MaintenanceCommand、opaque channel frame"
+    ],
+    "produces": [
+      "`VerifiedControlCommand`、Authenticator/Channel SPI、fencing reducer"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-coreclr-netcorehost-adapter",
+    "title": "实现官方 hostfxr/nethost Rust Adapter",
+    "wave": 5,
+    "module": "coreclr-host",
+    "objective": "通过netcorehost封装CoreCLR discovery/load/function table获取，集中unsafe和供应商错误映射。",
+    "files": [
+      "modules/coreclr-host/src/bootstrap.rs",
+      "modules/coreclr-host/src/adapters/netcorehost.rs",
+      "modules/coreclr-host/src/ffi/mod.rs",
+      "modules/coreclr-host/tests/netcorehost_smoke_test.rs"
+    ],
+    "dependencies": [
+      "implement-coreclr-lifecycle-and-fault-passthrough",
+      "implement-host-runtime-supervision-cancellation-and-join"
+    ],
+    "consumes": [
+      "CoreClrHost lifecycle、generated ABI"
+    ],
+    "produces": [
+      "`NetCoreHostAdapter`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-observability-failure-bundle-and-emergency-path",
+    "title": "实现 Failure Bundle 与 Crash-safe Emergency Path",
+    "wave": 5,
+    "module": "observability",
+    "objective": "以固定 typed evidence ports 汇集 generated FailureBundle，支持partial/missing provider并提供最小崩溃写入路径。",
+    "files": [
+      "modules/observability/src/evidence.rs",
+      "modules/observability/src/bundle.rs",
+      "modules/observability/src/emergency.rs",
+      "modules/observability/tests/failure_bundle_test.rs",
+      "modules/observability/tests/emergency_path_test.rs"
+    ],
+    "dependencies": [
+      "implement-observability-audit-durable-pipeline",
+      "implement-host-runtime-supervision-cancellation-and-join"
+    ],
+    "consumes": [
+      "generated FailureBundle、typed evidence fragments"
+    ],
+    "produces": [
+      "`FailureBundlePort`、`EvidenceRequest/Fragment`、`BundleCompletion`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-persistence-durable-streams-queues-and-acks",
+    "title": "实现四类 Durable Stream、独立队列与 Commit Ack",
+    "wave": 5,
+    "module": "persistence-host",
+    "objective": "建立Snapshot/WAL/TxnJournal/CommandLog writer状态、bounded queues、sequence和`PersistenceCommitAck`。",
+    "files": [
+      "modules/persistence-host/src/snapshot.rs",
+      "modules/persistence-host/src/wal.rs",
+      "modules/persistence-host/src/txn_journal.rs",
+      "modules/persistence-host/src/command_log.rs",
+      "modules/persistence-host/src/commit.rs",
+      "modules/persistence-host/src/pressure.rs",
+      "modules/persistence-host/src/queues.rs",
+      "modules/persistence-host/src/workers.rs",
+      "modules/persistence-host/src/commands.rs",
+      "modules/persistence-host/src/events.rs",
+      "modules/persistence-host/tests/journal_ack_test.rs",
+      "modules/persistence-host/tests/queue_saturation_test.rs"
+    ],
+    "dependencies": [
+      "implement-persistence-local-filesystem-atomic-store",
+      "implement-host-runtime-supervision-cancellation-and-join"
+    ],
+    "consumes": [
+      "DurableStorage、generated records"
+    ],
+    "produces": [
+      "PersistenceCommand/Event ports、四类writer、CommitAck"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-transport-registry-bounded-ingress-egress",
+    "title": "实现 ConnectionRegistry 与每连接有界队列",
+    "wave": 5,
+    "module": "transport",
+    "objective": "建立transport单写registry、connection epoch、Ingress/Egress/Command queues、可靠/分片/限流状态。",
+    "files": [
+      "modules/transport/src/registry.rs",
+      "modules/transport/src/rate_limit.rs",
+      "modules/transport/src/reliability.rs",
+      "modules/transport/src/fragment.rs",
+      "modules/transport/src/ingress.rs",
+      "modules/transport/src/egress.rs",
+      "modules/transport/src/runner.rs",
+      "modules/transport/tests/registry_owner_test.rs",
+      "modules/transport/tests/bounded_backpressure_test.rs"
+    ],
+    "dependencies": [
+      "implement-transport-vendor-neutral-envelope-core",
+      "implement-host-runtime-supervision-cancellation-and-join"
+    ],
+    "consumes": [
+      "Transport commands、PortSpec"
+    ],
+    "produces": [
+      "`ConnectionRegistry`、IngressReader、EgressWriter、runner"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-control-plane-injected-channel-and-status-reporting",
+    "title": "实现 Injected Channel 与本地状态上报",
+    "wave": 6,
+    "module": "control-plane-adapter",
+    "objective": "提供测试专用injected channel、bounded status queue、report coalescing与ReadyToExit不可丢语义。",
+    "files": [
+      "modules/control-plane-adapter/src/reports.rs",
+      "modules/control-plane-adapter/src/adapters/injected.rs",
+      "modules/control-plane-adapter/src/adapters/production_gate.rs",
+      "modules/control-plane-adapter/tests/report_delivery_test.rs",
+      "modules/control-plane-adapter/tests/production_gate_test.rs"
+    ],
+    "dependencies": [
+      "implement-control-plane-behavior-core",
+      "implement-host-profile-fault-decorator-declarations",
+      "implement-host-runtime-clock-and-timer-delivery"
+    ],
+    "consumes": [
+      "ControlChannel SPI、LocalStatusReport"
+    ],
+    "produces": [
+      "InjectedControlChannel、StatusReportPort"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-persistence-recovery-checkpoint-and-migration-adapter",
+    "title": "实现恢复、Checkpoint 与 Migration 消费 Adapter",
+    "wave": 6,
+    "module": "persistence-host",
+    "objective": "从合法active snapshot与durable logs生成可重复RecoveryPlan，并以typed timer/tick evidence触发checkpoint。",
+    "files": [
+      "modules/persistence-host/src/checkpoint.rs",
+      "modules/persistence-host/src/recovery.rs",
+      "modules/persistence-host/src/migration.rs",
+      "modules/persistence-host/tests/recovery_fixture_test.rs",
+      "modules/persistence-host/tests/checkpoint_trigger_test.rs"
+    ],
+    "dependencies": [
+      "implement-persistence-durable-streams-queues-and-acks",
+      "implement-host-runtime-clock-and-timer-delivery"
+    ],
+    "consumes": [
+      "active snapshot/log streams、generated migration manifest"
+    ],
+    "produces": [
+      "`RecoveryPlan/Report`、Checkpoint command/effects"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-process-signal-watchdog-and-crash-evidence",
+    "title": "实现 Signal、独立 Process Watchdog 与 Crash Evidence",
+    "wave": 6,
+    "module": "process",
+    "objective": "通过host-runtime监督signal/watchdog，安装最小panic hook并请求Failure Bundle，不直接调用领域模块。",
+    "files": [
+      "modules/process/src/signals.rs",
+      "modules/process/src/watchdog.rs",
+      "modules/process/src/crash.rs",
+      "modules/process/tests/panic_evidence_test.rs",
+      "modules/process/tests/watchdog_test.rs"
+    ],
+    "dependencies": [
+      "implement-process-config-lifecycle-and-explicit-components",
+      "implement-host-runtime-supervision-cancellation-and-join",
+      "implement-observability-failure-bundle-and-emergency-path"
+    ],
+    "consumes": [
+      "SupervisorEvent/heartbeat、OS signals"
+    ],
+    "produces": [
+      "ProcessControlCommand、crash/watchdog evidence"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-release-local-member-state-health-and-reporting",
+    "title": "实现本地 Release Member State、Health 与 Report",
+    "wave": 6,
+    "module": "release-agent",
+    "objective": "建立本进程local state reducer、timer-driven health和control-plane report，不拥有全局Pool。",
+    "files": [
+      "modules/release-agent/src/member_state.rs",
+      "modules/release-agent/src/health.rs",
+      "modules/release-agent/src/reports.rs",
+      "modules/release-agent/src/service.rs",
+      "modules/release-agent/tests/local_state_test.rs"
+    ],
+    "dependencies": [
+      "implement-release-catalog-manifest-verification",
+      "implement-host-runtime-clock-and-timer-delivery",
+      "implement-control-plane-behavior-core"
+    ],
+    "consumes": [
+      "VerifiedReleaseBundle、StatusReportPort"
+    ],
+    "produces": [
+      "`ReleaseAgent` reducer、`LocalReleaseReport`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-transport-local-embedded-fidelity-adapter",
+    "title": "实现 LocalEmbedded Byte Carrier 与保真测试",
+    "wave": 6,
+    "module": "transport",
+    "objective": "以内存byte carrier替代OS网络层，但复用同一codec/envelope/permission/size/queue路径。",
+    "files": [
+      "modules/transport/src/adapters/local_embedded.rs",
+      "modules/transport/tests/local_embedded_fidelity_test.rs"
+    ],
+    "dependencies": [
+      "implement-transport-registry-bounded-ingress-egress",
+      "implement-host-profile-resolution-and-capability-matching"
+    ],
+    "consumes": [
+      "ByteCarrier SPI、LocalEmbedded plan"
+    ],
+    "produces": [
+      "`LocalEmbeddedCarrier`"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-world-slot-aggregate-epoch-admission-and-quota",
+    "title": "实现 WorldSlotHost 聚合、Epoch、Admission Gate 与 Quota",
+    "wave": 6,
+    "module": "world-slot",
+    "objective": "建立唯一aggregate reducer、slot epoch、reservation/commit/abort和所有命令的StaleEpoch门。",
+    "files": [
+      "modules/world-slot/Cargo.toml",
+      "modules/world-slot/src/lib.rs",
+      "modules/world-slot/src/epoch.rs",
+      "modules/world-slot/src/state.rs",
+      "modules/world-slot/src/aggregate.rs",
+      "modules/world-slot/src/admission_gate.rs",
+      "modules/world-slot/src/quota.rs",
+      "modules/world-slot/src/handles.rs",
+      "modules/world-slot/src/commands.rs",
+      "modules/world-slot/src/events.rs",
+      "modules/world-slot/src/service.rs",
+      "modules/world-slot/src/error.rs",
+      "modules/world-slot/tests/aggregate_state_test.rs",
+      "modules/world-slot/tests/stale_epoch_test.rs"
+    ],
+    "dependencies": [
+      "implement-host-runtime-supervision-cancellation-and-join",
+      "implement-pacing-timer-driven-scheduler",
+      "implement-coreclr-lifecycle-and-fault-passthrough",
+      "implement-persistence-durable-streams-queues-and-acks",
+      "implement-transport-registry-bounded-ingress-egress"
+    ],
+    "consumes": [
+      "下游typed ports、generated WorldSlotHost state"
+    ],
+    "produces": [
+      "WorldSlot aggregate/command/event/query ports"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-persistence-durability-fault-matrix",
+    "title": "封闭 Persistence Durability 故障矩阵",
+    "wave": 7,
+    "module": "persistence-host",
+    "objective": "覆盖ENOSPC、short write、corruption、lock loss、queue saturation、迟到duplicate和shutdown中断的可验证终态。",
+    "files": [
+      "modules/persistence-host/tests/durability_fault_matrix_test.rs",
+      "modules/persistence-host/tests/recovery_property_test.rs"
+    ],
+    "dependencies": [
+      "implement-persistence-recovery-checkpoint-and-migration-adapter"
+    ],
+    "consumes": [
+      "fault-injected storage、writers/recovery"
+    ],
+    "produces": [
+      "持久化模块Foundation退出证据"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-session-registry-state-and-admission-saga",
+    "title": "实现 ServerConnectionSession 与接纳 Saga",
+    "wave": 7,
+    "module": "session",
+    "objective": "建立单写SessionRegistry及transport candidate→auth→exact release→slot reservation→transport bind的显式effect/compensation链。",
+    "files": [
+      "modules/session/Cargo.toml",
+      "modules/session/src/lib.rs",
+      "modules/session/src/id.rs",
+      "modules/session/src/state.rs",
+      "modules/session/src/session.rs",
+      "modules/session/src/registry.rs",
+      "modules/session/src/admission.rs",
+      "modules/session/src/binding.rs",
+      "modules/session/src/commands.rs",
+      "modules/session/src/events.rs",
+      "modules/session/src/service.rs",
+      "modules/session/src/error.rs",
+      "modules/session/tests/admission_saga_test.rs",
+      "modules/session/tests/server_name_guard_test.rs"
+    ],
+    "dependencies": [
+      "implement-auth-replay-grant-revocation-and-epoch",
+      "implement-release-local-member-state-health-and-reporting",
+      "implement-world-slot-aggregate-epoch-admission-and-quota",
+      "implement-transport-local-embedded-fidelity-adapter"
+    ],
+    "consumes": [
+      "transport/auth/release/world typed commands/events"
+    ],
+    "produces": [
+      "SessionRegistry、AdmissionReducer、Session ports"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-transport-remote-and-fault-adapters",
+    "title": "实现 Remote Carrier 候选与确定性 Fault Decorator",
+    "wave": 7,
+    "module": "transport",
+    "objective": "在D-004满足时以Quinn/rustls实现RemoteDS carrier，并提供bounded确定性故障decorator；两者均不改变稳定API。",
+    "files": [
+      "modules/transport/src/adapters/remote.rs",
+      "modules/transport/src/adapters/fault_decorator.rs",
+      "modules/transport/tests/remote_adapter_contract_test.rs",
+      "modules/transport/tests/fault_decorator_test.rs"
+    ],
+    "dependencies": [
+      "implement-transport-local-embedded-fidelity-adapter",
+      "implement-host-runtime-supervision-cancellation-and-join",
+      "implement-host-profile-fault-decorator-declarations"
+    ],
+    "consumes": [
+      "D-004 gate evidence、ByteCarrier SPI"
+    ],
+    "produces": [
+      "RemoteDS carrier adapter、FaultDecoratedCarrier"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-world-slot-simulation-owner-loop",
+    "title": "实现 Simulation Owner Thread 与 Tick Barrier 主链",
+    "wave": 7,
+    "module": "world-slot",
+    "objective": "建立host-runtime owned runner，固定执行permit→bounded ingress/native completion drain→Managed Tick→barrier outcome→egress/persistence effects。",
+    "files": [
+      "modules/world-slot/src/owner_thread.rs",
+      "modules/world-slot/src/tick_loop.rs",
+      "modules/world-slot/src/watchdog.rs",
+      "modules/world-slot/tests/tick_barrier_test.rs",
+      "modules/world-slot/tests/owner_thread_affinity_test.rs"
+    ],
+    "dependencies": [
+      "implement-world-slot-aggregate-epoch-admission-and-quota",
+      "implement-coreclr-netcorehost-adapter",
+      "implement-persistence-recovery-checkpoint-and-migration-adapter",
+      "implement-transport-local-embedded-fidelity-adapter"
+    ],
+    "consumes": [
+      "TickPermit、IngressReader、ManagedTickPort、Persistence/Egress ports"
+    ],
+    "produces": [
+      "`SimulationOwnerRunner`、TickCompleted/effects"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-session-reconnect-window-and-epoch-races",
+    "title": "实现重连窗口、Timer 与旧完成拒绝",
+    "wave": 8,
+    "module": "session",
+    "objective": "为断开Session保留有界metadata/opaque handle，使用host-runtime timer并处理disconnect/reconnect/expiry/kick竞态。",
+    "files": [
+      "modules/session/src/reconnect.rs",
+      "modules/session/tests/reconnect_race_test.rs",
+      "modules/session/tests/reconnect_budget_test.rs"
+    ],
+    "dependencies": [
+      "implement-session-registry-state-and-admission-saga",
+      "implement-host-runtime-clock-and-timer-delivery"
+    ],
+    "consumes": [
+      "Disconnected session、TimerFired、new candidate"
+    ],
+    "produces": [
+      "Reconnect reducer/metadata"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-world-slot-quiesce-migration-and-fault-adjudication",
+    "title": "实现 Quiesce、聚合迁移与 Runtime Witness 裁决",
+    "wave": 8,
+    "module": "world-slot",
+    "objective": "封闭close admission→stop new tick→drain→persist→stop流程，并确保只有world-slot发起aggregate migration/epoch更新。",
+    "files": [
+      "modules/world-slot/src/quiesce.rs",
+      "modules/world-slot/src/migration.rs",
+      "modules/world-slot/src/fault.rs",
+      "modules/world-slot/tests/fault_witness_test.rs",
+      "modules/world-slot/tests/quiesce_test.rs"
+    ],
+    "dependencies": [
+      "implement-world-slot-simulation-owner-loop",
+      "implement-persistence-durability-fault-matrix",
+      "implement-observability-failure-bundle-and-emergency-path"
+    ],
+    "consumes": [
+      "Runtime witness、persistence events、quiesce command"
+    ],
+    "produces": [
+      "FaultAdjudicated、Quiesced、ReadyToStop"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-maintenance-command-state-deadline-and-idempotency",
+    "title": "实现 MaintenanceCommand 状态、Deadline 与幂等",
+    "wave": 9,
+    "module": "maintenance-agent",
+    "objective": "包装generated command、monotonic grace deadline、run state和duplicate/conflict行为。",
+    "files": [
+      "modules/maintenance-agent/Cargo.toml",
+      "modules/maintenance-agent/src/lib.rs",
+      "modules/maintenance-agent/src/command.rs",
+      "modules/maintenance-agent/src/semantics.rs",
+      "modules/maintenance-agent/src/deadline.rs",
+      "modules/maintenance-agent/src/state.rs",
+      "modules/maintenance-agent/src/progress.rs",
+      "modules/maintenance-agent/src/acks.rs",
+      "modules/maintenance-agent/src/commands.rs",
+      "modules/maintenance-agent/src/events.rs",
+      "modules/maintenance-agent/src/evidence.rs",
+      "modules/maintenance-agent/src/error.rs",
+      "modules/maintenance-agent/tests/idempotency_test.rs"
+    ],
+    "dependencies": [
+      "implement-control-plane-injected-channel-and-status-reporting",
+      "implement-host-runtime-clock-and-timer-delivery",
+      "implement-session-reconnect-window-and-epoch-races",
+      "implement-world-slot-quiesce-migration-and-fault-adjudication"
+    ],
+    "consumes": [
+      "VerifiedMaintenanceCommand/LocalShutdown、dependency ports"
+    ],
+    "produces": [
+      "MaintenanceRun state/commands/events/ack slots"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-world-slot-resource-and-watchdog-soak",
+    "title": "封闭 Slot 资源、Watchdog 与重复生命周期 Soak",
+    "wave": 9,
+    "module": "world-slot",
+    "objective": "验证create/quiesce/destroy/recreate和owner stall下线程、队列、handle、epoch、evidence终态。",
+    "files": [
+      "modules/world-slot/tests/resource_soak_test.rs",
+      "modules/world-slot/tests/watchdog_fault_test.rs"
+    ],
+    "dependencies": [
+      "implement-world-slot-quiesce-migration-and-fault-adjudication"
+    ],
+    "consumes": [
+      "WorldSlot lifecycle、host-runtime supervisor"
+    ],
+    "produces": [
+      "world-slot soak/fault验收证据"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-session-drain-kick-and-fault-isolation",
+    "title": "实现 Session Drain/Kick 与故障隔离",
+    "wave": 10,
+    "module": "session",
+    "objective": "消费maintenance/world-slot命令，停止新接纳、drain/close连接并保证单Session故障不污染其他Session。",
+    "files": [
+      "modules/session/src/drain.rs",
+      "modules/session/src/fault.rs",
+      "modules/session/tests/drain_kick_test.rs",
+      "modules/session/tests/fault_isolation_test.rs"
+    ],
+    "dependencies": [
+      "implement-session-reconnect-window-and-epoch-races",
+      "implement-world-slot-resource-and-watchdog-soak"
+    ],
+    "consumes": [
+      "Maintenance command、WorldSlot fault event、Transport close ack"
+    ],
+    "produces": [
+      "Session Drained/Kicked/Faulted terminal events"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "implement-maintenance-orchestration-and-dual-durable-ack",
+    "title": "实现维护编排与两个独立 Durable Ack",
+    "wave": 11,
+    "module": "maintenance-agent",
+    "objective": "实现纯reducer和effect dispatcher：close gate→drain→quiesce→persist/audit→kick/escalate→ReadyToExit。",
+    "files": [
+      "modules/maintenance-agent/src/orchestrator.rs",
+      "modules/maintenance-agent/tests/graceful_flow_test.rs",
+      "modules/maintenance-agent/tests/forced_flow_test.rs",
+      "modules/maintenance-agent/tests/dual_ack_test.rs"
+    ],
+    "dependencies": [
+      "implement-maintenance-command-state-deadline-and-idempotency",
+      "implement-session-drain-kick-and-fault-isolation",
+      "implement-persistence-durability-fault-matrix",
+      "implement-observability-failure-bundle-and-emergency-path",
+      "implement-release-local-member-state-health-and-reporting"
+    ],
+    "consumes": [
+      "world/session/release/transport/persistence/audit typed ack/events"
+    ],
+    "produces": [
+      "MaintenanceOrchestrator、ReadyToExit evidence"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "assemble-process-startup-readiness-maintenance-and-shutdown",
+    "title": "组装进程启动、Readiness、维护与结构化关闭",
+    "wave": 12,
+    "module": "process",
+    "objective": "在wiring中连接所有具体typed ports，落实恢复前置、listener/admission开放门、maintenance ReadyToExit和逆序join。",
+    "files": [
+      "modules/process/src/wiring.rs",
+      "modules/process/src/shutdown.rs",
+      "modules/process/src/lib.rs",
+      "modules/process/src/main.rs",
+      "modules/process/tests/shutdown_order_test.rs",
+      "modules/process/tests/wiring_graph_test.rs"
+    ],
+    "dependencies": [
+      "implement-maintenance-orchestration-and-dual-durable-ack",
+      "implement-process-signal-watchdog-and-crash-evidence",
+      "implement-world-slot-resource-and-watchdog-soak"
+    ],
+    "consumes": [
+      "全部模块具体 factories/ports、ValidatedHostCompositionPlan"
+    ],
+    "produces": [
+      "可启动/关闭的`lumio-server` composition root"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "add-e2e-reference-host-shell",
+    "title": "建立 E2E Reference Host Shell 与 Fixture Wiring",
+    "wave": 13,
+    "module": "e2e",
+    "objective": "用dev-only testkit/injected adapters组装真实生产模块，提供可重复的LocalEmbedded场景驱动器。",
+    "files": [
+      "tests/e2e/Cargo.toml",
+      "tests/e2e/src/lib.rs",
+      "tests/e2e/src/reference_host.rs",
+      "tests/e2e/src/scenario.rs",
+      "tests/e2e/src/fixtures.rs",
+      "tests/e2e/tests/reference_host_smoke_test.rs"
+    ],
+    "dependencies": [
+      "assemble-process-startup-readiness-maintenance-and-shutdown",
+      "add-lumio-host-testkit"
+    ],
+    "consumes": [
+      "生产composition、testkit、upstream fixtures"
+    ],
+    "produces": [
+      "E2E ReferenceHost/Scenario API"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "add-repository-dag-queue-source-and-license-gates",
+    "title": "完善仓库 DAG、队列、源码与许可证 Gate",
+    "wave": 13,
+    "module": "repository",
+    "objective": "把最终Cargo图和源码提交到policy/cargo-deny/audit检查，验证零环、零无界、零旧名、零GPL热路径。",
+    "files": [
+      "tests/policy/workspace_dag_test.rs",
+      "tests/policy/queue_matrix_coverage_test.rs",
+      "tests/policy/source_redline_test.rs",
+      "tests/policy/license_policy_test.rs",
+      ".github/workflows/rust-foundation.yml"
+    ],
+    "dependencies": [
+      "assemble-process-startup-readiness-maintenance-and-shutdown",
+      "add-architecture-policy-xtask"
+    ],
+    "consumes": [
+      "最终workspace/queue registry/Cargo.lock"
+    ],
+    "produces": [
+      "Foundation architecture CI gate"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "verify-local-embedded-vertical-skeleton",
+    "title": "验收 LocalEmbedded 可运行垂直骨架",
+    "wave": 14,
+    "module": "e2e",
+    "objective": "从Handshake Envelope bytes开始，完整经过codec/schema/auth/permission/session/slot queue/Tick Barrier并产生架构允许的egress。",
+    "files": [
+      "tests/e2e/tests/local_embedded_vertical_test.rs",
+      "tests/e2e/fixtures/local_embedded_scenario.toml"
+    ],
+    "dependencies": [
+      "add-e2e-reference-host-shell",
+      "add-repository-dag-queue-source-and-license-gates"
+    ],
+    "consumes": [
+      "ReferenceHost、LocalEmbedded carrier、injected verifier/managed runtime fixture"
+    ],
+    "produces": [
+      "Foundation runnable vertical skeleton证据"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "verify-local-split-process-carrier-contract",
+    "title": "验收 LocalSplitProcess Carrier 合同",
+    "wave": 15,
+    "module": "e2e",
+    "objective": "在D-004 adapter可用时以两个进程/loopback carrier运行同一垂直场景，并与LocalEmbedded结果做contract diff。",
+    "files": [
+      "tests/e2e/tests/local_split_process_vertical_test.rs",
+      "tests/e2e/src/contract_diff.rs",
+      "tests/e2e/fixtures/local_split_process_scenario.toml"
+    ],
+    "dependencies": [
+      "verify-local-embedded-vertical-skeleton",
+      "implement-transport-remote-and-fault-adapters"
+    ],
+    "consumes": [
+      "Remote carrier gate、ReferenceHost contract recorder"
+    ],
+    "produces": [
+      "LocalSplitProcess contract parity报告"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "verify-maintenance-dual-ack-fault-domain-and-stale-epoch",
+    "title": "验收维护双 Ack、Fault Domain 与 StaleEpoch",
+    "wave": 15,
+    "module": "e2e",
+    "objective": "组合Graceful/Forced、persistence/audit ack顺序、Runtime witness缺失/存在和slot重建旧命令场景。",
+    "files": [
+      "tests/e2e/tests/maintenance_dual_ack_test.rs",
+      "tests/e2e/tests/fault_domain_test.rs",
+      "tests/e2e/tests/stale_epoch_test.rs",
+      "tests/e2e/fixtures/maintenance_fault_matrix.toml"
+    ],
+    "dependencies": [
+      "verify-local-embedded-vertical-skeleton",
+      "implement-maintenance-orchestration-and-dual-durable-ack"
+    ],
+    "consumes": [
+      "ReferenceHost fault injection、Runtime witness fixtures"
+    ],
+    "produces": [
+      "跨模块故障/维护验收报告"
+    ],
+    "status": "pending"
+  },
+  {
+    "slug": "measure-and-classify-provisional-server-defaults",
+    "title": "测量并分类 SRV-D-001..017 临时默认",
+    "wave": 16,
+    "module": "benchmark",
+    "objective": "以固定workload/hardware/build metadata运行容量、延迟、jitter、durability与shutdown基准，把结果标记为measured/retain/change候选而非公共常量。",
+    "files": [
+      "benches/Cargo.toml",
+      "benches/src/main.rs",
+      "benches/src/workload.rs",
+      "benches/src/report.rs",
+      "benches/workloads/foundation-vertical.toml",
+      "manifests/provisional-defaults-measurement.json",
+      "docs/specs/2026-08-27-foundation-measurement-report.md"
+    ],
+    "dependencies": [
+      "verify-maintenance-dual-ack-fault-domain-and-stale-epoch",
+      "verify-local-split-process-carrier-contract"
+    ],
+    "consumes": [
+      "E2E workloads、所有metrics"
+    ],
+    "produces": [
+      "provisional defaults measurement report/manifest"
+    ],
+    "status": "pending"
+  }
+]
