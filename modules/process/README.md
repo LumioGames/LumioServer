@@ -21,19 +21,20 @@
 - 不定义配置格式契约与 Table Reader（归 `LumioGameRuntime`，架构源 ADR-010）；本模块只做装载、校验、编排与分发。
 - 不拥有 Tick 触发（归 [pacing](../pacing/README.md)）、CoreCLR 生命周期（归 [coreclr-host](../coreclr-host/README.md)）、Slot 状态机（归 [world-slot](../world-slot/README.md)）。
 - 不决定维护命令语义与滚动更新状态（归 [maintenance-agent](../maintenance-agent/README.md)、[release-agent](../release-agent/README.md)）；进程只是被编排的执行单元。
+- 不提供通用 lifecycle callback、Service Locator 或 `Vec<dyn Service>` 插件面；组装与逆序关闭只操作编译期明确的 `Components` 字段和类型化端口。
 
 ## 拥有的状态与资源
 
 - 进程生命周期状态（本仓细化设计，非公共契约）：`Starting -> Ready -> Serving -> Draining -> Stopping -> Exited`，任一活动状态可进入 `Faulted`。
 - 不可变配置快照（当前生效版本 + 其 Hash/签名元数据）。
-- 模块注册表：各模块初始化顺序、析构顺序与健康心跳句柄。
+- 显式 `Components` 组装：每个具体模块的句柄、类型化端口、固定初始化/析构顺序与健康心跳句柄；不存在运行期可扩张的模块注册表。
 - crash marker 文件句柄与退出码。
 
 ## 输入、输出与稳定接口
 
 - **输入**：命令行参数、环境变量、部署配置文件、信号、上次运行遗留的 crash marker。
 - **输出**：不可变配置快照（分发给全部模块）、分类退出码、启动/关闭 Audit 事件、Failure Bundle 触发请求。
-- **稳定接口**（未来实现的边界承诺）：`run() -> ExitCode` 入口；`ConfigSnapshot` 只读句柄；模块注册的 `init/shutdown/health` 三个生命周期挂点。
+- **稳定接口**（未来实现的边界承诺）：`run_from_os(...) -> ExitCode` 薄入口；`ConfigSnapshot` 只读句柄；具体 `Components` 与逐模块类型化 command/event ports。初始化、健康检查和关闭由固定编排直接调用具体组件接口，不注册任意回调。
 
 ## 上游与下游依赖
 

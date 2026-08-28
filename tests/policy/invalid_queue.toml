@@ -1,0 +1,11 @@
+baseline = "LGE-V1.4-2026-08-27"
+registry_source = "modules/README.md#4.2"
+
+[[queue]]
+module = "transport"
+name = "BrokenIngressQueue"
+element = "ValidatedEnvelopeBytes"
+producers = "carrier"
+consumers = "owner thread"
+ordering = "FIFO"
+capacity = "transport.ingress.capacity"

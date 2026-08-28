@@ -1,0 +1,27 @@
+baseline = "LGE-V1.4-2026-08-27"
+composition_root = "process"
+compile_source = "modules/README.md#3.2.1"
+command_source = "modules/README.md#3.2.2"
+event_source = "modules/README.md#3.2.3"
+
+compile_edges = [
+    "host-runtime -> observability",
+    "observability -> host-runtime",
+]
+command_edges = []
+event_edges = []
+
+[[module]]
+name = "process"
+package = "lumio-server-process"
+role = "composition-root"
+
+[[module]]
+name = "host-runtime"
+package = "lumio-host-runtime"
+role = "module"
+
+[[module]]
+name = "observability"
+package = "lumio-observability"
+role = "module"

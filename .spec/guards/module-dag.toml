@@ -1,0 +1,172 @@
+baseline = "LGE-V1.4-2026-08-27"
+baseline_source = ".spec/knowledge/standards/repository-architecture.md#1."
+composition_root = "process"
+compile_source = "modules/README.md#3.2.1"
+command_source = "modules/README.md#3.2.2"
+event_source = "modules/README.md#3.2.3"
+
+compile_edges = [
+    "maintenance-agent -> world-slot",
+    "maintenance-agent -> session",
+    "maintenance-agent -> release-agent",
+    "maintenance-agent -> transport",
+    "maintenance-agent -> persistence-host",
+    "maintenance-agent -> control-plane-adapter",
+    "maintenance-agent -> host-profiles",
+    "maintenance-agent -> host-runtime",
+    "maintenance-agent -> observability",
+    "session -> auth",
+    "session -> release-agent",
+    "session -> world-slot",
+    "session -> transport",
+    "session -> host-profiles",
+    "session -> host-runtime",
+    "session -> observability",
+    "release-agent -> transport",
+    "release-agent -> control-plane-adapter",
+    "release-agent -> host-profiles",
+    "release-agent -> host-runtime",
+    "release-agent -> observability",
+    "world-slot -> coreclr-host",
+    "world-slot -> pacing",
+    "world-slot -> persistence-host",
+    "world-slot -> transport",
+    "world-slot -> host-profiles",
+    "world-slot -> host-runtime",
+    "world-slot -> observability",
+    "transport -> host-profiles",
+    "transport -> host-runtime",
+    "transport -> observability",
+    "auth -> host-profiles",
+    "auth -> host-runtime",
+    "auth -> observability",
+    "pacing -> host-profiles",
+    "pacing -> host-runtime",
+    "pacing -> observability",
+    "coreclr-host -> host-profiles",
+    "coreclr-host -> host-runtime",
+    "coreclr-host -> observability",
+    "persistence-host -> host-profiles",
+    "persistence-host -> host-runtime",
+    "persistence-host -> observability",
+    "control-plane-adapter -> host-profiles",
+    "control-plane-adapter -> host-runtime",
+    "control-plane-adapter -> observability",
+    "observability -> host-runtime",
+]
+
+command_edges = [
+    "external-control-plane -> control-plane-adapter | trusted signed input",
+    "control-plane-adapter -> maintenance-agent | VerifiedMaintenanceCommand",
+    "maintenance-agent -> world-slot | QuiesceForMaintenance or Resume with SlotEpoch",
+    "maintenance-agent -> session | KickRemaining",
+    "maintenance-agent -> transport | Broadcast MaintenanceKick or Disconnect",
+    "maintenance-agent -> release-agent | local PoolMemberTransition",
+    "process -> world-slot | QuiesceForShutdown or ConfigActivation",
+    "world-slot -> pacing | Start Pause Resume or StopPacing",
+    "world-slot -> coreclr-host | native bootstrap and owner-thread managed entry",
+    "world-slot -> persistence-host | PersistSnapshot AppendWal or Checkpoint",
+    "world-slot -> session | IsolateSession with Runtime witness",
+    "session -> auth | Authenticate or Authorize",
+    "session -> release-agent | MatchRelease",
+    "session -> world-slot | Reserve Bind or ReleaseSession",
+    "session -> transport | Bind Unbind or Disconnect",
+    "timer-owner -> host-runtime | RegisterTimer or Cancel",
+]
+
+event_edges = [
+    "transport -> world-slot | IngressBatch owner-thread pull",
+    "transport -> session | HandshakeReady or ConnectionClosed with epoch",
+    "pacing -> world-slot | TickPermit and pacing health",
+    "coreclr-host -> world-slot | managed result ErrorCode and optional FaultClass witness",
+    "world-slot -> session | GateStateChanged SlotFaulted or admission ack",
+    "world-slot -> maintenance-agent | Quiesce progress ack with epoch",
+    "world-slot -> process | shutdown progress or ReadyToStop",
+    "session -> maintenance-agent | DrainProgress or terminal ack",
+    "persistence-host -> world-slot | CommitAck or DiskPressure",
+    "persistence-host -> maintenance-agent | PersistenceCommitAck",
+    "observability -> maintenance-agent | AuditDurableAck or AuditBackpressure",
+    "observability -> world-slot | AuditBackpressure",
+    "auth -> transport | ReplayStorm through process typed bridge",
+    "host-runtime -> timer-owner | TimerFired to owner inbox",
+    "host-runtime -> process | TaskPanicked or supervision terminal",
+    "maintenance-agent -> control-plane-adapter | Progress or ReadyToExit",
+    "release-agent -> control-plane-adapter | Health or Identity",
+    "process -> control-plane-adapter | lifecycle or exit evidence",
+    "control-plane-adapter -> external-control-plane | local status or evidence",
+]
+
+[[module]]
+name = "process"
+package = "lumio-server-process"
+role = "composition-root"
+
+[[module]]
+name = "host-runtime"
+package = "lumio-host-runtime"
+role = "module"
+
+[[module]]
+name = "transport"
+package = "lumio-transport"
+role = "module"
+
+[[module]]
+name = "auth"
+package = "lumio-auth"
+role = "module"
+
+[[module]]
+name = "session"
+package = "lumio-session"
+role = "module"
+
+[[module]]
+name = "world-slot"
+package = "lumio-world-slot"
+role = "module"
+
+[[module]]
+name = "pacing"
+package = "lumio-pacing"
+role = "module"
+
+[[module]]
+name = "coreclr-host"
+package = "lumio-coreclr-host"
+role = "module"
+
+[[module]]
+name = "release-agent"
+package = "lumio-release-agent"
+role = "module"
+
+[[module]]
+name = "persistence-host"
+package = "lumio-persistence-host"
+role = "module"
+
+[[module]]
+name = "maintenance-agent"
+package = "lumio-maintenance-agent"
+role = "module"
+
+[[module]]
+name = "control-plane-adapter"
+package = "lumio-control-plane-adapter"
+role = "module"
+
+[[module]]
+name = "observability"
+package = "lumio-observability"
+role = "module"
+
+[[module]]
+name = "host-profiles"
+package = "lumio-host-profiles"
+role = "module"
+
+[[module]]
+name = "protocol-dispatch"
+package = ""
+role = "blocked"

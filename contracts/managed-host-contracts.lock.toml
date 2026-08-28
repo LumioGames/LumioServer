@@ -1,0 +1,12 @@
+# Controlled refusal: the upstream repository has no published Managed Host ABI Rust package.
+lock_format = 1
+contract = "managed-host"
+availability = "missing"
+source_repository = "LumioGameRuntime"
+source_path = "C:/Work/LumioGames/LumioGameRuntime"
+source_commit = "5e480dd4a6fc9989d05ae8cd257a80c3b5eac513"
+baseline_id = "LGE-V1.4-2026-08-27"
+expected_artifact = "Managed Host ABI generated Rust package"
+missing_reason = "Only the architecture CSharp wrapper exists; no Managed Host ABI Rust package or descriptor is published"
+boundary_path = "generated/lumio-managed-host-contracts"
+boundary_hash = "bb7025fa3104825a11e53ae6eac381a0ab9d5fe4886d58e56f77a6da02dac282"

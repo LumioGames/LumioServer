@@ -1,0 +1,12 @@
+# Controlled refusal: CoreEngine AG-001 still blocks publication of the Root ABI artifact.
+lock_format = 1
+contract = "core-engine"
+availability = "missing"
+source_repository = "LumioCoreEngine"
+source_path = "C:/Work/LumioGames/LumioCoreEngine"
+source_commit = "68e144220ec7c4e0c8d16e4bde8a0b351cb549e9"
+baseline_id = "LGE-V1.4-2026-08-27"
+expected_artifact = "CoreEngine Root ABI generated Rust package"
+missing_reason = "Root ABI generator and contracts crates explicitly report AG-001 blocked and publish no generated API"
+boundary_path = "generated/lumio-core-engine-contracts"
+boundary_hash = "5f4bce4aa22f99afeda326d2adf760263c902dcdacd37bd500f7881fc7f81fe7"

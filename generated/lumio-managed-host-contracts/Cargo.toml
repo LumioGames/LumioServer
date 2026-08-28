@@ -1,0 +1,22 @@
+[package]
+name = "lumio-managed-host-contracts"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98.0"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+resolver = "2"
+
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[package.metadata.lumio-contract]
+availability = "missing"
+lock = "../../contracts/managed-host-contracts.lock.toml"

@@ -57,7 +57,8 @@ CoreClrDown -> CoreEngineLoaded -> CoreClrStarted -> RuntimeLoaded
 
 ## 线程、队列与并发所有权
 
-- 无自有线程；全部 Managed 调用发生在 Simulation Owner Thread 上。
+- 无自有线程；`nethost`/`hostfxr` discovery、CoreCLR 原生 bootstrap 与 function-table 获取可在 `host-runtime` 监督的 control context 完成，此时尚未进入 Managed Ready。
+- Simulation Owner Thread 绑定后，Managed delegate 的初始化、Gameplay load/unload 与 Tick 调用全部只在该 Owner Thread 执行；原生 bootstrap control 不冒充 Managed Tick 入口。
 - Native Worker 不回调 Hot Gameplay；Managed 调用期间不得持有可能阻塞的 Rust 锁；取消、超时与 World 销毁后的异步完成是终态且不能写状态（架构源 §8.1）。
 - 跨边界只传固定宽度 POD、版本化 Buffer 与不透明 Index+Generation+Context Handle；内存由创建侧释放或调用方提供 Buffer。
 

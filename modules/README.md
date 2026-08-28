@@ -1,7 +1,7 @@
 # LumioServer 系统架构（模块总入口）
 
-> **架构基线**：`LGE-V1.2-2026-08-27`
-> **唯一架构源**：`LumioGameEngineArchitecture`（本仓只保存只读镜像 [docs/architecture/LumioGameEngine_Architecture_v1.2.md](../docs/architecture/LumioGameEngine_Architecture_v1.2.md)）
+> **架构基线**：`LGE-V1.4-2026-08-27`
+> **唯一架构源**：`LumioGameEngineArchitecture` 固定提交 `d3252a8886b4bfd56fbb08490c3db0e6fc8c9550`（本仓只保存只读镜像 [docs/architecture/LumioGameEngine_Architecture_v1.4.md](../docs/architecture/LumioGameEngine_Architecture_v1.4.md)）
 > **本文定位**：LumioServer 源码模块骨架的架构总入口。公共语义一律引用架构源，本文只定义本仓内部的模块划分、依赖方向、线程/队列拓扑和运维流程编排；与架构源冲突时以架构源为准。
 
 ## 1. 设计目标、范围与非目标
@@ -119,7 +119,7 @@ graph TD
 - `process` 是**组装根**：唯一允许知道全部模块并按 §6.1 顺序初始化/析构它们、完成端口接线的模块；不入层，不画边以免掩盖运行期依赖。
 - `host-runtime` 是编译最底层（含 observability 也依赖它）；`observability` 与 `host-profiles` 是全员只读依赖，不得回调上层。
 - 同层依赖仅登记下列五条：`session -> world-slot`、`maintenance-agent -> world-slot`、`maintenance-agent -> session`、`session -> release-agent`、`maintenance-agent -> release-agent`；其余同层依赖是驳回项。
-- `protocol-dispatch` 封锁中，无任何边。
+- `protocol-dispatch` 封锁中：目录只允许保留 `README.md`，不得出现 `Cargo.toml`、`src/`、package/target/API，也不得被任何 crate 依赖；三张图均无它的边。
 
 #### 3.2.2 运行期命令流（谁指挥谁；全部为类型化命令，箭头指向执行方）
 
@@ -373,7 +373,7 @@ Server 相关 Preset（公共 Schema：架构源 `schemas/host-capability.schema
 | SessionRevisionVector | `schemas/common.schema.json`（`sessionRevisionVector`） | `session-revision-vector.json` / `session-revision-negative.json` | session、persistence-host |
 | CrossWorldTxn | `schemas/cross-world-txn.schema.json` | `cross-world-txn-committed.json`、`cross-world-txn-aborted.json` / `cross-world-txn-partial-commit.json` | persistence-host（仅 durability） |
 | FaultClass / ErrorCode（`StaleEpoch`、`FencingTokenStale` 等） | `ids/index.json` | `id-registry.json` / `id-registry-duplicate.json` | world-slot、coreclr-host、control-plane-adapter |
-| WorldSlotHost/SimulationSession 状态机与聚合根条款 | `docs/architecture/LumioGameEngine_Architecture_v1.2.md` §3.2 与 `docs/adr/ADR-001-session-lifecycle.md` | 由 Host 测试覆盖每个迁移 + `StaleEpoch` 拒绝 | world-slot、session |
+| WorldSlotHost/SimulationSession 状态机与聚合根条款 | `docs/architecture/LumioGameEngine_Architecture_v1.4.md` §3.2 与 `docs/adr/ADR-001-session-lifecycle.md` | 由 Host 测试覆盖每个迁移 + `StaleEpoch` 拒绝 | world-slot、session |
 | Pool 滚动更新状态机与控制面条款 | 同上 §13.2/§13.3 与 `docs/adr/ADR-012-release-update-maintenance.md` | 见 ReleaseCatalog/Maintenance Fixture | release-agent、maintenance-agent、control-plane-adapter |
 | 13 相 Tick、ProcessorDescriptor | 同上 §4 与 `docs/adr/ADR-002-tick-determinism.md` | `processor-place-voxel.json` / `processor-read-write-conflict.json` | pacing、world-slot（只消费入口） |
 | NativeManagedAbiV1 与 FaultClass 见证条款 | `schemas/native-managed-abi.schema.json` 与 `docs/adr/ADR-006-native-managed-abi.md` | `native-managed-abi.json` / `native-managed-abi-pointer-width.json` | coreclr-host |

@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lumio-host-testkit",
+    "generated/lumio-architecture-contracts",
+    "modules/process",
+    "tools/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98.0"
+license = "Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

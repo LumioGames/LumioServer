@@ -1,0 +1,85 @@
+baseline = "LGE-V1.4-2026-08-27"
+baseline_source = ".spec/knowledge/standards/repository-architecture.md#1."
+registry_snapshot = "LGE-V1.2-2026-08-27"
+registry_source = "modules/README.md#4.2"
+design_registry = "docs/LumioServer_Framework_Implementation_Design_2026-08-27/manifests/queue-registry.json"
+required_fields = [
+    "module",
+    "queue",
+    "element",
+    "owner",
+    "producers",
+    "consumers",
+    "ordering",
+    "capacity_config",
+    "full_action",
+    "close_semantics",
+]
+
+registry_trace_rows = [
+    "per-session Ingress",
+    "per-session Egress",
+    "Diagnostic 日志",
+    "Audit durable",
+    "WAL / TxnJournal / CommandLog",
+    "维护命令幂等队列",
+    "聚合命令收件箱",
+    "Session 命令收件箱",
+    "连接命令队列",
+    "Timer 投递",
+    "Watchdog 心跳汇聚",
+]
+
+registry_trace_contracts = [
+    "per-session Ingress | transport | 亲和 Reactor 分片 → Simulation Owner Thread（SPSC） | 单连接 FIFO | SRV-D-001 | Unreliable 丢弃计数；Reliable 断开连接 | Gate 关闭后停收；Quiesce 按序列处置余量",
+    "per-session Egress | transport | Simulation Owner Thread → 发送线程 | 单连接 FIFO | SRV-D-002 | 可靠积压先降速后断开 | 断开前按 SRV-D-002 排空语义 flush",
+    "Diagnostic 日志 | observability | 任意线程 → Sink 线程 | 每 Producer `eventSeq` | SRV-D-008 | 按级别/类别采样丢弃并计数 | 尽力 Flush",
+    "Audit durable | observability | 任意线程 → Audit Sink | 每 Producer `eventSeq`；落盘回 durable ack | SRV-D-014 | **不丢**；置背压状态，聚合根关闸/进维护 | 必须 Flush 完才允许退出",
+    "WAL / TxnJournal / CommandLog | persistence-host | Simulation Owner Thread → Persistence Worker | 严格追加序；落盘回 commit ack | SRV-D-014 | **不丢**；拒新命令或触发维护 | 必须 Flush 完才允许退出",
+    "维护命令幂等队列 | control-plane-adapter | 已验证命令 → maintenance-agent | FIFO；`maintenanceId` 幂等 | SRV-D-015 | 稳定错误拒绝（控制面重试） | Stopping 期拒新命令",
+    "聚合命令收件箱 | world-slot | maintenance-agent/process/session → 聚合控制上下文 | FIFO；epoch 校验 | SRV-D-015 | 稳定错误拒绝 | Destroyed 后全部拒绝",
+    "Session 命令收件箱 | session | transport 事件/world-slot 命令/Timer → session 上下文 | FIFO；连接 epoch 校验 | SRV-D-015 | 稳定错误拒绝 | 终结后拒绝",
+    "连接命令队列 | transport | session/maintenance-agent → Reactor 分片 | 单连接串行 | SRV-D-015 | 稳定错误拒绝 | Closed 后拒绝",
+    "Timer 投递 | host-runtime | Timer 线程 → 各所有者收件箱 | 到期序（尽力） | 随目标队列 | 按目标队列满载动作；deadline 类投递失败升级监督事件 | 取消级联后停止",
+    "Watchdog 心跳汇聚 | process | 全部具名线程 → 进程级 Watchdog | 无序（最新心跳时间戳） | SRV-D-016 | 覆盖旧心跳（只保留最新） | 进程退出前停止判定",
+]
+
+contracts = [
+    "process::ProcessControlInbox",
+    "process::WatchdogHeartbeatInbox",
+    "host-runtime::BoundedPort<T>",
+    "host-runtime::SpscPort<T>",
+    "host-runtime::TimerDeliveryPort",
+    "host-runtime::SupervisorEventPort",
+    "transport::ConnectionIngressQueue",
+    "transport::ConnectionEgressQueue",
+    "transport::ConnectionCommandQueue",
+    "auth::AuthRequestQueue",
+    "auth::AuthEventQueue",
+    "session::SessionControlInbox",
+    "session::SessionEventOutbox",
+    "world-slot::WorldSlotAggregateInbox",
+    "world-slot::TickPermitQueue",
+    "world-slot::NativeCompletionQueue",
+    "pacing::PacingCommandInbox",
+    "pacing::TickPermitQueue",
+    "coreclr-host::CoreClrControlInbox",
+    "coreclr-host::CoreClrEventOutbox",
+    "release-agent::ReleaseCommandInbox",
+    "release-agent::ReleaseEventOutbox",
+    "persistence-host::WalWriteQueue",
+    "persistence-host::TxnJournalQueue",
+    "persistence-host::CommandLogQueue",
+    "persistence-host::SnapshotQueue",
+    "persistence-host::PersistenceEventQueue",
+    "maintenance-agent::VerifiedMaintenanceCommandQueue",
+    "maintenance-agent::MaintenanceInbox",
+    "maintenance-agent::MaintenanceEventOutbox",
+    "control-plane-adapter::ControlIngressQueue",
+    "control-plane-adapter::VerifiedControlQueue",
+    "control-plane-adapter::StatusReportQueue",
+    "observability::DiagnosticQueue",
+    "observability::AuditDurableQueue",
+    "observability::FailureBundleRequestQueue",
+    "observability::EvidenceFragmentQueue",
+]

@@ -28,7 +28,19 @@ metadata:
 ## 语言 / 框架特定风格
 
 - Server Host 与网络基础设施使用 Rust；CoreCLR/Gameplay 只能经版本化 Host/Runtime Contract 和隔离 Adapter 加载。
-- 当前仓库尚未提交 Cargo 工程。首次引入代码时必须固定 Rust toolchain、`rustfmt`、`clippy`、依赖/漏洞审计与可复现验证命令，并更新本文和 [`testing.md`](./testing.md)。
+- Rust 工程固定在 `rust-toolchain.toml` 的 `1.98.0`（`rustfmt` 与 `clippy` 组件）；workspace package 必须继承 `edition`、`rust-version`、`license` 与 `[lints] workspace = true`，不得在 crate 内漂移。
 - Rust 模块、文件、函数与局部变量使用 `snake_case`，类型与 trait 使用 `PascalCase`，常量使用 `SCREAMING_SNAKE_CASE`；已发布 Envelope/Manifest/Schema 标识符保持原拼写。
 - 规范正文使用中文，代码标识符、协议字段和命令保留原始英文；Markdown 与结构化文本保持 LF（见根 `.gitattributes`）。
 - Envelope、Endpoint、ReleaseCatalog、Maintenance 与日志 Contract 的生成物只从架构源生成，记录 Compiler/Input/Output Hash，不维护第二套手写协议。
+
+## Rust 工具链与 lint 纪律
+
+- 格式统一由 `cargo fmt --all -- --check` 判定；不得以手工格式差异绕过检查。
+- 质量门统一使用 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`。新增 lint 例外必须有明确的代码边界和评审依据，不能用全局 `allow` 掩盖问题。
+- `unsafe` 默认禁止（workspace `unsafe_code = "deny"`）；只有 FFI/平台 Adapter 的最小边界可在后续任务提出局部、可审计的例外，并附安全不变量和测试。
+- 依赖版本由 workspace 集中管理；Cargo.lock 必须提交，CI 与本地收口命令使用 `--locked`。未经批准的网络、日志、CoreCLR 或协议供应商不得进入骨架。
+- 生产代码不得直接 `spawn`、`sleep`、轮询或构造无界 channel；线程、Timer、异步任务和端口统一经 `host-runtime` 的监督 API。文档中的反例文字不构成实现许可。
+
+## 骨架阶段入口
+
+当前 workspace 只包含无生产行为的 `process` 与 `xtask` 骨架。`process` 的 binary 必须保持薄入口，业务组装、协议和模块实现由后续任务按所有权加入；`protocol-dispatch` 永不因 workspace glob 自动成为 package。

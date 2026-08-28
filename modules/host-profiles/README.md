@@ -9,7 +9,7 @@
 ## 负责什么
 
 - 解析并持有本进程的 Host Capability 声明（公共 Schema：架构源 `schemas/host-capability.schema.json`——`preset`、`roomMode`、`roles`、`capabilities`、`platformProfile`、`faultProfile`、`requiredCapabilities`）。
-- Preset 组装矩阵：`RemoteDS`、`LocalSplitProcess`、`LocalEmbedded`、`PureHeadless`、`NativeHeadless` 各自对应的模块装配差异（例如 `LocalEmbedded` 用 InMemory 传输 Adapter，`RemoteDS` 用完整网络栈），供 [process](../process/README.md) 组装时消费。
+- Preset 组合决议：把 `RemoteDS`、`LocalSplitProcess`、`LocalEmbedded`、`PureHeadless`、`NativeHeadless` 解析为不可变 `HostCompositionPlan`，只包含能力、角色和 adapter kind 等值；[process](../process/README.md) 的 `wiring` 负责把这些 kind 映射到具体 factory 与组件。
 - Required/Provided Capability 匹配：Scenario 声明 `requiredCapabilities`，Host 声明 `capabilities`；只允许匹配组合激活，失败发生在 Session 激活之前并携带稳定原因。
 - Fault Decorator 配置入口：按 Host Profile 声明延迟、抖动、丢包、乱序、重复、断线、重连、QueueFull 注入，带确定性 Seed，并把 fault profile 记录进 Replay/Failure Bundle 元数据（架构源 ADR-009）。
 - LocalEmbedded 保真约束的**声明与守护**：LocalEmbedded 可绕过 Socket/TLS/OS 网络栈，但必须复用同一 Envelope、Codec、大小限制、权限路径、有界队列与 Tick 交付；本模块负责把"哪些可绕过、哪些不可绕过"表达为 Capability 组合，使旁路在类型上不可表达。
@@ -25,19 +25,19 @@
 ## 拥有的状态与资源
 
 - 本进程生效的 HostCapability 声明（启动期解析、运行期不可变）。
-- Preset 到模块装配差异的映射表（静态设计数据）。
+- Preset 到能力、角色与 adapter kind 的不可变决议表；不持有具体模块 factory 或组件句柄。
 - Fault Decorator 配置（含确定性 Seed），运行期只读。
 
 ## 输入、输出与稳定接口
 
 - **输入**：部署配置中的 Preset 选择与 Capability 覆盖、Scenario 的 `requiredCapabilities`（经 Release/握手输入）。
 - **输出**：只读 Capability 查询结果、Preset 装配决议、Capability 匹配裁决（通过/带稳定原因失败）、fault profile 元数据。
-- **稳定接口**：`provided_capabilities()` 只读查询；`match_required(required) -> Ok | StableReason` 匹配裁决；`transport_profile()`、`fault_profile()` 装配查询。
+- **稳定接口**：`provided_capabilities()` 只读查询；`match_required(required) -> Ok | StableReason` 匹配裁决；`resolve_composition() -> HostCompositionPlan`；`fault_profile()` 声明查询。
 
-## 上游与下游依赖
+## 编译依赖与消费者
 
-- **上游**：[process](../process/README.md)（启动装配）、[transport](../transport/README.md)（传输/故障注入 Profile）、[auth](../auth/README.md)（权限相关能力位）、[coreclr-host](../coreclr-host/README.md)（Native/Runtime 能力位）、[session](../session/README.md)（激活前匹配，经 [release-agent](../release-agent/README.md) 的 Capability 校验链）。
-- **下游**：仅 [observability](../observability/README.md)（记录匹配失败事件）。本模块不得回调任何上层模块。
+- **一等模块依赖**：零。`host-profiles` 只消费生成契约中的值类型和启动配置，不编译依赖 process、transport、auth、coreclr-host、session、release-agent 或 observability。
+- **消费者**：上述模块可以只读消费 `HostCompositionPlan`/Capability 匹配结果；具体 factory mapping、端口接线及匹配失败 Audit 均由 [process](../process/README.md) 组装根连接到对应所有者。本模块不回调消费者。
 
 ## 生命周期与状态机
 
