@@ -1,4 +1,7 @@
-use super::{value_array, value_string, Document, Value};
+use super::{
+    has_markdown_heading, markdown_fence_marker, markdown_indented_code, markdown_section,
+    value_array, value_string, Document, Value,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -36,6 +39,27 @@ const TRACE_FIELDS: &[&str] = &[
     "capacity",
     "full",
     "close",
+];
+const TRACE_HEADER_EN: &[&str] = &[
+    "queue", "owner", "producer", "ordering", "capacity", "full", "close",
+];
+const TRACE_HEADER_EN_EXPLICIT: &[&str] = &[
+    "queue",
+    "owner",
+    "producer/consumer",
+    "ordering",
+    "capacity",
+    "full",
+    "close",
+];
+const TRACE_HEADER_ZH: &[&str] = &[
+    "队列",
+    "所有者",
+    "生产者 → 消费者",
+    "顺序保证",
+    "容量门",
+    "满载动作",
+    "关闭语义",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -409,67 +433,57 @@ fn validate_registry_trace(
     errors
 }
 
-fn markdown_section(text: &str, anchor: &str) -> Option<String> {
-    let mut section = Vec::new();
-    let mut level = None;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let heading_level = trimmed
-            .chars()
-            .take_while(|character| *character == '#')
-            .count();
-        if level.is_none() {
-            if heading_level > 0
-                && trimmed[heading_level..].split_whitespace().next() == Some(anchor)
-            {
-                level = Some(heading_level);
-            }
-            continue;
-        }
-        if heading_level > 0 && heading_level <= level.unwrap_or(heading_level) {
-            break;
-        }
-        section.push(line);
-    }
-    level.map(|_| section.join("\n"))
-}
-
 fn markdown_queue_rows(section: &str, source: &str) -> (BTreeMap<String, String>, Vec<String>) {
     let mut rows = BTreeMap::new();
     let mut errors = Vec::new();
     let mut fence = None;
-    for line in section.lines().map(str::trim) {
+    let mut awaiting_delimiter = false;
+    let mut in_table = false;
+    for raw_line in section.lines() {
+        if markdown_indented_code(raw_line) {
+            awaiting_delimiter = false;
+            in_table = false;
+            continue;
+        }
+        let line = raw_line.trim();
         if let Some((marker, width)) = fence {
-            if fence_marker(line).is_some_and(|(candidate, candidate_width)| {
-                candidate == marker
-                    && candidate_width >= width
-                    && line[candidate_width..].trim().is_empty()
-            }) {
+            if markdown_fence_marker(raw_line).is_some_and(
+                |(candidate, candidate_width, suffix)| {
+                    candidate == marker && candidate_width >= width && suffix.trim().is_empty()
+                },
+            ) {
                 fence = None;
             }
             continue;
         }
-        if let Some(marker) = fence_marker(line) {
-            fence = Some(marker);
+        if let Some((marker, width, _)) = markdown_fence_marker(raw_line) {
+            fence = Some((marker, width));
+            awaiting_delimiter = false;
+            in_table = false;
             continue;
         }
-        if !line.starts_with('|') || !line.ends_with('|') {
+        let Some(cells) = markdown_cells(line) else {
+            awaiting_delimiter = false;
+            in_table = false;
+            continue;
+        };
+        if is_queue_header(&cells) {
+            awaiting_delimiter = true;
+            in_table = false;
             continue;
         }
-        let cells = line
-            .trim_matches('|')
-            .split('|')
-            .map(str::trim)
-            .collect::<Vec<_>>();
-        if cells.iter().all(|cell| {
-            !cell.is_empty()
-                && cell
-                    .chars()
-                    .all(|character| matches!(character, '-' | ':' | ' '))
-        }) || cells
-            .first()
-            .is_some_and(|cell| cell.eq_ignore_ascii_case("queue") || *cell == "队列")
-        {
+        if awaiting_delimiter {
+            awaiting_delimiter = false;
+            if is_table_delimiter(&cells) {
+                in_table = true;
+            } else {
+                errors.push(format!(
+                    "queue trace table in `{source}` must place a Markdown delimiter after its header"
+                ));
+            }
+            continue;
+        }
+        if !in_table {
             continue;
         }
         if cells.len() != TRACE_FIELDS.len() {
@@ -497,16 +511,33 @@ fn markdown_queue_rows(section: &str, source: &str) -> (BTreeMap<String, String>
     (rows, errors)
 }
 
-fn fence_marker(line: &str) -> Option<(u8, usize)> {
-    let marker = *line.as_bytes().first()?;
-    if !matches!(marker, b'`' | b'~') {
+fn markdown_cells(line: &str) -> Option<Vec<&str>> {
+    if !line.starts_with('|') || !line.ends_with('|') {
         return None;
     }
-    let width = line
-        .bytes()
-        .take_while(|candidate| *candidate == marker)
-        .count();
-    (width >= 3).then_some((marker, width))
+    Some(line.trim_matches('|').split('|').map(str::trim).collect())
+}
+
+fn is_queue_header(cells: &[&str]) -> bool {
+    [TRACE_HEADER_EN, TRACE_HEADER_EN_EXPLICIT]
+        .iter()
+        .any(|header| {
+            cells.len() == header.len()
+                && cells
+                    .iter()
+                    .zip(*header)
+                    .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+        })
+        || cells == TRACE_HEADER_ZH
+}
+
+fn is_table_delimiter(cells: &[&str]) -> bool {
+    cells.len() == TRACE_FIELDS.len()
+        && cells.iter().all(|cell| {
+            let marker = cell.strip_prefix(':').unwrap_or(cell);
+            let marker = marker.strip_suffix(':').unwrap_or(marker);
+            marker.len() >= 3 && marker.bytes().all(|byte| byte == b'-')
+        })
 }
 
 fn validate_trace_source(root: &Path, source: &str) -> Vec<String> {
@@ -520,14 +551,6 @@ fn validate_trace_source(root: &Path, source: &str) -> Vec<String> {
             "queue trace source `{source}` cannot be read: {error}"
         )],
     }
-}
-
-fn has_markdown_heading(text: &str, anchor: &str) -> bool {
-    text.lines().any(|line| {
-        let line = line.trim_start();
-        let heading = line.trim_start_matches('#');
-        line.starts_with('#') && heading.split_whitespace().next() == Some(anchor)
-    })
 }
 
 fn parse_flat_json_array(text: &str) -> Result<Vec<BTreeMap<String, String>>, String> {
@@ -701,7 +724,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("README.md"),
-            "# 1. Baseline\n\n## 4.2 Queues\n\n| queue | owner | producer | ordering | capacity | full | close |\n| --- | --- | --- | --- | --- | --- | --- |\n",
+            "# 1. Baseline\n\n## 4.2 Queues\n\nThe matrix is temporarily absent.\n\n| Ingress | transport | reactor -> slot | FIFO | ingress.capacity | reject | drain |\n\n| queue | owner | producer | ordering | capacity | full | close |\n\n| --- | --- | --- | --- | --- | --- | --- |\n| Ingress | transport | reactor -> slot | FIFO | ingress.capacity | reject | drain |\n",
         )
         .unwrap();
         std::fs::write(
@@ -778,5 +801,64 @@ registry_trace_contracts = ["Ingress | transport | reactor -> slot | FIFO | ingr
             "queue semantics drift was accepted: {errors:?}"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hidden_queue_tables_are_not_trace_evidence() {
+        let fenced = "```markdown\n## 4.2 Queues\n| queue | owner | producer | ordering | capacity | full | close |\n| --- | --- | --- | --- | --- | --- | --- |\n```\n";
+        assert!(
+            markdown_section(fenced, "4.2").is_none(),
+            "heading inside a fence was accepted"
+        );
+
+        let commented = "## 4.2 Queues\n<!--\n| queue | owner | producer | ordering | capacity | full | close |\n| --- | --- | --- | --- | --- | --- | --- |\n| Ingress | transport | reactor -> slot | FIFO | ingress.capacity | reject | drain |\n-->\n";
+        let section = markdown_section(commented, "4.2").expect("visible queue heading");
+        let (rows, _) = markdown_queue_rows(&section, "README.md#4.2");
+        assert!(rows.is_empty(), "HTML-commented queue row was accepted");
+
+        let indented_heading = "    ## 4.2 Queues\n    | queue | owner | producer | ordering | capacity | full | close |\n";
+        assert!(
+            markdown_section(indented_heading, "4.2").is_none(),
+            "heading inside an indented code block was accepted"
+        );
+
+        for indentation in ["    ", "\t"] {
+            let table = format!(
+                "## 4.2 Queues\n{indentation}| queue | owner | producer | ordering | capacity | full | close |\n{indentation}| --- | --- | --- | --- | --- | --- | --- |\n{indentation}| Ingress | transport | reactor -> slot | FIFO | ingress.capacity | reject | drain |\n"
+            );
+            let section = markdown_section(&table, "4.2").expect("visible queue heading");
+            let (rows, _) = markdown_queue_rows(&section, "README.md#4.2");
+            assert!(rows.is_empty(), "indented queue table was accepted");
+        }
+
+        let raw_html = "<pre>\n## 4.2 Queues\n| queue | owner | producer | ordering | capacity | full | close |\n| --- | --- | --- | --- | --- | --- | --- |\n| Ingress | transport | reactor -> slot | FIFO | ingress.capacity | reject | drain |\n</pre>\n";
+        assert!(
+            markdown_section(raw_html, "4.2").is_none(),
+            "heading inside a raw HTML block was accepted"
+        );
+
+        let raw_html_table = "## 4.2 Queues\n<pre>\n| queue | owner | producer | ordering | capacity | full | close |\n| --- | --- | --- | --- | --- | --- | --- |\n| Ingress | transport | reactor -> slot | FIFO | ingress.capacity | reject | drain |\n</pre>\n";
+        let section = markdown_section(raw_html_table, "4.2").expect("visible queue heading");
+        let (rows, _) = markdown_queue_rows(&section, "README.md#4.2");
+        assert!(rows.is_empty(), "raw-HTML queue table was accepted");
+
+        let type_seven_html = "<span>\n## 4.2 Queues\n| queue | owner | producer | ordering | capacity | full | close |\n| --- | --- | --- | --- | --- | --- | --- |\n| Ingress | transport | reactor -> slot | FIFO | ingress.capacity | reject | drain |\n</span>\n";
+        assert!(
+            markdown_section(type_seven_html, "4.2").is_none(),
+            "heading inside a type-7 HTML block was accepted"
+        );
+
+        let type_seven_html_table = "## 4.2 Queues\n<span>\n| queue | owner | producer | ordering | capacity | full | close |\n| --- | --- | --- | --- | --- | --- | --- |\n| Ingress | transport | reactor -> slot | FIFO | ingress.capacity | reject | drain |\n</span>\n";
+        let section =
+            markdown_section(type_seven_html_table, "4.2").expect("visible queue heading");
+        let (rows, _) = markdown_queue_rows(&section, "README.md#4.2");
+        assert!(rows.is_empty(), "type-7 HTML queue table was accepted");
+    }
+
+    #[test]
+    fn malformed_markdown_delimiter_is_not_a_queue_table() {
+        let section = "| queue | owner | producer | ordering | capacity | full | close |\n| ::::---:::: | ::::---:::: | ::::---:::: | ::::---:::: | ::::---:::: | ::::---:::: | ::::---:::: |\n| Ingress | transport | reactor -> slot | FIFO | ingress.capacity | reject | drain |\n";
+        let (rows, _) = markdown_queue_rows(section, "README.md#4.2");
+        assert!(rows.is_empty(), "malformed delimiter was accepted");
     }
 }

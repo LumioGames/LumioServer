@@ -330,7 +330,7 @@ fn verify_missing_boundary(
         return errors;
     };
     match repository_path(repository_root, relative_path) {
-        Ok(path) => match directory_hash(&path, false) {
+        Ok(path) => match refusal_boundary_hash(&path) {
             Ok(actual_hash) if actual_hash == *expected_hash => {}
             Ok(actual_hash) => errors.push(format!(
                 "controlled refusal boundary hash drift at {}: expected {expected_hash}, got {actual_hash}",
@@ -457,24 +457,26 @@ fn verify_generator_identity(
     fields: &BTreeMap<String, String>,
     errors: &mut Vec<String>,
 ) {
+    match generator_identity_hash(source_root) {
+        Ok(actual) => check_hash(
+            "generator identity",
+            &fields["generator_identity"],
+            &actual,
+            errors,
+        ),
+        Err(error) => errors.push(error),
+    }
+}
+
+fn generator_identity_hash(source_root: &Path) -> Result<String, String> {
     let mut bytes = Vec::new();
     for relative in ["tools/lumio_contract.py", "tools/lumio_generate.py"] {
-        match fs::read(source_root.join(relative)) {
-            Ok(mut file) => bytes.append(&mut file),
-            Err(error) => {
-                errors.push(format!(
-                    "cannot read upstream generator {relative}: {error}"
-                ));
-                return;
-            }
-        }
+        bytes.extend(
+            canonical_file_bytes(&source_root.join(relative))
+                .map_err(|error| format!("cannot read upstream generator {relative}: {error}"))?,
+        );
     }
-    check_hash(
-        "generator identity",
-        &fields["generator_identity"],
-        &sha256_hex(&bytes),
-        errors,
-    );
+    Ok(sha256_hex(&bytes))
 }
 
 fn verify_input_hash(
@@ -971,9 +973,7 @@ fn architecture_input_hash(source_root: &Path) -> Result<String, String> {
         }
         material.extend_from_slice(relative.as_bytes());
         material.push(0);
-        material.extend_from_slice(
-            &fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?,
-        );
+        material.extend_from_slice(&canonical_file_bytes(&path)?);
     }
     Ok(sha256_hex(&material))
 }
@@ -1003,6 +1003,18 @@ fn collect_json_files(
 }
 
 fn directory_hash(directory: &Path, skip_descriptor: bool) -> Result<String, String> {
+    directory_hash_with_options(directory, skip_descriptor, false)
+}
+
+fn refusal_boundary_hash(directory: &Path) -> Result<String, String> {
+    directory_hash_with_options(directory, false, true)
+}
+
+fn directory_hash_with_options(
+    directory: &Path,
+    skip_descriptor: bool,
+    skip_cargo_outputs: bool,
+) -> Result<String, String> {
     if !directory.is_dir() {
         return Err(format!(
             "contract directory does not exist: {}",
@@ -1010,7 +1022,7 @@ fn directory_hash(directory: &Path, skip_descriptor: bool) -> Result<String, Str
         ));
     }
     let mut paths = Vec::new();
-    collect_regular_files(directory, directory, &mut paths)?;
+    collect_regular_files(directory, directory, &mut paths, skip_cargo_outputs)?;
     paths.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut lines = Vec::new();
@@ -1024,27 +1036,14 @@ fn directory_hash(directory: &Path, skip_descriptor: bool) -> Result<String, Str
 }
 
 fn directory_file_hash(path: &Path) -> Result<String, String> {
-    const TEXT_EXTENSIONS: &[&str] = &[
-        "cs", "csproj", "json", "md", "props", "rs", "targets", "toml",
-    ];
-    let bytes =
-        fs::read(path).map_err(|error| format!("cannot hash {}: {error}", path.display()))?;
-    let is_text = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| TEXT_EXTENSIONS.contains(&extension));
-    if is_text {
-        if let Ok(text) = std::str::from_utf8(&bytes) {
-            return Ok(sha256_hex(text.replace("\r\n", "\n").as_bytes()));
-        }
-    }
-    Ok(sha256_hex(&bytes))
+    canonical_file_bytes(path).map(|bytes| sha256_hex(&bytes))
 }
 
 fn collect_regular_files(
     root: &Path,
     directory: &Path,
     paths: &mut Vec<(String, PathBuf)>,
+    skip_cargo_outputs: bool,
 ) -> Result<(), String> {
     for path in sorted_directory_entries(directory)? {
         let file_type = fs::symlink_metadata(&path)
@@ -1056,8 +1055,16 @@ fn collect_regular_files(
                 path.display()
             ));
         }
+        if skip_cargo_outputs
+            && directory == root
+            && ((file_type.is_dir() && path.file_name().is_some_and(|name| name == "target"))
+                || (file_type.is_file()
+                    && path.file_name().is_some_and(|name| name == "Cargo.lock")))
+        {
+            continue;
+        }
         if file_type.is_dir() {
-            collect_regular_files(root, &path, paths)?;
+            collect_regular_files(root, &path, paths, skip_cargo_outputs)?;
         } else if file_type.is_file() {
             paths.push((slash_relative(root, &path)?, path));
         }
@@ -1087,9 +1094,25 @@ fn slash_relative(root: &Path, path: &Path) -> Result<String, String> {
 }
 
 fn file_hash(path: &Path) -> Result<String, String> {
-    fs::read(path)
-        .map(|bytes| sha256_hex(&bytes))
-        .map_err(|error| format!("cannot hash {}: {error}", path.display()))
+    canonical_file_bytes(path).map(|bytes| sha256_hex(&bytes))
+}
+
+fn canonical_file_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    const TEXT_EXTENSIONS: &[&str] = &[
+        "cs", "csproj", "json", "md", "props", "py", "rs", "targets", "toml",
+    ];
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot hash {}: {error}", path.display()))?;
+    let is_text = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| TEXT_EXTENSIONS.contains(&extension));
+    if is_text {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            return Ok(text.replace("\r\n", "\n").into_bytes());
+        }
+    }
+    Ok(bytes)
 }
 
 fn verify_camel_case_json_keys(bytes: &[u8]) -> Result<(), String> {
@@ -1675,6 +1698,147 @@ mod tests {
             "text line endings changed the lock hash"
         );
         fs::remove_dir_all(root).expect("remove line ending fixture");
+    }
+
+    #[test]
+    fn architecture_scalar_hashes_are_stable_across_text_line_endings() {
+        let root = fixture_root("scalar-line-endings");
+        for directory in ["schemas", "fixtures", "ids", "tools", "packages"] {
+            fs::create_dir_all(root.join(directory)).expect("create scalar hash directory");
+        }
+        for relative in [
+            "schemas/example.json",
+            "fixtures/index.json",
+            "ids/index.json",
+        ] {
+            fs::write(root.join(relative), b"{\n  \"value\": true\n}\n").expect("write LF JSON");
+        }
+        fs::write(root.join("tools/lumio_contract.py"), b"print('one')\n")
+            .expect("write LF generator");
+        fs::write(root.join("tools/lumio_generate.py"), b"print('two')\n")
+            .expect("write LF generator");
+        fs::write(
+            root.join("packages/index.json"),
+            b"{\n  \"packages\": []\n}\n",
+        )
+        .expect("write LF package index");
+
+        let input_hash = architecture_input_hash(&root).expect("hash LF inputs");
+        let content_hash = file_hash(&root.join("packages/index.json")).expect("hash LF index");
+        let mut fields = BTreeMap::from([(
+            "generator_identity".to_owned(),
+            sha256_hex(b"print('one')\nprint('two')\n"),
+        )]);
+        let mut errors = Vec::new();
+        verify_generator_identity(&root, &fields, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "LF generator identity failed: {errors:?}"
+        );
+
+        for relative in [
+            "schemas/example.json",
+            "fixtures/index.json",
+            "ids/index.json",
+        ] {
+            fs::write(root.join(relative), b"{\r\n  \"value\": true\r\n}\r\n")
+                .expect("write CRLF JSON");
+        }
+        fs::write(root.join("tools/lumio_contract.py"), b"print('one')\r\n")
+            .expect("write CRLF generator");
+        fs::write(root.join("tools/lumio_generate.py"), b"print('two')\r\n")
+            .expect("write CRLF generator");
+        fs::write(
+            root.join("packages/index.json"),
+            b"{\r\n  \"packages\": []\r\n}\r\n",
+        )
+        .expect("write CRLF package index");
+
+        assert_eq!(
+            architecture_input_hash(&root).expect("hash CRLF inputs"),
+            input_hash,
+            "input hash changed with line endings"
+        );
+        assert_eq!(
+            file_hash(&root.join("packages/index.json")).expect("hash CRLF index"),
+            content_hash,
+            "content hash changed with line endings"
+        );
+        errors.clear();
+        verify_generator_identity(&root, &fields, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "generator identity changed with line endings: {errors:?}"
+        );
+        fields.clear();
+        fs::remove_dir_all(root).expect("remove scalar hash fixture");
+    }
+
+    #[test]
+    fn refusal_boundary_hash_ignores_cargo_build_outputs() {
+        let root = fixture_root("refusal-build-output");
+        let boundary = root.join("generated/missing");
+        fs::create_dir_all(boundary.join("src")).expect("create refusal boundary");
+        fs::write(boundary.join("Cargo.toml"), b"[workspace]\n").expect("write refusal manifest");
+        fs::write(
+            boundary.join("src/lib.rs"),
+            b"compile_error!(\"blocked\");\n",
+        )
+        .expect("write refusal source");
+        let boundary_hash = directory_hash(&boundary, false).expect("hash clean boundary");
+
+        fs::write(boundary.join("Cargo.lock"), b"# generated\n").expect("write Cargo lock");
+        fs::create_dir_all(boundary.join("target/debug/build")).expect("create Cargo target");
+        fs::write(boundary.join("target/debug/build/output"), b"generated")
+            .expect("write Cargo output");
+        let fields = BTreeMap::from([
+            ("boundary_path".to_owned(), "generated/missing".to_owned()),
+            ("boundary_hash".to_owned(), boundary_hash),
+        ]);
+        let errors = verify_missing_boundary(&root, &fields);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("boundary hash drift")),
+            "Cargo build outputs changed refusal boundary hash: {errors:?}"
+        );
+
+        fs::create_dir_all(boundary.join("src/target")).expect("create nested target directory");
+        fs::write(
+            boundary.join("src/target/mod.rs"),
+            b"pub const VALUE: u8 = 1;\n",
+        )
+        .expect("write nested target source");
+        assert!(
+            verify_missing_boundary(&root, &fields)
+                .iter()
+                .any(|error| error.contains("boundary hash drift")),
+            "nested target directory was ignored"
+        );
+        fs::remove_dir_all(boundary.join("src/target")).expect("remove nested target directory");
+
+        fs::write(boundary.join("src/Cargo.lock"), b"repository content\n")
+            .expect("write nested Cargo lock");
+        assert!(
+            verify_missing_boundary(&root, &fields)
+                .iter()
+                .any(|error| error.contains("boundary hash drift")),
+            "nested Cargo.lock was ignored"
+        );
+        fs::remove_file(boundary.join("src/Cargo.lock")).expect("remove nested Cargo lock");
+
+        fs::write(
+            boundary.join("src/lib.rs"),
+            b"compile_error!(\"changed\");\n",
+        )
+        .expect("mutate refusal source");
+        assert!(
+            verify_missing_boundary(&root, &fields)
+                .iter()
+                .any(|error| error.contains("boundary hash drift")),
+            "refusal source drift was ignored"
+        );
+        fs::remove_dir_all(root).expect("remove refusal hash fixture");
     }
 
     #[test]

@@ -1,4 +1,7 @@
-use super::{strip_comment, value_array, value_string, Document, Value};
+use super::{
+    has_markdown_heading, markdown_fence_marker, markdown_indented_code, markdown_section,
+    value_array, value_string, Document, Value,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -503,31 +506,6 @@ fn validate_graph_trace(
     errors
 }
 
-fn markdown_section(text: &str, anchor: &str) -> Option<String> {
-    let mut section = Vec::new();
-    let mut level = None;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let heading_level = trimmed
-            .chars()
-            .take_while(|character| *character == '#')
-            .count();
-        if level.is_none() {
-            if heading_level > 0
-                && trimmed[heading_level..].split_whitespace().next() == Some(anchor)
-            {
-                level = Some(heading_level);
-            }
-            continue;
-        }
-        if heading_level > 0 && heading_level <= level.unwrap_or(heading_level) {
-            break;
-        }
-        section.push(line);
-    }
-    level.map(|_| section.join("\n"))
-}
-
 fn mermaid_edges(
     section: &str,
     modules: &BTreeMap<String, ModuleRule>,
@@ -623,21 +601,25 @@ fn mermaid_edges(
 
 fn mermaid_fenced_source(section: &str) -> String {
     let mut source = Vec::new();
-    let mut fence_width = None;
-    for line in section.lines() {
-        let trimmed = line.trim();
-        let ticks = trimmed
-            .bytes()
-            .take_while(|character| *character == b'`')
-            .count();
-        if let Some(width) = fence_width {
-            if ticks >= width && trimmed[ticks..].trim().is_empty() {
-                fence_width = None;
-            } else {
-                source.push(line);
+    let mut fence = None;
+    for raw_line in section.lines() {
+        if let Some((marker, width, capture)) = fence {
+            if markdown_fence_marker(raw_line).is_some_and(
+                |(candidate, candidate_width, suffix)| {
+                    candidate == marker && candidate_width >= width && suffix.trim().is_empty()
+                },
+            ) {
+                fence = None;
+            } else if capture {
+                source.push(raw_line);
             }
-        } else if ticks >= 3 && trimmed[ticks..].trim().eq_ignore_ascii_case("mermaid") {
-            fence_width = Some(ticks);
+            continue;
+        }
+        if markdown_indented_code(raw_line) {
+            continue;
+        }
+        if let Some((marker, width, suffix)) = markdown_fence_marker(raw_line) {
+            fence = Some((marker, width, suffix.trim().eq_ignore_ascii_case("mermaid")));
         }
     }
     source.join("\n")
@@ -722,14 +704,6 @@ fn resolve_mermaid_endpoint(
     })
 }
 
-fn has_markdown_heading(text: &str, anchor: &str) -> bool {
-    text.lines().any(|line| {
-        let line = line.trim_start();
-        let heading = line.trim_start_matches('#');
-        line.starts_with('#') && heading.split_whitespace().next() == Some(anchor)
-    })
-}
-
 #[derive(Debug)]
 struct ParsedManifest {
     package: String,
@@ -739,72 +713,37 @@ struct ParsedManifest {
 fn parse_manifest(path: &Path) -> Result<ParsedManifest, String> {
     let text =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut section = String::new();
-    let mut dependency_table_alias = None;
+    let mut section = Vec::new();
     let mut package = None;
-    let mut dependencies = BTreeSet::new();
-    for raw_line in text.lines() {
-        let line = strip_comment(raw_line).trim();
-        if line.is_empty() {
-            continue;
-        }
+    let mut dependencies = BTreeMap::new();
+    for statement in toml_statements(&text) {
+        let line = statement.as_str();
         if line.starts_with('[') && line.ends_with(']') {
-            line[1..line.len() - 1].trim().clone_into(&mut section);
-            dependency_table_alias = dependency_table_name(&section);
-            if let Some(alias) = &dependency_table_alias {
-                dependencies.insert(alias.clone());
-            }
+            section = toml_key_path(&line[1..line.len() - 1]);
             continue;
         }
-        let Some((raw_key, value)) = line.split_once('=') else {
+        let Some((raw_key, value)) = split_toml_assignment(line) else {
             continue;
         };
-        if section == "package" && toml_key(raw_key) == "name" {
+        let mut key_path = section.clone();
+        key_path.extend(toml_key_path(raw_key));
+        if key_path == ["package", "name"] {
             package = quoted_value(value);
-        } else if is_normal_dependency_section(&section) {
-            let (alias, property) = dependency_key(raw_key);
-            let dependency = if property.as_deref() == Some("package") {
-                quoted_value(value)
-            } else {
-                inline_package(value)
-            }
-            .unwrap_or(alias);
-            dependencies.insert(dependency);
-        } else if toml_key(raw_key) == "package" {
-            if let (Some(alias), Some(dependency)) = (&dependency_table_alias, quoted_value(value))
-            {
-                dependencies.remove(alias);
-                dependencies.insert(dependency);
-            }
+        } else if is_production_dependency_container(&key_path) {
+            record_inline_dependency_table(&mut dependencies, value);
+        } else if let Some((alias, property)) = production_dependency_path(&key_path) {
+            record_dependency(&mut dependencies, alias, property, value);
+        } else if key_path.first().is_some_and(|segment| segment == "target") {
+            record_inline_target_dependencies(&mut dependencies, &key_path, value);
         }
     }
     package
         .filter(|name| !name.is_empty())
         .map(|package| ParsedManifest {
             package,
-            dependencies,
+            dependencies: dependencies.into_values().collect(),
         })
         .ok_or_else(|| format!("{}: missing [package] name", path.display()))
-}
-
-fn dependency_table_name(section: &str) -> Option<String> {
-    let name = section
-        .strip_prefix("dependencies.")
-        .or_else(|| section.strip_prefix("build-dependencies."))
-        .or_else(|| section.rsplit_once(".dependencies.").map(|(_, name)| name))
-        .or_else(|| {
-            section
-                .rsplit_once(".build-dependencies.")
-                .map(|(_, name)| name)
-        })?;
-    let name = toml_key(name);
-    (!name.is_empty()).then_some(name)
-}
-
-fn is_normal_dependency_section(section: &str) -> bool {
-    matches!(section, "dependencies" | "build-dependencies")
-        || (section.starts_with("target.")
-            && (section.ends_with(".dependencies") || section.ends_with(".build-dependencies")))
 }
 
 fn toml_key(raw: &str) -> String {
@@ -816,13 +755,58 @@ fn toml_key(raw: &str) -> String {
     }
 }
 
-fn dependency_key(key: &str) -> (String, Option<String>) {
-    let Some((alias, property)) = split_last_unquoted_dot(key) else {
-        return (toml_key(key), None);
+fn production_dependency_path(path: &[String]) -> Option<(String, Option<&str>)> {
+    let dependency_index = if path
+        .first()
+        .is_some_and(|segment| is_production_dependency_kind(segment))
+    {
+        0
+    } else if path.first().is_some_and(|segment| segment == "target") {
+        path.iter()
+            .enumerate()
+            .skip(2)
+            .find_map(|(index, segment)| is_production_dependency_kind(segment).then_some(index))?
+    } else {
+        return None;
     };
-    let property = toml_key(property);
-    if matches!(
-        property.as_str(),
+    let alias = path.get(dependency_index + 1)?.clone();
+    let property = path
+        .get(dependency_index + 2)
+        .map(String::as_str)
+        .filter(|property| is_dependency_property(property));
+    Some((alias, property))
+}
+
+fn is_production_dependency_container(path: &[String]) -> bool {
+    path.len() == 1 && is_production_dependency_kind(&path[0])
+        || (path.len() == 3 && path[0] == "target" && is_production_dependency_kind(&path[2]))
+}
+
+fn workspace_dependency_path(path: &[String]) -> Option<(String, Option<&str>)> {
+    if path.first().is_none_or(|segment| segment != "workspace")
+        || path.get(1).is_none_or(|segment| segment != "dependencies")
+    {
+        return None;
+    }
+    let alias = path.get(2)?.clone();
+    let property = path
+        .get(3)
+        .map(String::as_str)
+        .filter(|property| is_dependency_property(property));
+    Some((alias, property))
+}
+
+fn is_workspace_dependency_container(path: &[String]) -> bool {
+    path == ["workspace", "dependencies"]
+}
+
+fn is_production_dependency_kind(segment: &str) -> bool {
+    matches!(segment, "dependencies" | "build-dependencies")
+}
+
+fn is_dependency_property(property: &str) -> bool {
+    matches!(
+        property,
         "branch"
             | "default-features"
             | "features"
@@ -835,17 +819,88 @@ fn dependency_key(key: &str) -> (String, Option<String>) {
             | "tag"
             | "version"
             | "workspace"
-    ) {
-        (toml_key(alias), Some(property))
+    )
+}
+
+fn record_dependency(
+    dependencies: &mut BTreeMap<String, String>,
+    alias: String,
+    property: Option<&str>,
+    value: &str,
+) {
+    if property == Some("package") {
+        if let Some(package) = quoted_value(value) {
+            dependencies.insert(alias, package);
+        }
+    } else if property.is_none() {
+        let package = inline_package(value).unwrap_or_else(|| alias.clone());
+        dependencies.insert(alias, package);
     } else {
-        (toml_key(key), None)
+        dependencies.entry(alias.clone()).or_insert(alias);
     }
 }
 
-fn split_last_unquoted_dot(raw: &str) -> Option<(&str, &str)> {
+fn record_inline_dependency_table(dependencies: &mut BTreeMap<String, String>, value: &str) {
+    let Some(inner) = value
+        .trim()
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return;
+    };
+    for entry in split_inline_entries(inner) {
+        let Some((raw_key, nested_value)) = split_toml_assignment(entry) else {
+            continue;
+        };
+        let path = toml_key_path(raw_key);
+        let Some(alias) = path.first().cloned() else {
+            continue;
+        };
+        let property = path
+            .get(1)
+            .map(String::as_str)
+            .filter(|property| is_dependency_property(property));
+        record_dependency(dependencies, alias, property, nested_value);
+    }
+}
+
+fn record_inline_target_dependencies(
+    dependencies: &mut BTreeMap<String, String>,
+    path: &[String],
+    value: &str,
+) {
+    let Some(inner) = value
+        .trim()
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return;
+    };
+    for entry in split_inline_entries(inner) {
+        let Some((raw_key, nested_value)) = split_toml_assignment(entry) else {
+            continue;
+        };
+        let mut nested_path = path.to_vec();
+        nested_path.extend(toml_key_path(raw_key));
+        if is_production_dependency_container(&nested_path) {
+            record_inline_dependency_table(dependencies, nested_value);
+        } else if let Some((alias, property)) = production_dependency_path(&nested_path) {
+            record_dependency(dependencies, alias, property, nested_value);
+        } else if nested_path.len() == 2 {
+            record_inline_target_dependencies(dependencies, &nested_path, nested_value);
+        }
+    }
+}
+
+fn toml_key_path(raw: &str) -> Vec<String> {
+    split_unquoted_dots(raw).into_iter().map(toml_key).collect()
+}
+
+fn split_unquoted_dots(raw: &str) -> Vec<&str> {
     let mut quote = None;
     let mut escaped = false;
-    let mut last_dot = None;
+    let mut start = 0;
+    let mut segments = Vec::new();
     for (index, character) in raw.char_indices() {
         if let Some(active_quote) = quote {
             if active_quote == '"' && escaped {
@@ -858,14 +913,183 @@ fn split_last_unquoted_dot(raw: &str) -> Option<(&str, &str)> {
         } else if matches!(character, '"' | '\'') {
             quote = Some(character);
         } else if character == '.' {
-            last_dot = Some(index);
+            segments.push(raw[start..index].trim());
+            start = index + 1;
         }
     }
-    last_dot.map(|index| (&raw[..index], &raw[index + 1..]))
+    segments.push(raw[start..].trim());
+    segments
+}
+
+fn split_toml_assignment(raw: &str) -> Option<(&str, &str)> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in raw.char_indices() {
+        if let Some(active_quote) = quote {
+            if active_quote == '"' && escaped {
+                escaped = false;
+            } else if active_quote == '"' && character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+        } else if matches!(character, '"' | '\'') {
+            quote = Some(character);
+        } else if character == '=' {
+            return Some((&raw[..index], &raw[index + 1..]));
+        }
+    }
+    None
+}
+
+fn toml_statements(text: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut state = TomlStatementState::default();
+    for raw_line in text.lines() {
+        let line = toml_line_without_comment(raw_line, &mut state);
+        if current.is_empty() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            current.push_str(line);
+        } else {
+            current.push('\n');
+            current.push_str(&line);
+        }
+        if state.is_complete() {
+            statements.push(std::mem::take(&mut current));
+            state = TomlStatementState::default();
+        }
+    }
+    if !current.is_empty() {
+        statements.push(current);
+    }
+    statements
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TomlStringKind {
+    Basic,
+    Literal,
+    MultilineBasic,
+    MultilineLiteral,
+}
+
+#[derive(Debug, Default)]
+struct TomlStatementState {
+    string: Option<TomlStringKind>,
+    escaped: bool,
+    depth: i32,
+}
+
+impl TomlStatementState {
+    fn is_complete(&self) -> bool {
+        self.string.is_none() && self.depth <= 0
+    }
+}
+
+fn toml_line_without_comment(raw_line: &str, state: &mut TomlStatementState) -> String {
+    let mut visible = String::new();
+    let mut index = 0;
+    while index < raw_line.len() {
+        let remaining = &raw_line[index..];
+        match state.string {
+            Some(TomlStringKind::MultilineBasic) => {
+                if !state.escaped && remaining.starts_with("\"\"\"") {
+                    let width = remaining.bytes().take_while(|byte| *byte == b'"').count();
+                    visible.push_str(&remaining[..width]);
+                    index += width;
+                    state.string = None;
+                    continue;
+                }
+            }
+            Some(TomlStringKind::MultilineLiteral) => {
+                if remaining.starts_with("'''") {
+                    let width = remaining.bytes().take_while(|byte| *byte == b'\'').count();
+                    visible.push_str(&remaining[..width]);
+                    index += width;
+                    state.string = None;
+                    continue;
+                }
+            }
+            Some(TomlStringKind::Basic | TomlStringKind::Literal) | None => {}
+        }
+
+        if state.string.is_none() {
+            if remaining.starts_with("\"\"\"") {
+                visible.push_str("\"\"\"");
+                index += 3;
+                state.string = Some(TomlStringKind::MultilineBasic);
+                state.escaped = false;
+                continue;
+            }
+            if remaining.starts_with("'''") {
+                visible.push_str("'''");
+                index += 3;
+                state.string = Some(TomlStringKind::MultilineLiteral);
+                continue;
+            }
+        }
+
+        let character = remaining.chars().next().expect("index is within the line");
+        match state.string {
+            Some(TomlStringKind::Basic) => {
+                if state.escaped {
+                    state.escaped = false;
+                } else if character == '\\' {
+                    state.escaped = true;
+                } else if character == '"' {
+                    state.string = None;
+                }
+            }
+            Some(TomlStringKind::Literal) => {
+                if character == '\'' {
+                    state.string = None;
+                }
+            }
+            Some(TomlStringKind::MultilineBasic) => {
+                if state.escaped {
+                    state.escaped = false;
+                } else if character == '\\' {
+                    state.escaped = true;
+                }
+            }
+            Some(TomlStringKind::MultilineLiteral) => {}
+            None => match character {
+                '#' => break,
+                '"' => state.string = Some(TomlStringKind::Basic),
+                '\'' => state.string = Some(TomlStringKind::Literal),
+                '[' | '{' => state.depth += 1,
+                ']' | '}' => state.depth -= 1,
+                _ => {}
+            },
+        }
+        visible.push(character);
+        index += character.len_utf8();
+    }
+    if state.string == Some(TomlStringKind::MultilineBasic) {
+        state.escaped = false;
+    }
+    visible
 }
 
 fn quoted_value(raw: &str) -> Option<String> {
-    let chars = raw.trim().chars().collect::<Vec<_>>();
+    let raw = raw.trim();
+    if let Some(inner) = raw
+        .strip_prefix("\"\"\"")
+        .and_then(|value| value.strip_suffix("\"\"\""))
+    {
+        return decode_basic_toml_string(trim_multiline_initial_newline(inner));
+    }
+    if let Some(inner) = raw
+        .strip_prefix("'''")
+        .and_then(|value| value.strip_suffix("'''"))
+    {
+        return Some(trim_multiline_initial_newline(inner).to_owned());
+    }
+    let chars = raw.chars().collect::<Vec<_>>();
     let quote = *chars.first()?;
     if !matches!(quote, '"' | '\'') {
         return None;
@@ -891,8 +1115,12 @@ fn quoted_value(raw: &str) -> Option<String> {
             'r' => value.push('\r'),
             '"' => value.push('"'),
             '\\' => value.push('\\'),
-            'u' | 'U' => {
-                let digits = if escaped == 'u' { 4 } else { 8 };
+            'x' | 'u' | 'U' => {
+                let digits = match escaped {
+                    'x' => 2,
+                    'u' => 4,
+                    _ => 8,
+                };
                 let end = index.checked_add(digits)?;
                 let scalar = chars
                     .get(index..end)?
@@ -907,6 +1135,69 @@ fn quoted_value(raw: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn trim_multiline_initial_newline(raw: &str) -> &str {
+    raw.strip_prefix('\n').unwrap_or(raw)
+}
+
+fn decode_basic_toml_string(raw: &str) -> Option<String> {
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut value = String::new();
+    let mut index = 0;
+    while let Some(character) = chars.get(index).copied() {
+        index += 1;
+        if character != '\\' {
+            value.push(character);
+            continue;
+        }
+        let mut continuation = index;
+        while chars
+            .get(continuation)
+            .is_some_and(|character| matches!(character, ' ' | '\t' | '\r'))
+        {
+            continuation += 1;
+        }
+        if chars.get(continuation) == Some(&'\n') {
+            index = continuation + 1;
+            while chars
+                .get(index)
+                .is_some_and(|character| character.is_whitespace())
+            {
+                index += 1;
+            }
+            continue;
+        }
+        let escaped = chars.get(index).copied()?;
+        index += 1;
+        match escaped {
+            'b' => value.push('\u{0008}'),
+            't' => value.push('\t'),
+            'n' => value.push('\n'),
+            'f' => value.push('\u{000c}'),
+            'r' => value.push('\r'),
+            '"' => value.push('"'),
+            '\\' => value.push('\\'),
+            'x' | 'u' | 'U' => {
+                let digits = match escaped {
+                    'x' => 2,
+                    'u' => 4,
+                    _ => 8,
+                };
+                let end = index.checked_add(digits)?;
+                let scalar = chars
+                    .get(index..end)?
+                    .iter()
+                    .try_fold(0_u32, |value, digit| {
+                        digit.to_digit(16).map(|digit| value * 16 + digit)
+                    })?;
+                value.push(char::from_u32(scalar)?);
+                index = end;
+            }
+            _ => return None,
+        }
+    }
+    Some(value)
 }
 
 fn inline_package(raw: &str) -> Option<String> {
@@ -955,31 +1246,20 @@ fn split_inline_entries(raw: &str) -> Vec<&str> {
 fn workspace_members(path: &Path) -> Result<BTreeSet<String>, String> {
     let text =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut in_workspace = false;
-    let mut collecting = false;
+    let mut section = Vec::new();
     let mut array = String::new();
-    for raw_line in text.lines() {
-        let line = strip_comment(raw_line).trim();
+    for statement in toml_statements(&text) {
+        let line = statement.as_str();
         if line.starts_with('[') && line.ends_with(']') {
-            in_workspace = line == "[workspace]";
-            collecting = false;
+            section = toml_key_path(&line[1..line.len() - 1]);
             continue;
         }
-        if !in_workspace {
-            continue;
-        }
-        if collecting {
-            array.push_str(line);
-            if line.contains(']') {
+        if let Some((key, value)) = split_toml_assignment(line) {
+            let mut key_path = section.clone();
+            key_path.extend(toml_key_path(key));
+            if key_path == ["workspace", "members"] {
+                value.trim().clone_into(&mut array);
                 break;
-            }
-        } else if let Some((key, value)) = line.split_once('=') {
-            if key.trim() == "members" {
-                collecting = true;
-                array.push_str(value.trim());
-                if value.contains(']') {
-                    break;
-                }
             }
         }
     }
@@ -1000,43 +1280,23 @@ fn workspace_members(path: &Path) -> Result<BTreeSet<String>, String> {
 fn workspace_dependency_packages(path: &Path) -> Result<BTreeMap<String, String>, String> {
     let text =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut section = String::new();
-    let mut table_alias = None;
+    let mut section = Vec::new();
     let mut packages = BTreeMap::new();
-    for raw_line in text.lines() {
-        let line = strip_comment(raw_line).trim();
-        if line.is_empty() {
-            continue;
-        }
+    for statement in toml_statements(&text) {
+        let line = statement.as_str();
         if line.starts_with('[') && line.ends_with(']') {
-            line[1..line.len() - 1].trim().clone_into(&mut section);
-            table_alias = section
-                .strip_prefix("workspace.dependencies.")
-                .map(str::trim)
-                .map(toml_key);
-            if let Some(alias) = &table_alias {
-                packages.insert(alias.clone(), alias.clone());
-            }
+            section = toml_key_path(&line[1..line.len() - 1]);
             continue;
         }
-        let Some((raw_key, value)) = line.split_once('=') else {
+        let Some((raw_key, value)) = split_toml_assignment(line) else {
             continue;
         };
-        if section == "workspace.dependencies" {
-            let (alias, property) = dependency_key(raw_key);
-            if property.as_deref() == Some("package") {
-                if let Some(package) = quoted_value(value) {
-                    packages.insert(alias, package);
-                }
-            } else if let Some(package) = inline_package(value) {
-                packages.insert(alias, package);
-            } else {
-                packages.entry(alias.clone()).or_insert(alias);
-            }
-        } else if toml_key(raw_key) == "package" {
-            if let (Some(alias), Some(package)) = (&table_alias, quoted_value(value)) {
-                packages.insert(alias.clone(), package);
-            }
+        let mut key_path = section.clone();
+        key_path.extend(toml_key_path(raw_key));
+        if is_workspace_dependency_container(&key_path) {
+            record_inline_dependency_table(&mut packages, value);
+        } else if let Some((alias, property)) = workspace_dependency_path(&key_path) {
+            record_dependency(&mut packages, alias, property, value);
         }
     }
     Ok(packages)
@@ -1275,6 +1535,51 @@ role = "module"
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn hidden_mermaid_graphs_are_not_trace_evidence() {
+        let modules = BTreeMap::from([
+            (
+                "a".to_owned(),
+                ModuleRule {
+                    package: "a".to_owned(),
+                    role: "module".to_owned(),
+                },
+            ),
+            (
+                "b".to_owned(),
+                ModuleRule {
+                    package: "b".to_owned(),
+                    role: "module".to_owned(),
+                },
+            ),
+        ]);
+
+        for hidden_heading in [
+            "<!--\n## 3.2.1 Compile\n```mermaid\ngraph TD\naNode[a] --> bNode[b]\n```\n-->\n",
+            "```markdown\n## 3.2.1 Compile\n```mermaid\ngraph TD\naNode[a] --> bNode[b]\n```\n```\n",
+            "    ## 3.2.1 Compile\n    ```mermaid\n    graph TD\n    aNode[a] --> bNode[b]\n    ```\n",
+            "<pre>\n## 3.2.1 Compile\n```mermaid\ngraph TD\naNode[a] --> bNode[b]\n```\n</pre>\n",
+            "<span>\n## 3.2.1 Compile\n```mermaid\ngraph TD\naNode[a] --> bNode[b]\n```\n</span>\n",
+        ] {
+            assert!(
+                markdown_section(hidden_heading, "3.2.1").is_none(),
+                "hidden graph heading was accepted"
+            );
+        }
+
+        for hidden_graph in [
+            "## 3.2.1 Compile\n<!--\n```mermaid\ngraph TD\naNode[a] --> bNode[b]\n```\n-->\n",
+            "## 3.2.1 Compile\n```markdown\n```mermaid\ngraph TD\naNode[a] --> bNode[b]\n```\n```\n",
+            "## 3.2.1 Compile\n    ```mermaid\n    graph TD\n    aNode[a] --> bNode[b]\n    ```\n",
+            "## 3.2.1 Compile\n<pre>\n```mermaid\ngraph TD\naNode[a] --> bNode[b]\n```\n</pre>\n",
+            "## 3.2.1 Compile\n<span>\n```mermaid\ngraph TD\naNode[a] --> bNode[b]\n```\n</span>\n",
+        ] {
+            let section = markdown_section(hidden_graph, "3.2.1").expect("visible graph heading");
+            let (edges, _) = mermaid_edges(&section, &modules);
+            assert!(edges.is_empty(), "hidden Mermaid edge was accepted: {edges:?}");
+        }
+    }
+
     fn assert_production_dependency_rejected(
         root: &Path,
         module_dir: &Path,
@@ -1304,6 +1609,70 @@ name = "lumio-server"
         );
     }
 
+    fn assert_root_dotted_dependency_rejected(root: &Path, module_dir: &Path, guard: &DagGuard) {
+        std::fs::write(
+            module_dir.join("Cargo.toml"),
+            r#"
+dependencies.testkit.package = "lumio-host-testkit"
+dependencies.testkit.path = "../../crates/lumio-host-testkit"
+
+[package]
+name = "lumio-server"
+"#,
+        )
+        .unwrap();
+        let errors = check_live(root, guard);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("dev-only") && error.contains("lumio-host-testkit")),
+            "root dotted production dependency was accepted: {errors:?}"
+        );
+    }
+
+    fn assert_inline_dependency_table_rejected(root: &Path, module_dir: &Path, guard: &DagGuard) {
+        std::fs::write(
+            module_dir.join("Cargo.toml"),
+            r#"
+dependencies = {
+    testkit = { package = "lumio-host-testkit", path = "../../crates/lumio-host-testkit" }
+}
+
+[package]
+name = "lumio-server"
+"#,
+        )
+        .unwrap();
+        let errors = check_live(root, guard);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("dev-only") && error.contains("lumio-host-testkit")),
+            "inline production dependency table was accepted: {errors:?}"
+        );
+    }
+
+    fn assert_multiline_benign_dependency_parsed(module_dir: &Path) {
+        std::fs::write(
+            module_dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "lumio-server"
+
+[dependencies.lumio-host-testkit]
+package = """benign-\
+    package"""
+"#,
+        )
+        .unwrap();
+        let parsed = parse_manifest(&module_dir.join("Cargo.toml")).unwrap();
+        assert_eq!(
+            parsed.dependencies,
+            BTreeSet::from(["benign-package".to_owned()]),
+            "multiline continuation changed a renamed benign dependency"
+        );
+    }
+
     #[test]
     fn production_dependencies_cannot_use_dev_only_testkit() {
         let root =
@@ -1313,10 +1682,10 @@ name = "lumio-server"
         std::fs::write(
             root.join("Cargo.toml"),
             r#"
-[workspace]
+["workspace"]
 members = ["modules/process"]
 
-[workspace.dependencies]
+["workspace"."dependencies"]
 testkit = { package = "lumio-host-testkit", path = "crates/lumio-host-testkit" }
 literal-testkit = { package = 'lumio-host-testkit', path = 'crates/lumio-host-testkit' }
 dotted-testkit.package = 'lumio-host-testkit'
@@ -1343,6 +1712,10 @@ escaped-testkit.path = "crates/lumio-host-testkit"
             "[build-dependencies]",
             "[target.'cfg(unix)'.dependencies]",
             "[target.'cfg(unix)'.build-dependencies]",
+            r#"["dependencies"]"#,
+            r#"["build-dependencies"]"#,
+            r#"[target.'cfg(unix)'."dependencies"]"#,
+            r#"[target.'cfg(unix)'."build-dependencies"]"#,
         ];
         let dependency_forms = [
             "lumio-host-testkit = { path = '../../crates/lumio-host-testkit' }",
@@ -1351,6 +1724,16 @@ escaped-testkit.path = "crates/lumio-host-testkit"
             "'lumio-host-testkit' = { path = '../../crates/lumio-host-testkit' }",
             r#"escaped = { package = "lumio\u002dhost\u002dtestkit", path = "../../crates/lumio-host-testkit" }"#,
             r#""lumio\u002dhost\u002dtestkit" = { path = "../../crates/lumio-host-testkit" }"#,
+            r#"alias.package = "lumio\x2dhost\x2dtestkit""#,
+            r#"alias.package = """lumio-host-testkit""""#,
+            r#"alias.package = """lumio\x2dhost\x2dtestkit""""#,
+            "alias.package = '''lumio-host-testkit'''",
+            r#"alias.package = """
+lumio-host-testkit""""#,
+            "alias.package = '''\nlumio-host-testkit'''",
+            r#"alias.package = """lumio-host-\
+    testkit""""#,
+            "alias.package = \"\"\"lumio-host-\\   \n    testkit\"\"\"",
         ];
         for section in production_sections {
             for dependency in dependency_forms {
@@ -1363,6 +1746,9 @@ escaped-testkit.path = "crates/lumio-host-testkit"
                 );
             }
         }
+
+        assert_root_dotted_dependency_rejected(&root, &module_dir, &guard);
+
         for dependency in [
             "testkit.workspace = true",
             "literal-testkit.workspace = true",
@@ -1377,6 +1763,8 @@ escaped-testkit.path = "crates/lumio-host-testkit"
                 dependency,
             );
         }
+
+        assert_multiline_benign_dependency_parsed(&module_dir);
 
         std::fs::write(
             module_dir.join("Cargo.toml"),
@@ -1393,6 +1781,72 @@ target-testkit = { package = "lumio-host-testkit", path = "../../crates/lumio-ho
         )
         .unwrap();
         assert_eq!(check_live(&root, &guard), Vec::<String>::new());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn whole_inline_dependency_tables_cannot_use_dev_only_testkit() {
+        let root = std::env::temp_dir().join(format!(
+            "lumio-inline-testkit-policy-{}",
+            std::process::id()
+        ));
+        let module_dir = root.join("modules/process");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["modules/process"]
+dependencies = {
+    testkit = { package = "lumio-host-testkit", path = "crates/lumio-host-testkit" }
+}
+"#,
+        )
+        .unwrap();
+        let guard = DagGuard {
+            modules: BTreeMap::from([(
+                "process".to_owned(),
+                ModuleRule {
+                    package: "lumio-server".to_owned(),
+                    role: "composition-root".to_owned(),
+                },
+            )]),
+            composition_root: "process".to_owned(),
+            ..DagGuard::default()
+        };
+
+        assert_inline_dependency_table_rejected(&root, &module_dir, &guard);
+        assert_production_dependency_rejected(
+            &root,
+            &module_dir,
+            &guard,
+            "[dependencies]",
+            "testkit.workspace = true",
+        );
+
+        std::fs::write(
+            module_dir.join("Cargo.toml"),
+            r#"
+target = {
+    'cfg(windows)' = {
+        dependencies = {
+            testkit = { package = "lumio-host-testkit", path = "../../crates/lumio-host-testkit" }
+        }
+    }
+}
+
+[package]
+name = "lumio-server"
+"#,
+        )
+        .unwrap();
+        let errors = check_live(&root, &guard);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("dev-only") && error.contains("lumio-host-testkit")),
+            "whole inline target dependency tree was accepted: {errors:?}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

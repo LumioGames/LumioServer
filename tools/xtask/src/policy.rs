@@ -117,6 +117,350 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
+fn markdown_section(text: &str, anchor: &str) -> Option<String> {
+    let mut section = Vec::new();
+    let mut level = None;
+    let mut fence = None;
+    let mut html_block = None;
+    let mut in_html_comment = false;
+    let mut paragraph_open = false;
+    for raw_line in text.lines() {
+        if let Some((marker, width)) = fence {
+            if level.is_some() {
+                section.push(raw_line.to_owned());
+            }
+            if markdown_fence_marker(raw_line).is_some_and(
+                |(candidate, candidate_width, suffix)| {
+                    candidate == marker && candidate_width >= width && suffix.trim().is_empty()
+                },
+            ) {
+                fence = None;
+            }
+            continue;
+        }
+
+        if let Some(block) = html_block {
+            if markdown_html_block_ends(block, raw_line) {
+                html_block = None;
+            }
+            paragraph_open = false;
+            continue;
+        }
+
+        let was_in_html_comment = in_html_comment;
+        let line = markdown_without_html_comments(raw_line, &mut in_html_comment);
+        if let Some(block) = markdown_html_block_start(&line, !paragraph_open) {
+            if !was_in_html_comment {
+                in_html_comment = false;
+            }
+            if !markdown_html_block_ends(block, &line) {
+                html_block = Some(block);
+            }
+            paragraph_open = false;
+            continue;
+        }
+        if markdown_indented_code(&line) {
+            if level.is_some() {
+                section.push(String::new());
+            }
+            paragraph_open = false;
+            continue;
+        }
+        if let Some((marker, width, _)) = markdown_fence_marker(&line) {
+            fence = Some((marker, width));
+            if level.is_some() {
+                section.push(line);
+            }
+            paragraph_open = false;
+            continue;
+        }
+
+        let heading_level = markdown_heading_level(&line);
+        if level.is_none() {
+            if heading_level.is_some_and(|heading_level| {
+                let trimmed = line.trim_start_matches(' ');
+                trimmed[heading_level..].split_whitespace().next() == Some(anchor)
+            }) {
+                level = heading_level;
+            }
+            paragraph_open = heading_level.is_none() && !line.trim().is_empty();
+            continue;
+        }
+        if heading_level.is_some_and(|heading_level| heading_level <= level.unwrap_or(0)) {
+            break;
+        }
+        paragraph_open = heading_level.is_none() && !line.trim().is_empty();
+        section.push(line);
+    }
+    level.map(|_| section.join("\n"))
+}
+
+#[derive(Clone, Copy)]
+enum MarkdownHtmlBlock {
+    ClosingTag(&'static str),
+    Terminator(&'static str),
+    BlankLine,
+}
+
+const MARKDOWN_HTML_BLOCK_TAGS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "search",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+];
+
+fn markdown_html_block_start(line: &str, allow_type_seven: bool) -> Option<MarkdownHtmlBlock> {
+    if markdown_indented_code(line) {
+        return None;
+    }
+    let trimmed = line.trim_start_matches(' ');
+    let lower = trimmed.to_ascii_lowercase();
+    for tag in ["pre", "script", "style", "textarea"] {
+        if html_tag_at_start(&lower, tag) {
+            return Some(MarkdownHtmlBlock::ClosingTag(tag));
+        }
+    }
+    if lower.starts_with("<?") {
+        return Some(MarkdownHtmlBlock::Terminator("?>"));
+    }
+    if lower.starts_with("<![cdata[") {
+        return Some(MarkdownHtmlBlock::Terminator("]]>"));
+    }
+    if trimmed
+        .strip_prefix("<!")
+        .and_then(|suffix| suffix.chars().next())
+        .is_some_and(|character| character.is_ascii_uppercase())
+    {
+        return Some(MarkdownHtmlBlock::Terminator(">"));
+    }
+    let standard_block = MARKDOWN_HTML_BLOCK_TAGS
+        .iter()
+        .any(|tag| html_tag_at_start(&lower, tag))
+        .then_some(MarkdownHtmlBlock::BlankLine);
+    standard_block.or_else(|| {
+        (allow_type_seven && markdown_type_seven_html_tag(trimmed))
+            .then_some(MarkdownHtmlBlock::BlankLine)
+    })
+}
+
+fn markdown_type_seven_html_tag(line: &str) -> bool {
+    let line = line.trim_end();
+    let Some(mut inner) = line
+        .strip_prefix('<')
+        .and_then(|line| line.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let closing = inner.starts_with('/');
+    if closing {
+        inner = &inner[1..];
+    }
+    let tag_length = inner
+        .char_indices()
+        .take_while(|(index, character)| {
+            if *index == 0 {
+                character.is_ascii_alphabetic()
+            } else {
+                character.is_ascii_alphanumeric() || *character == '-'
+            }
+        })
+        .map(|(index, character)| index + character.len_utf8())
+        .last()
+        .unwrap_or(0);
+    if tag_length == 0 {
+        return false;
+    }
+    let suffix = &inner[tag_length..];
+    if closing {
+        return suffix.trim().is_empty();
+    }
+    if suffix.is_empty() {
+        return true;
+    }
+    if !suffix
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_whitespace() || character == '/')
+    {
+        return false;
+    }
+
+    let mut quote = None;
+    for character in suffix.chars() {
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if matches!(character, '<' | '>' | '`') {
+            return false;
+        }
+    }
+    quote.is_none()
+}
+
+fn markdown_html_block_ends(block: MarkdownHtmlBlock, line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    match block {
+        MarkdownHtmlBlock::ClosingTag(tag) => lower.contains(&format!("</{tag}>")),
+        MarkdownHtmlBlock::Terminator(terminator) => lower.contains(terminator),
+        MarkdownHtmlBlock::BlankLine => line.trim().is_empty(),
+    }
+}
+
+fn html_tag_at_start(line: &str, tag: &str) -> bool {
+    for prefix in [format!("<{tag}"), format!("</{tag}")] {
+        if let Some(suffix) = line.strip_prefix(&prefix) {
+            if suffix
+                .chars()
+                .next()
+                .is_none_or(|character| character.is_whitespace() || matches!(character, '>' | '/'))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_markdown_heading(text: &str, anchor: &str) -> bool {
+    markdown_section(text, anchor).is_some()
+}
+
+fn markdown_heading_level(line: &str) -> Option<usize> {
+    if markdown_indented_code(line) {
+        return None;
+    }
+    let trimmed = line.trim_start_matches(' ');
+    let level = trimmed
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    trimmed[level..]
+        .chars()
+        .next()
+        .is_none_or(char::is_whitespace)
+        .then_some(level)
+}
+
+fn markdown_without_html_comments(line: &str, in_comment: &mut bool) -> String {
+    let mut visible = String::new();
+    let mut remaining = line;
+    loop {
+        if *in_comment {
+            let Some(end) = remaining.find("-->") else {
+                return visible;
+            };
+            remaining = &remaining[end + 3..];
+            *in_comment = false;
+        } else if let Some(start) = remaining.find("<!--") {
+            visible.push_str(&remaining[..start]);
+            remaining = &remaining[start + 4..];
+            *in_comment = true;
+        } else {
+            visible.push_str(remaining);
+            return visible;
+        }
+    }
+}
+
+fn markdown_indented_code(line: &str) -> bool {
+    let mut spaces = 0;
+    for character in line.chars() {
+        match character {
+            ' ' => spaces += 1,
+            '\t' => return true,
+            _ => break,
+        }
+    }
+    spaces >= 4
+}
+
+fn markdown_fence_marker(line: &str) -> Option<(u8, usize, &str)> {
+    if markdown_indented_code(line) {
+        return None;
+    }
+    let trimmed = line.trim_start_matches(' ');
+    let marker = *trimmed.as_bytes().first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let width = trimmed
+        .bytes()
+        .take_while(|candidate| *candidate == marker)
+        .count();
+    if width < 3 {
+        return None;
+    }
+    let suffix = &trimmed[width..];
+    if marker == b'`' && suffix.contains('`') {
+        return None;
+    }
+    Some((marker, width, suffix))
+}
+
 fn array_is_closed(raw: &str) -> bool {
     let mut in_string = false;
     let mut escaped = false;
