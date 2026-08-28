@@ -1018,9 +1018,27 @@ fn directory_hash(directory: &Path, skip_descriptor: bool) -> Result<String, Str
         if skip_descriptor && relative.ends_with(".descriptor.json") {
             continue;
         }
-        lines.push(format!("{relative}={}", file_hash(&path)?));
+        lines.push(format!("{relative}={}", directory_file_hash(&path)?));
     }
     Ok(sha256_hex(lines.join("\n").as_bytes()))
+}
+
+fn directory_file_hash(path: &Path) -> Result<String, String> {
+    const TEXT_EXTENSIONS: &[&str] = &[
+        "cs", "csproj", "json", "md", "props", "rs", "targets", "toml",
+    ];
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot hash {}: {error}", path.display()))?;
+    let is_text = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| TEXT_EXTENSIONS.contains(&extension));
+    if is_text {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            return Ok(sha256_hex(text.replace("\r\n", "\n").as_bytes()));
+        }
+    }
+    Ok(sha256_hex(&bytes))
 }
 
 fn collect_regular_files(
@@ -1634,6 +1652,29 @@ mod tests {
             .iter()
             .any(|error| error.contains("controlled refusal boundary hash drift")));
         fs::remove_dir_all(root).expect("remove local hash fixture");
+    }
+
+    #[test]
+    fn directory_hash_is_stable_across_text_line_endings() {
+        let root = fixture_root("line-endings");
+        fs::write(root.join("Cargo.toml"), b"[package]\nname = \"fixture\"\n")
+            .expect("write LF fixture");
+        fs::write(root.join("lib.rs"), b"pub fn fixture() {}\n").expect("write LF source");
+        let lf_hash = directory_hash(&root, false).expect("hash LF source");
+
+        fs::write(
+            root.join("Cargo.toml"),
+            b"[package]\r\nname = \"fixture\"\r\n",
+        )
+        .expect("write CRLF fixture");
+        fs::write(root.join("lib.rs"), b"pub fn fixture() {}\r\n").expect("write CRLF source");
+        let crlf_hash = directory_hash(&root, false).expect("hash CRLF source");
+
+        assert_eq!(
+            lf_hash, crlf_hash,
+            "text line endings changed the lock hash"
+        );
+        fs::remove_dir_all(root).expect("remove line ending fixture");
     }
 
     #[test]
