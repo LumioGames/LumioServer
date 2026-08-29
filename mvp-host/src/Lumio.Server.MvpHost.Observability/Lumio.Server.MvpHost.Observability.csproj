@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>3</MvpHostLayer>
+    <RootNamespace>Lumio.Server.MvpHost.Observability</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.Observability</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    零 PackageReference；ProjectReference 恰一个。
+    IWallClock 只在本工程被消费（两个 writer 内部填 Timestamp），
+    「IWallClock 只被 Observability 引用」由 Architecture.Tests 的依赖断言守住。
+  -->
+  <ItemGroup>
+    <ProjectReference Include="../Lumio.Server.MvpHost.HostContracts/Lumio.Server.MvpHost.HostContracts.csproj" />
+  </ItemGroup>
+
+</Project>

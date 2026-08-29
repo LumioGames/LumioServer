@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>2</MvpHostLayer>
+    <RootNamespace>Lumio.Server.MvpHost.HostContracts</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.HostContracts</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    全部跨模块协作的唯一契约层。事件端口集中在这里之后，
+    「事件不产生反向边」是机制保证而不是纪律：Transport / Auth / Session / WorldSlot
+    互不引用，只各自引用本层，因此它们之间不可能出现直接边。
+
+    零 PackageReference；ProjectReference 恰两个（Wire 与 Platform，都是 Layer 1）。
+  -->
+  <ItemGroup>
+    <ProjectReference Include="../Lumio.Server.MvpHost.Wire/Lumio.Server.MvpHost.Wire.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Platform/Lumio.Server.MvpHost.Platform.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -26,6 +26,12 @@
     <EmbeddedResource Include="../../contract-mirror/schemas/common.schema.json" LogicalName="mirror/common.schema.json" />
     <EmbeddedResource Include="../../contract-mirror/schemas/protocol-permission-gate.schema.json" LogicalName="mirror/protocol-permission-gate.schema.json" />
     <EmbeddedResource Include="../../contract-mirror/schemas/session-revision-vector.schema.json" LogicalName="mirror/session-revision-vector.schema.json" />
+    <!--
+      logging-event 由 Observability（Layer 3）产出、在这里校验：校验器只有一个。
+      两个 schema 校验器迟早会在某条构造上分歧，而分歧的表现是「一边放行一边拦」，
+      排查成本远高于让 Layer 1 多嵌一份 schema。
+    -->
+    <EmbeddedResource Include="../../contract-mirror/schemas/logging-event.schema.json" LogicalName="mirror/logging-event.schema.json" />
   </ItemGroup>
 
   <ItemGroup>
