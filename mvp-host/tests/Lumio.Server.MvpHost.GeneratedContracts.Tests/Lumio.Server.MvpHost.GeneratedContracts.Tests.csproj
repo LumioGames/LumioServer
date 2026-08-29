@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>1</MvpHostLayer>
+    <MvpHostProductionProject>false</MvpHostProductionProject>
+    <!-- xunit.v3 的构建期检查要求测试工程可执行；非 Exe 时它在 PrepareForBuild 之前硬失败。 -->
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Lumio.Server.MvpHost.GeneratedContracts.Tests</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.GeneratedContracts.Tests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.GeneratedContracts/Lumio.Server.MvpHost.GeneratedContracts.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -19,6 +19,11 @@ fail() {
 bash eng/verify-isolation.sh || fail isolation $?
 bash eng/verify-sdk.sh || fail sdk $?
 
+# 契约面的两道锁排在 restore 之前：镜像或生成物被手改时，后面的构建与测试跑出来的
+# 「绿」是对着被篡改的契约算的，越早拦下越好。两者都不需要架构源在手。
+bash eng/verify-contract-mirror.sh || fail contract-mirror $?
+bash eng/verify-generated-contracts.sh || fail generated-contracts $?
+
 dotnet restore build.proj --locked-mode || fail restore $?
 
 # 逐工程 format 校验；零工程时循环体不执行。

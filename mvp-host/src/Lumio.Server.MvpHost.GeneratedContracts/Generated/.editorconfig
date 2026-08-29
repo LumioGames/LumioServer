@@ -1,0 +1,21 @@
+# Generated/ 下的每个 .cs 都是架构源 packages/csharp/ 的逐字节拷贝，不得手改。
+# 本文件由 bash eng/generate-contracts.sh 与 Generated/ 一起重建。
+#
+# 例外一律**目录级**、不写工程级 NoWarn：工程级 NoWarn 会把例外面扩大到本工程未来
+# 可能新增的任何手写文件上（R-00270 的 RS0030 教训——「有一份看起来在守护的东西」
+# 必须证明它真的会响，而放宽面越大越难证明）。这里的两条降级只对 Generated/ 生效。
+
+[*.cs]
+
+# ① 把本目录视作生成代码，分析器的风格类诊断因此降级。
+#    没有这条，架构源按 net8.0 生成的代码会在本构建根的
+#    TreatWarningsAsErrors + latest-recommended 下因风格诊断整片变红，
+#    而这些代码本仓无权修改（改了就不再是镜像）。
+generated_code = true
+
+# ② CS8669：生成代码里出现 nullable 注解时，编译器要求文件内有显式 #nullable 指令。
+#    架构源的 ContractBodies.cs / ProtocolGate.cs 用了 `string?`，而文件里没有该指令
+#    （它们在架构源自己的构建里不被视作生成代码，因此不需要）。①一旦开启，
+#    这条就必然触发——两者是同一枚硬币的两面。本工程 Nullable=enable，
+#    注解语义明确，缺的只是那行指令，而指令不能由本仓补（补了就不是逐字节镜像）。
+dotnet_diagnostic.CS8669.severity = none

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>0</MvpHostLayer>
+    <RootNamespace>Lumio.Server.MvpHost.GeneratedContracts</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.GeneratedContracts</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    零 PackageReference、零 ProjectReference：本工程是依赖图的底（layer 0），
+    只承载架构源生成物的**源码拷贝**与一份记录来源的 manifest。
+
+    刻意**不引用**架构源的 6 个 .csproj。实测理由（详见 contract-mirror/MIRROR.md）：
+    架构源工程原样是 net8.0，而本构建根的 Directory.Build.targets 对每个 SDK 工程硬断言
+    TargetFramework == net10.0；在 contract-mirror/ 放空壳 Directory.Build.props **拦不住**
+    父级 Directory.Build.targets（MSBuild 对 .props 与 .targets 的向上查找各自独立），
+    构建输出 `VALIDATE-RAN TFM=net8.0 RootPropsSeen=` 后随即
+    `error : TFM must be net10.0 but was net8.0` 与 `Build FAILED`。
+  -->
+
+</Project>
