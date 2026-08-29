@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>4</MvpHostLayer>
+    <MvpHostProductionProject>false</MvpHostProductionProject>
+    <RootNamespace>Lumio.Server.MvpHost.TestKit</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.TestKit</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    测试库，不是测试工程：刻意**不设** IsTestProject —— 设了会让 test runner
+    去发现它、并把它当成一个零测试的测试程序集。
+
+    ProjectReference 恰四个。第四个 Observability 是本轮新增：RecordingHostTraceSink
+    实现的 IHostTraceSink 与它记录的 AuditRecord 都属 Observability，
+    设计 §4.2 的三项列表未含它，已作为设计缺口上报。
+  -->
+  <ItemGroup>
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.Wire/Lumio.Server.MvpHost.Wire.csproj" />
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.Platform/Lumio.Server.MvpHost.Platform.csproj" />
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.HostContracts/Lumio.Server.MvpHost.HostContracts.csproj" />
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.Observability/Lumio.Server.MvpHost.Observability.csproj" />
+  </ItemGroup>
+
+</Project>

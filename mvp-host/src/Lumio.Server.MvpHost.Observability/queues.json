@@ -1,0 +1,25 @@
+{
+  "queues": [
+    {
+      "name": "MvpAuditQueue",
+      "owner": "Lumio.Server.MvpHost.Observability",
+      "producer": "auth / session / world-slot",
+      "consumer": "Observability audit drain",
+      "ordering": "FIFO",
+      "budget": "SRV-D-016 provisional: 256 items / 256 KiB",
+      "onFull": "回 EnqueueStatus.Full 并置 IsBackpressured；请求 world-slot 关闸，绝不静默放行",
+      "onClose": "关闭后拒绝新写入；已入队记录由 drain 侧处置"
+    },
+    {
+      "name": "MvpDiagnosticQueue",
+      "owner": "Lumio.Server.MvpHost.Observability",
+      "producer": "全部生产工程",
+      "consumer": "Observability diagnostic drain",
+      "ordering": "FIFO",
+      "budget": "SRV-D-017 provisional: 512 items / 512 KiB",
+      "onFull": "丢弃并计数（diagnostic 可丢，audit 不可）",
+      "onClose": "关闭后拒绝新写入"
+    }
+  ],
+  "note": "七项合同字段齐全由 Architecture.Tests 的 QueueRegistryTest 机器校验；budget 的数值是 provisional 声明值。"
+}

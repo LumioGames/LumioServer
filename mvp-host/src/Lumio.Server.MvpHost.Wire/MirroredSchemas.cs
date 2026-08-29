@@ -19,6 +19,7 @@ namespace Lumio.Server.MvpHost.Wire
         internal const string CommonId = "common.schema.json";
         internal const string ProtocolPermissionGateId = "protocol-permission-gate.schema.json";
         internal const string SessionRevisionVectorId = "session-revision-vector.schema.json";
+        internal const string LoggingEventId = "logging-event.schema.json";
 
         private static readonly Dictionary<string, JsonObject> Loaded = Load();
 
@@ -64,7 +65,7 @@ namespace Lumio.Server.MvpHost.Wire
             var assembly = Assembly.GetExecutingAssembly();
             var result = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
 
-            foreach (var id in new[] { ReplicationEnvelopeId, CommonId, ProtocolPermissionGateId, SessionRevisionVectorId })
+            foreach (var id in new[] { ReplicationEnvelopeId, CommonId, ProtocolPermissionGateId, SessionRevisionVectorId, LoggingEventId })
             {
                 using var stream = assembly.GetManifestResourceStream("mirror/" + id)
                     ?? throw new InvalidOperationException($"嵌入资源缺失：mirror/{id}（检查 Wire.csproj 的 EmbeddedResource）。");
