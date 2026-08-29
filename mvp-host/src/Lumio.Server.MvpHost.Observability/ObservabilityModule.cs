@@ -158,7 +158,7 @@ internal sealed class AuditWriter : IAuditWriter
         string traceId,
         string producerId,
         ulong eventSeq,
-        string reasonCode)
+        string? reasonCode)
     {
         var correlation = new CorrelationView(
             Scope: "Release",

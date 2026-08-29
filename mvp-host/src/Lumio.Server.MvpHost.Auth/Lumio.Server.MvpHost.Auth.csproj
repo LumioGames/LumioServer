@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>4</MvpHostLayer>
+    <RootNamespace>Lumio.Server.MvpHost.Auth</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.Auth</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    零 PackageReference；ProjectReference 恰两个。
+    **不引用 Transport / Session / WorldSlot** —— auth 只裁决「这个连接是谁、允许它做什么」，
+    既不认识字节载体，也不认识 session 编排与 slot 生命周期。
+    调用方（Session）只经 HostContracts 的 IAuthorizationService 接口调用本实现，
+    两个程序集互不引用，实例由组装根在装配期注入。由 LayeringTest 的禁边断言守住。
+  -->
+  <ItemGroup>
+    <ProjectReference Include="../Lumio.Server.MvpHost.HostContracts/Lumio.Server.MvpHost.HostContracts.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Observability/Lumio.Server.MvpHost.Observability.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.Auth.Tests" />
+  </ItemGroup>
+
+</Project>

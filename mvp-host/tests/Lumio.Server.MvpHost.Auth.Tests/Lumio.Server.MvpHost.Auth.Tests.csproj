@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>5</MvpHostLayer>
+    <MvpHostProductionProject>false</MvpHostProductionProject>
+    <!-- xunit.v3 的构建期检查要求测试工程可执行；非 Exe 时它在 PrepareForBuild 之前硬失败。 -->
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Lumio.Server.MvpHost.Auth.Tests</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.Auth.Tests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <!--
+      ArchUnitNET 只用于「谁调用了谁」这一类断言：System.Reflection 看不到方法体内部、
+      构造点与调用点，凡调用依赖一律走它；能用类型/成员签名表达的仍用签名级反射。
+      不使用 IL 字节扫描，不引入任何未冻结的分析包（设计 §4.3 / §14 J4）。
+    -->
+    <PackageReference Include="TngTech.ArchUnitNET.xUnitV3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.Auth/Lumio.Server.MvpHost.Auth.csproj" />
+    <ProjectReference Include="../../testkit/Lumio.Server.MvpHost.TestKit/Lumio.Server.MvpHost.TestKit.csproj" />
+  </ItemGroup>
+
+</Project>
