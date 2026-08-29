@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>1</MvpHostLayer>
+    <RootNamespace>Lumio.Server.MvpHost.Platform</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.Platform</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    零 PackageReference。卡面写「唯一 PackageReference 是 System.Threading.Channels」，
+    但该包在 net10.0 已并入共享框架：显式引用触发 NU1510
+    （"This package is automatically available and does not need to be referenced explicitly"），
+    在 TreatWarningsAsErrors 下是硬错误。System.Threading.Channels 的类型直接由框架提供，
+    因此本工程的正确形态是零 PackageReference。
+    Directory.Packages.props 里的 PackageVersion 条目保留不动（无 PackageReference 时为惰性）。
+  -->
+
+</Project>

@@ -1,0 +1,1 @@
+{"queues": [], "note": "Platform 只提供 IBoundedInbox/IBoundedOutbox 原语，具体队列由各业务工程在自己的 queues.json 登记"}
