@@ -16,10 +16,10 @@ namespace Lumio.Server.MvpHost.Platform;
 /// </summary>
 internal sealed class SystemWallClock : IWallClock
 {
-    // 本 pragma 是「双重收窄」的内层。注意它目前是**冗余**的：
-    // Directory.Build.props 给本工程开的例外是工程级 NoWarn RS0030，外层已经把诊断关掉，
-    // 内层因此抑制不到任何东西。等该例外收窄到文件级（归 R-00270，已上报）之后它才真正生效。
-    // 保留它，是为了收窄那天不需要再回来补。
+    // 本 pragma 是全仓唯一的 RS0030 例外，**它就是例外本身**，不是任何外层开关的内层备份。
+    // Directory.Build.props 刻意不写工程级 NoWarn（写了会一刀切放行本工程的全部四条禁令），
+    // 因此本文件之外、本工程之内的 DateTimeOffset / Socket / DateTime / Thread.Sleep 照常被拦。
+    // 删掉它，本文件立刻报 RS0030；把它挪到别处，就等于把全仓唯一墙钟出口挪走。
 #pragma warning disable RS0030
     public string UtcIso8601Now() =>
         DateTimeOffset.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture);

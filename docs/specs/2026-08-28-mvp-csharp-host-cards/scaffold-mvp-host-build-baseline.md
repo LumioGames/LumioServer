@@ -73,3 +73,24 @@ Produces:
 - 包引用契约：所有 `PackageReference` 一律**不带 `Version` 属性**（中央包版本管理已开启），版本只在 `mvp-host/Directory.Packages.props` 中声明，且该文件已含 7 个包的版本，后续卡不再修改它。
 - 脚本契约：`bash mvp-host/eng/verify-all.sh` 成功末行 `MVP_HOST_VERIFY_OK` 退出码 0；`bash mvp-host/eng/verify-isolation.sh` 成功打印 `MVP_HOST_ISOLATION_OK` 退出码 0、违规退出码 `34`；`bash mvp-host/eng/verify-sdk.sh` 成功打印 `SDK_OK sdk=<v> runtime=<v>` 退出码 0。
 - `mvp-host/absences.json` 的全量 19 条已由本卡写定，下游卡**只读校验、不追加**；下游卡的验收项「未越界实现任何 `mvp-host/absences.json` 列出的条目」以本文件为准。
+
+
+---
+
+## TD 卡面修订(2026-08-29,总调度)
+
+本卡正文中的三处陈述已在 R-00270 重开修复中按已定裁决改掉,**卡面同步如下**:
+
+1. **「43 个已注册 ErrorCode」→ 作废。** 实测 `StableErrorIds` 长度为 **53**。按已定裁决,**一切计数式论证改为「存在性 + 身份」断言**(BaselineId 相等 + SchemaId 在册 + 逐名核验),**不写任何计数** —— 计数会随 additive 增补必然腐烂,43→53 即为实例。结论(认证失败用 close 1008 不发 Envelope Error)**仍成立**,失效的只是计数式论证。
+2. **「64 个 `0`」→ 作废**,见 [`implement-mvp-envelope-wire-and-fixture-gate.md`](implement-mvp-envelope-wire-and-fixture-gate.md) 的同日修订:ADR-045 明文否决 sentinel,实际值为 `a805f7c8…6d2ea7`。
+3. **「七条迁移」的计数标签 → 去掉**(同第 1 条口径)。
+
+### 附:一条被误判的缺口,以及它的真正根因
+
+R-00270 的 QA 轮曾判「19 条 `absences.json` source 中 4 条指向不存在的 `contract-mirror/`」。**重开修复实测:那 4 条本来就成立,缺口 = 0。**
+
+根因不是路径写错,而是:[`define-mvp-host-contracts-and-audit-surface.md:42`](define-mvp-host-contracts-and-audit-surface.md)(R-00274 卡面,自 `490fdb1` 起从未改过)**原文写定**「`contract-mirror/` 内路径按 `mvp-host/` 相对解析」,而 R-00271 正是把镜像落在 `mvp-host/contract-mirror/`。QA 按**仓库根**量,故量得缺失 —— **这条解析基准从未落进 `absences.json` 自身**。
+
+**处置**:把基准补进 `absences.json` 顶层 `note`,**不改那 4 个 source 字符串**(改它们反而会同时违背 R-00270 与 R-00274 两张卡面的明文指令,并让 `MIRROR.md:121` 的引用失准)。
+
+**沉淀**:**缺席 / 清单类文件必须把「路径解析基准」写进文件自身** —— 基准只写在另一张卡面上,等于把「怎么读这份文件」藏在了读者不会去看的地方。
