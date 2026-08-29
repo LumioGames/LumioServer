@@ -69,14 +69,41 @@ public sealed class QueueRegistryTest
                 }
             }
 
+            // owner 允许**前向引用尚未落地的工程**：按「消费者拥有队列」的口径，
+            // 跨模块队列的所有者常常是下游卡才交付的消费者
+            // （例如 MvpTransportEventOutbox 归 Session，而 Session 在 wave 5）。
+            // 因此这里只判两件事：名字符合本仓工程命名规范；已落地时必须是生产工程。
+            // 拼错或瞎填仍会被前一条挡住，而前向引用会在该工程落地后自动被覆盖。
             var owner = entry["owner"]?.GetValue<string>();
-            if (owner is not null && BuildGraph.ByName(owner) is null)
+            if (owner is not null)
             {
-                violations.Add($"{project} 的 {name} 的 owner {owner} 不在构建图内");
+                if (!owner.StartsWith("Lumio.Server.MvpHost.", StringComparison.Ordinal))
+                {
+                    violations.Add($"{project} 的 {name} 的 owner「{owner}」不符合工程命名规范");
+                }
+                else if (BuildGraph.ByName(owner) is { IsProduction: false })
+                {
+                    violations.Add($"{project} 的 {name} 的 owner {owner} 不是生产工程");
+                }
             }
         }
 
         Assert.Empty(violations);
+    }
+
+    /// <summary>
+    /// 防空转：整张登记表不能全是前向引用。允许 owner 指向尚未落地的工程是必要的松弛，
+    /// 但若**一条都没落地**，上面那条「已落地时必须是生产工程」就从未真正判过任何东西。
+    /// </summary>
+    [Fact]
+    public void 至少有一条登记的owner已经落地()
+    {
+        var landed = RegisteredQueues()
+            .Select(x => x.Entry["owner"]?.GetValue<string>())
+            .Where(o => o is not null && BuildGraph.ByName(o) is not null)
+            .ToList();
+
+        Assert.NotEmpty(landed);
     }
 
     /// <summary>
