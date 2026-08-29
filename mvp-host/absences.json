@@ -1,6 +1,6 @@
 {
   "baselineId": "LGE-V1.4-2026-08-27",
-  "note": "缺席登记纪律：缺席不得改变公共接口或状态机的形状——接口保留、返回稳定拒绝或固定成功，不删步骤、不删状态。「简化」「暂时」不是合法的缺席理由。本文件由 scaffold-mvp-host-build-baseline 一次性写定，下游卡只读校验、不追加。",
+  "note": "缺席登记纪律：缺席不得改变公共接口或状态机的形状——接口保留、返回稳定拒绝或固定成功，不删步骤、不删状态。「简化」「暂时」不是合法的缺席理由。本文件由 scaffold-mvp-host-build-baseline 一次性写定，下游卡只读校验、不追加。 source 路径解析基准（2026-08-29 补记，此前从未落纸，导致 4 条 contract-mirror 路径被按仓库根误判为缺失）：默认相对仓库根；以 contract-mirror/ 开头的路径相对 mvp-host/ 解析——该口径由 docs/specs/2026-08-28-mvp-csharp-host-cards/define-mvp-host-contracts-and-audit-surface.md 的 AbsencesManifestTest 验收项原文写定（「contract-mirror/ 内路径按 mvp-host/ 相对解析」），本文件照此执行。 clause 的断言口径：一律只取「存在性 + 身份」（具名 id 在册、BaselineId 相等），不写任何元素计数——架构源的 additive 增补是被鼓励的，计数断言必然腐烂。",
   "reasonVocabulary": ["载体已提供", "阶段未到", "决策门冻结", "实现方为 P1"],
   "absences": [
     {
@@ -12,7 +12,7 @@
     },
     {
       "id": "ABS-WORLDSLOT-DEFERRED-TRANSITIONS",
-      "clause": "Resume / BeginSnapshot / SnapshotComplete / BeginReload / ReloadComplete / BeginMigrate / MigrationHandedOff 七条迁移的触发方缺席；迁移定义保留在表内、MVP 代码路径不触发。",
+      "clause": "Resume / BeginSnapshot / SnapshotComplete / BeginReload / ReloadComplete / BeginMigrate / MigrationHandedOff 这些具名迁移的触发方缺席；迁移定义保留在表内、MVP 代码路径不触发。",
       "source": "modules/world-slot/README.md",
       "reason": "阶段未到",
       "successor": "implement-world-slot-quiesce-migration-and-fault-adjudication"
@@ -68,14 +68,14 @@
     },
     {
       "id": "ABS-ENVELOPE-POCO",
-      "clause": "架构源未生成 C# ReplicationEnvelope POCO（Lumio.Gen.LanguageBinding 只有名字映射三元组），本仓 MvpEnvelopeDocument 是临时替身，由 ContractArtifactDebtTest 自过期守卫标注到期日。",
+      "clause": "【2026-08-29 修正 · 本条缺席已闭合】原记录写「架构源未生成 C# ReplicationEnvelope POCO（Lumio.Gen.LanguageBinding 只有名字映射三元组），本仓 MvpEnvelopeDocument 是临时替身」——ADR-048 (D-3) 发布 closed contract type bodies 后已失实。实测（本仓镜像自架构源 664ccd6，判据取存在性 + 身份：SchemaId replication-envelope 在册、Catalog.BaselineId 与本文件 baselineId 相等）：Lumio.Gen.ContractTypes.ReplicationEnvelope 是已存在的公开类型，字段按 schema 声明序排列，Body 为 OpaqueJson；本仓 MvpEnvelopeReader / MvpEnvelopeWriter 直接消费该生成类型，不自造 DTO，MvpEnvelopeDocument 替身从未落地（.cs 树内零出现；该名字只剩在 docs/specs 的 R-00260 设计包正文里，属设计包与交付实现之间的已知漂移，不归本文件）。闭合后仍然成立的唯一约束：Body 必须保持 OpaqueJson——换成具体类型即是发明 D-009 尚未裁决的公共状态载荷（body 内层的缺席另登记在 ABS-REPLICATION-STATE-PAYLOAD）。ContractArtifactDebtTest 已按到期后的现实翻转为正向断言；它一旦变红即为架构源反向撤面，须停下上报而非本地绕过。",
       "source": "docs/specs/2026-08-28-mvp-csharp-host-design.md",
       "reason": "载体已提供",
       "successor": "consume-upstream-generated-contract-artifacts"
     },
     {
       "id": "ABS-PERMISSION-VALIDATOR",
-      "clause": "ADR-022 要求的生成式 Protocol/Permission Validator 在 C# 侧只有 15 项字段名表、没有可执行校验方法；本仓 gate 判定是手写替身。",
+      "clause": "【2026-08-29 修正 · 本条缺席已闭合】原记录写「ADR-022 要求的生成式 Protocol/Permission Validator 在 C# 侧只有 15 项字段名表、没有可执行校验方法；本仓 gate 判定是手写替身」——两点均已失实，且「15 项」本身就是被裁决禁止的计数式论证。实测（判据取存在性 + 身份：SchemaId protocol-permission-gate 在册、Catalog.BaselineId 与本文件 baselineId 相等）：ADR-048 已发布可执行闸门 Lumio.Gen.ProtocolPermissionValidator.ProtocolGate.Evaluate（公开静态方法），随附 RejectPrecedence（多条同时失败时的判定顺序，属公共规则）与 RegisteredMessageIds；本仓 MvpProtocolPermissionGate 已收缩为薄适配层，判定全部委托生成执行体、一条 if 都不复制，手写替身路径作废。闭合后仍然成立的约束：架构源未发布 role→message 表，本仓不得发明。",
       "source": "docs/specs/2026-08-28-mvp-csharp-host-design.md",
       "reason": "载体已提供",
       "successor": "consume-upstream-generated-contract-artifacts"
@@ -103,14 +103,14 @@
     },
     {
       "id": "ABS-AUTH-CREDENTIAL-ERRORCODE",
-      "clause": "43 个已注册 ErrorCode 中没有「凭据无效」语义码，因此通道认证失败不发 Envelope Error，只以 WebSocket close 1008 拒绝并写一条 Release 作用域 Audit。",
+      "clause": "已注册 ErrorCode 集合中不存在「凭据无效」语义码，因此通道认证失败不发 Envelope Error，只以 WebSocket close 1008 拒绝并写一条 Release 作用域 Audit。判据取存在性 + 身份，不写任何计数：Catalog.BaselineId 与本文件 baselineId 相等，SchemaId replication-envelope 在册；逐名核验 Catalog.StableErrorIds 无任何承载「凭据本身无效」的成员——SignatureInvalid / TrustRootUnknown / TrustPolicyRejected / KeyRevoked 属包与签名信任面，SessionMismatch / RoleMismatch / ClaimNotGranted / StaleConnectionGeneration / SessionAntiReplay 属 admission 之后的会话权限面，两族都不表达通道认证阶段的凭据无效。【2026-08-29 修正】原记录写「43 个已注册 ErrorCode 中没有…」——结论不变，失效的只是计数式论证：该集合在同一 V1.4 基线内已由 43 增至 53（ADR-046 的 native kernel status band），而 additive 增补正是被鼓励的，任何计数断言必然腐烂（同一裁决口径见 BaselineSentinelTest）。",
       "source": "modules/auth/README.md",
       "reason": "决策门冻结",
       "successor": "needs-new-card"
     },
     {
       "id": "ABS-CLIENT-UPLINK-COMMAND",
-      "clause": "客户端上行 gameplay 命令的 wire 承载缺席（A1-β）：8 个冻结 messageType 中无一可承载 client→server 命令，D-009 禁止任何仓库发明 dispatch wire format。",
+      "clause": "客户端上行 gameplay 命令的 wire 承载缺席（A1-β）：已冻结的 messageType 取值域中不存在承载 client→server gameplay 命令的成员，D-009 禁止任何仓库发明 dispatch wire format。判据取存在性 + 身份，不写任何计数：SchemaId replication-envelope 在册、Catalog.BaselineId 与本文件 baselineId 相等；逐名核验取值域 Handshake / FullSnapshot / BaselineAck / Delta / DeltaAck / ResyncRequest / MaintenanceKick / Error——其中确为上行的 BaselineAck / DeltaAck / ResyncRequest 都是复制控制面语义，无一承载 gameplay 命令。【2026-08-29 修正】原记录写「8 个冻结 messageType 中无一可承载…」——结论不变，改掉的是计数式论证。",
       "source": "modules/protocol-dispatch/README.md",
       "reason": "决策门冻结",
       "successor": "needs-new-card"
