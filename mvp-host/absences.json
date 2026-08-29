@@ -96,8 +96,8 @@
     },
     {
       "id": "ABS-LENGTH-SEMANTICS",
-      "clause": "Envelope 顶层 length 字段无公共语义定义，出入站取非对称私有口径：入站只校验 integer >= 0、不与任何字节数交叉核对；出站写 body 规范 JSON 序列化后的 UTF-8 字节数。",
-      "source": "docs/specs/2026-08-28-mvp-csharp-host-design.md",
+      "clause": "Envelope 的 wire 字节编码尚未冻结（等状态载荷决定），因此 length 不表示任何字节数。公共判定只有一条（ADR-045 §3）：length MUST NOT exceed 本信封自己的 transportPolicy.maxMessageBytes；出入站一律只按该上界校验，不与任何实际字节数交叉核对。【2026-08-29 修正】原记录写「length 无公共语义定义、出站写 body 的 UTF-8 字节数」——ADR-045 落地后两点均已失实：语义已公开，且该 ADR 的 Alternatives 明文否决把 length 定义为 CanonicalJsonV1 字节数（那会让文本编码由副作用变成规范 wire 形态）。",
+      "source": "contract-mirror/schemas/replication-envelope.schema.json",
       "reason": "决策门冻结",
       "successor": "needs-new-card"
     },
@@ -124,7 +124,7 @@
     },
     {
       "id": "ABS-REPLICATION-MAPPING-SET",
-      "clause": "mappingSetHash 指向 ADR-005 所述、由 LumioGame 拥有而 MVP 期不存在的公共映射集；出站填本仓单点常量 64 个 0（provisional，含义仅为「本 MVP 宿主不声明任何映射集」），入站只校验 hash256 正则、不做任何交叉核对。",
+      "clause": "MVP 期没有任何已注册的复制映射集。ADR-045 §2 把 mappingSetHash 定义为 ADR-041 的 ReplicationMappingSetV1 域摘要，空映射集有定义值 a805f7c841f708981cc82a93047d7b0c8e6bf923f3dba18e179036741a6d2ea7（canonicalBytes = {\"digestDomain\":\"ReplicationMappingSetV1\",\"mappings\":[]}，已自算 sha256 复核）；出站恒填该值，入站只校验 hash256 正则、不做交叉核对。【2026-08-29 修正】原记录写「出站填本仓单点常量 64 个 0（provisional）」——ADR-045 §2 与其 Alternatives 明文逐一否决 sentinel（空串 / 全零 / 省略成员），理由是每种都要在每个实现里加特例、省略成员还会重开 ADR-028 已关闭的「缺失意味什么」歧义。64 个 0 已构成对公共规则的违反。",
       "source": "contract-mirror/schemas/replication-envelope.schema.json",
       "reason": "阶段未到",
       "successor": "needs-new-card"
