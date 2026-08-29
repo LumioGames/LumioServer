@@ -1,0 +1,44 @@
+<Project DefaultTargets="Build">
+
+  <!--
+    MSBuild 遍历工程。glob 刻意不含 adapters/ —— Runtime 类型全部关在
+    adapters/Lumio.Server.MvpHost.Runtime.Adapter 且不进构建图，
+    「Adapter 缺席仍全绿」因此是机器可判断言，不是口头承诺（设计 §4.2）。
+
+    零匹配（本卡落地时的状态）不是失败：下面每个 MSBuild 任务都带 Condition 守空。
+  -->
+
+  <PropertyGroup>
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <TraversalProject Include="src/**/*.csproj" />
+    <TraversalProject Include="tests/**/*.csproj" />
+    <TraversalProject Include="testkit/**/*.csproj" />
+  </ItemGroup>
+
+  <Target Name="Restore">
+    <MSBuild Projects="@(TraversalProject)"
+             Targets="Restore"
+             BuildInParallel="true"
+             Condition="'@(TraversalProject)' != ''" />
+  </Target>
+
+  <Target Name="Build">
+    <MSBuild Projects="@(TraversalProject)"
+             Targets="Build"
+             BuildInParallel="true"
+             Condition="'@(TraversalProject)' != ''" />
+  </Target>
+
+  <Target Name="Clean">
+    <MSBuild Projects="@(TraversalProject)"
+             Targets="Clean"
+             BuildInParallel="true"
+             Condition="'@(TraversalProject)' != ''" />
+  </Target>
+
+  <Target Name="Rebuild" DependsOnTargets="Clean;Build" />
+
+</Project>

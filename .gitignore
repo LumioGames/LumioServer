@@ -6,3 +6,12 @@ node_modules/
 /target
 /build
 /dist
+
+# .NET (mvp-host/)
+[Bb]in/
+[Oo]bj/
+.vs/
+*.user
+*.suo
+TestResults/
+artifacts/

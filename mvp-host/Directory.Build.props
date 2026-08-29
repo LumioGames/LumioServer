@@ -1,0 +1,61 @@
+<Project>
+
+  <!--
+    C# 构建基线。本文件刻意下沉到 mvp-host/ 而非仓库根：MSBuild 从工程目录逐级向上查找、
+    遇到第一个 Directory.Build.props 即停止，放在仓根会让 net10.0 / LangVersion 14.0
+    意外管辖未来 Rust 侧任意位置的测试夹具 csproj（设计 §3.4）。
+  -->
+
+  <PropertyGroup Condition="'$(MSBuildProjectExtension)' == '.csproj'">
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+    <Deterministic>true</Deterministic>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <DisableImplicitNuGetFallbackFolder>true</DisableImplicitNuGetFallbackFolder>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>14.0</LangVersion>
+  </PropertyGroup>
+
+  <!--
+    两个自定义开关属性。MvpHostLayer 刻意无默认值：每个 csproj 必须自行声明层号，
+    Architecture.Tests 据此断言「被依赖方 layer 严格小于依赖方 layer」，
+    因而新增工程不需要改任何共享 allowlist 文件、不造成卡间文件冲突（设计 §4）。
+  -->
+  <PropertyGroup>
+    <MvpHostProductionProject Condition="'$(MvpHostProductionProject)' == ''">true</MvpHostProductionProject>
+  </PropertyGroup>
+
+  <!--
+    BannedApiAnalyzers 的全仓接线。分析器必须逐工程引用才生效，
+    因此「在所有生产工程生效」只能写在本文件（设计 §7.4 把归属定死在这里）。
+
+    AdditionalFiles 的文件名不可改成任意名字：BannedApiAnalyzers 只读取文件名为
+    BannedSymbols.txt 或 BannedSymbols.*.txt 的 AdditionalFile，其余名字**被静默忽略**——
+    不报错、不警告，四条禁令直接空转。本轮实测：文件名为 banned-public-api.txt 时，
+    生产工程内写 System.DateTimeOffset.UtcNow 构建全绿、零 RS0030；仅改名即报 RS0030。
+    分析器没有可改该文件名的 MSBuild 开关，Link 元数据也改不了 AdditionalText.Path。
+  -->
+  <ItemGroup Condition="'$(MSBuildProjectExtension)' == '.csproj'">
+    <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" PrivateAssets="all" />
+    <AdditionalFiles Include="$(MSBuildThisFileDirectory)eng/BannedSymbols.banned-public-api.txt" />
+  </ItemGroup>
+
+  <!--
+    全仓唯一的禁用面例外：Platform 的 IWallClock 实现需要 System.DateTimeOffset。
+    没有这个墙钟出口，本仓产不出一条含合法 timestamp 的 logging-event
+    （logging-event.schema.json 的 required 含 timestamp 且 additionalProperties:false，设计 §6.0）。
+    这是「双重收窄」的外层——工程级放行；内层是该实现文件内的单文件 pragma，
+    并由 Platform 工程内的源码扫描测试断言「使用 DateTimeOffset 的源文件恰有一个」。
+    Platform 之外的任何工程一律无例外。
+  -->
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'Lumio.Server.MvpHost.Platform'">
+    <NoWarn>$(NoWarn);RS0030</NoWarn>
+  </PropertyGroup>
+
+</Project>

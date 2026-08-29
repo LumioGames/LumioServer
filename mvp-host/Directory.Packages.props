@@ -1,0 +1,25 @@
+<Project>
+
+  <!--
+    中央包版本管理：全部 PackageReference 一律不带 Version 属性，版本只在本文件声明。
+    这 7 个包是本批次的全集——后续任何卡都不得新增分析包（设计 §7.4）。
+    TngTech.ArchUnitNET.xUnitV3 供测试工程做方法调用依赖级断言：System.Reflection 只能看
+    签名与元数据，看不到方法体内部、构造点与调用点，凡「谁调用了谁」的断言只能靠它（设计 §4.3）。
+  -->
+
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageVersion Include="xunit.v3" Version="3.2.2" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageVersion Include="TngTech.ArchUnitNET.xUnitV3" Version="0.13.3" />
+    <PackageVersion Include="FsCheck" Version="3.3.4" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="5.6.0" />
+    <PackageVersion Include="System.Threading.Channels" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>
