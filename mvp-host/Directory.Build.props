@@ -50,12 +50,20 @@
     全仓唯一的禁用面例外：Platform 的 IWallClock 实现需要 System.DateTimeOffset。
     没有这个墙钟出口，本仓产不出一条含合法 timestamp 的 logging-event
     （logging-event.schema.json 的 required 含 timestamp 且 additionalProperties:false，设计 §6.0）。
-    这是「双重收窄」的外层——工程级放行；内层是该实现文件内的单文件 pragma，
-    并由 Platform 工程内的源码扫描测试断言「使用 DateTimeOffset 的源文件恰有一个」。
+
+    **这里刻意不写工程级 NoWarn。** 初版写的是
+    `<PropertyGroup Condition="'$(MSBuildProjectName)' == 'Lumio.Server.MvpHost.Platform'">
+       <NoWarn>$(NoWarn);RS0030</NoWarn></PropertyGroup>`，
+    本意是「只放行墙钟」，实际却一刀切关掉了该工程的**全部四条**禁令
+    （Socket / DateTime / DateTimeOffset / Thread.Sleep）——而 Platform 恰恰是唯一被授予例外的工程，
+    等于例外面比设计意图宽了一整个工程，且 SystemWallClock.cs 里的 pragma 沦为死代码。
+    实测：工程级 NoWarn 在场时，Platform 内写 Thread.Sleep 构建成功；去掉后即报 RS0030。
+
+    正确形态是**只靠文件级 pragma**：`SystemWallClock.cs` 内的
+    `#pragma warning disable RS0030` 已足以放行该文件，其余文件照常被拦。
+    收窄由 Platform 工程内的源码扫描测试（「使用 DateTimeOffset 的源文件恰有一个」）二次守住。
     Platform 之外的任何工程一律无例外。
   -->
-  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'Lumio.Server.MvpHost.Platform'">
-    <NoWarn>$(NoWarn);RS0030</NoWarn>
-  </PropertyGroup>
+
 
 </Project>
