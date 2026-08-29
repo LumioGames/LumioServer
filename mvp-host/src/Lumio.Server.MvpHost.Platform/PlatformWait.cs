@@ -9,12 +9,12 @@ namespace Lumio.Server.MvpHost.Platform;
 ///
 /// 除本文件外，任何工程、任何文件都不得出现 <c>Task.Delay</c>、线程级睡眠或自建轮询循环。
 ///
-/// <b>本工程内这条纪律的实际执行者只有源码扫描测试，不是分析器。</b>
-/// `Directory.Build.props` 给本工程开的例外是**工程级** <c>NoWarn RS0030</c>，
-/// 它一刀切关掉了全部四条禁令（Socket / DateTime / DateTimeOffset / Thread.Sleep），
-/// 不只是墙钟那一条——所以本工程内写 <c>Thread.Sleep</c> 构建**不会**失败。
-/// 收窄该例外到文件级归 `Directory.Build.props` 的所有者卡（R-00270），已上报。
-/// 在收窄之前，不要以为这里有构建期护栏。
+/// <b>这条纪律由构建期护栏与源码扫描测试双重执行。</b>
+/// `Directory.Build.props` 刻意**不写工程级** <c>NoWarn RS0030</c>——全仓唯一的禁用面例外是
+/// <c>SystemWallClock.cs</c> 内的文件级 pragma，只放行墙钟那一条。因此本工程内、本文件之外写
+/// <c>Thread.Sleep</c> 会报 <c>RS0030</c> 并构建失败；本文件自身走
+/// <c>Task.Delay(...).GetAwaiter().GetResult()</c>，不触发 <c>Thread.Sleep(Int32)</c> 那条禁令，
+/// 所以这里的唯一落点约束仍要靠源码扫描测试守。
 ///
 /// 等待集中在这里的理由：定时语义一旦散落，重连窗口、防重放窗口、ack 超时就会各自长出
 /// 一套时间源与一条轮询线程，将来换成 Rust 侧的 host-runtime 时是结构性返工。
