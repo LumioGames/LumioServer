@@ -36,12 +36,35 @@ cd mvp-host && bash eng/verify-isolation.sh    # 隔离门禁，成功 MVP_HOST_
 cd mvp-host && bash eng/verify-sdk.sh          # SDK 族校验，成功 SDK_OK sdk=<v> runtime=<v>
 ```
 
+契约镜像与生成物拷贝的四条命令（详见 [`contract-mirror/MIRROR.md`](contract-mirror/MIRROR.md)）：
+
+```bash
+cd mvp-host && bash eng/sync-contract-mirror.sh        # 重新同步 contract-mirror/ 并重写哈希清单
+cd mvp-host && bash eng/verify-contract-mirror.sh      # 镜像守护，漂移退出码 33
+cd mvp-host && bash eng/generate-contracts.sh          # 重拷架构源 .cs 到 Generated/ 并重写 manifest
+cd mvp-host && bash eng/verify-generated-contracts.sh  # 生成物守护，漂移退出码 32
+```
+
+`sync` 与 `generate` 需要 `$LUMIO_ARCHITECTURE_ROOT` 指向 `LumioGameEngineArchitecture`
+（可用 `$LUMIO_ARCHITECTURE_REF` 覆盖默认的 `origin/main`）；两条 `verify` 的门禁部分不需要。
+**`contract-mirror/` 与 `src/Lumio.Server.MvpHost.GeneratedContracts/Generated/` 都是不得手改的
+镜像/生成物**，只能经上述命令更新，并与各自的哈希清单一起提交。
+
+两条 `verify` 各自是**两条互相独立的检查**：「产物未被手改」不需要架构源、漂移即硬失败（33 / 32），
+「与上游同步」需要架构源、**只报告不影响退出码**。上游 additive 增补是被鼓励的，落后于上游
+不是本仓的错误状态；把它和「有人手改了镜像」共用一个红灯，结果就是红灯常亮然后被无视。
+守护本身用 `--self-test`（`.ps1` 用 `-SelfTest`）证伪：临时目录里造镜像、篡改一个字节，
+确认确实返回 33 / 32，再确认原样返回 0。
+
 Windows 用同名 `.ps1`（`pwsh eng/verify-all.ps1`）。
 
-`verify-all` 的步骤顺序：`verify-isolation` → `verify-sdk` → `dotnet restore build.proj --locked-mode`
+`verify-all` 的步骤顺序：`verify-isolation` → `verify-sdk` → **`verify-contract-mirror` →
+`verify-generated-contracts`** → `dotnet restore build.proj --locked-mode`
 → 逐工程 `dotnet format --verify-no-changes --no-restore` → `dotnet build build.proj -c Release --no-restore`
 → 逐工程 `dotnet test -c Release --no-build`（**排除 `*.Integration.Tests`**——集成测试显式触发，
 入口是 `bash eng/verify-integration.sh`，成功末行 `MVP_HOST_INTEGRATION_OK`）。
+两道契约锁排在 `restore` 之前：契约被篡改时，后面构建与测试跑出来的「绿」是对着假契约算的。
+失败时打印 `MVP_HOST_VERIFY_FAIL contract-mirror` 或 `MVP_HOST_VERIFY_FAIL generated-contracts`。
 
 `verify-sdk` 的判据是**版本前缀 `10.0.` + SDK 与 runtime 的 `major.minor` 一致**，
 **不锁补丁号**——补丁号只作为交回物里记录的观测值。把 runtime 号写死进门禁，
@@ -80,4 +103,10 @@ Windows 用同名 `.ps1`（`pwsh eng/verify-all.ps1`）。
 
 四条禁令：`System.Net.Sockets.Socket`、`System.DateTime`、`System.DateTimeOffset`、
 `Thread.Sleep(Int32)`。唯一例外是 `Lumio.Server.MvpHost.Platform` 的 `IWallClock` 实现
-（全仓唯一墙钟出口），以 `Directory.Build.props` 的工程级 `NoWarn` + 该实现文件内的单文件 pragma 双重收窄。
+（全仓唯一墙钟出口），**只靠 `SystemWallClock.cs` 内的单文件 pragma** 放行。
+
+这里**刻意没有工程级 `NoWarn`**：初版在 `Directory.Build.props` 写了工程级 `NoWarn RS0030`，
+本意是放行墙钟，实际一刀切关掉了 Platform 工程的全部四条禁令——而 Platform 恰是唯一
+被授予例外的工程，例外面因此比设计意图宽了一整个工程，文件内的 pragma 沦为死代码。
+实测对照：工程级 `NoWarn` 在场时 Platform 内写 `Thread.Sleep` 构建成功；去掉后即报 `RS0030`。
+同一族教训也写在 `Generated/.editorconfig` 里：**例外一律目录级或文件级，不写工程级**。
