@@ -1,0 +1,25 @@
+{
+  "queues": [
+    {
+      "name": "MvpAuthRequestQueue",
+      "owner": "Lumio.Server.MvpHost.Auth",
+      "producer": "Lumio.Server.MvpHost.Session",
+      "consumer": "auth 认证路径（在 session 编排线程上同步执行，auth 无自有线程）",
+      "ordering": "FIFO per connection epoch",
+      "budget": "SRV-D-005 同族 provisional: 32 条",
+      "onFull": "AuthBusy（映射 QueueFull）由 session 决定重试或关闭",
+      "onClose": "关闭后拒绝新请求"
+    },
+    {
+      "name": "MvpAuthEventQueue",
+      "owner": "Lumio.Server.MvpHost.Session",
+      "producer": "auth runner",
+      "consumer": "Lumio.Server.MvpHost.Session",
+      "ordering": "FIFO per request id",
+      "budget": "provisional: 64 条",
+      "onFull": "写 diagnostic emergency；成功 ack 进保留槽，绝不丢弃",
+      "onClose": "关闭后只交付已入队项"
+    }
+  ],
+  "note": "所有者一栏按「消费者拥有队列」的口径填：MvpAuthEventQueue 归 Session（wave 5 落地，此处是允许的前向引用），因此「不得丢成功 ack」是消费者的保证而不是生产者的自觉。七项合同字段齐全由 Architecture.Tests 的 QueueRegistryTest 机器校验。"
+}
