@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>1</MvpHostLayer>
+    <RootNamespace>Lumio.Server.MvpHost.Wire</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.Wire</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    零 PackageReference：JSON Schema 校验器手写在本工程内（卡面定死）。
+    唯一 ProjectReference 是 GeneratedContracts —— 本工程消费架构源生成的
+    ReplicationEnvelope 与 ProtocolGate，不再自造第二套定义。
+  -->
+  <ItemGroup>
+    <ProjectReference Include="../Lumio.Server.MvpHost.GeneratedContracts/Lumio.Server.MvpHost.GeneratedContracts.csproj" />
+  </ItemGroup>
+
+  <!--
+    镜像 schema 作为嵌入资源编译进程序集，而不是运行期按相对路径去找仓库目录。
+    生产代码一旦依赖「自己在仓库树里的位置」，部署后就会坏，且测试宿主的 cwd 不可控。
+    嵌入副本与 contract-mirror/ 下的源文件字节一致由 MirroredSchemaMatchesContractMirrorTest 守住，
+    上游漂移则由 eng/verify-contract-mirror.sh 的哈希锁在构建前拦下。
+  -->
+  <ItemGroup>
+    <EmbeddedResource Include="../../contract-mirror/schemas/replication-envelope.schema.json" LogicalName="mirror/replication-envelope.schema.json" />
+    <EmbeddedResource Include="../../contract-mirror/schemas/common.schema.json" LogicalName="mirror/common.schema.json" />
+    <EmbeddedResource Include="../../contract-mirror/schemas/protocol-permission-gate.schema.json" LogicalName="mirror/protocol-permission-gate.schema.json" />
+    <EmbeddedResource Include="../../contract-mirror/schemas/session-revision-vector.schema.json" LogicalName="mirror/session-revision-vector.schema.json" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.Wire.Tests" />
+  </ItemGroup>
+
+</Project>
