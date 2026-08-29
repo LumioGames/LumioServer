@@ -1,0 +1,40 @@
+<Project>
+
+  <!--
+    生产工程与测试工程的边界、以及 TFM/LangVersion 的单一取值，在构建期硬失败。
+    形状照 LumioGameRuntime/Directory.Build.targets 的 ValidateRuntimeBuildProfile。
+    本目标只对 SDK 工程生效——build.proj 没有 PrepareForBuild，因而不受管辖。
+  -->
+  <Target Name="ValidateMvpHostBuildProfile" BeforeTargets="PrepareForBuild">
+
+    <!-- ① 生产工程不得引入任何测试框架或分析套件。 -->
+    <Error Condition="'$(MvpHostProductionProject)' == 'true' AND (
+             $([System.String]::Copy('%(PackageReference.Identity)').StartsWith('xunit')) OR
+             $([System.String]::Copy('%(PackageReference.Identity)').StartsWith('nunit')) OR
+             $([System.String]::Copy('%(PackageReference.Identity)').StartsWith('mstest')) OR
+             $([System.String]::Copy('%(PackageReference.Identity)').StartsWith('Microsoft.NET.Test.Sdk')) OR
+             $([System.String]::Copy('%(PackageReference.Identity)').StartsWith('coverlet')) OR
+             $([System.String]::Copy('%(PackageReference.Identity)').StartsWith('FsCheck')) OR
+             $([System.String]::Copy('%(PackageReference.Identity)').StartsWith('ArchUnitNET')) OR
+             $([System.String]::Copy('%(PackageReference.Identity)').StartsWith('TngTech.ArchUnitNET')))"
+           Text="MVP_HOST_BUILD_PROFILE: 生产工程 $(MSBuildProjectName) 不得引用测试包 %(PackageReference.Identity)；测试工程须声明 &lt;MvpHostProductionProject&gt;false&lt;/MvpHostProductionProject&gt;。" />
+
+    <Error Condition="'$(MvpHostProductionProject)' == 'true' AND '$(IsTestProject)' == 'true'"
+           Text="MVP_HOST_BUILD_PROFILE: 生产工程 $(MSBuildProjectName) 不得设置 IsTestProject=true。" />
+
+    <!-- ② 生产工程不得引用测试工程或测试库。 -->
+    <Error Condition="'$(MvpHostProductionProject)' == 'true' AND (
+             $([System.String]::Copy('%(ProjectReference.Identity)').EndsWith('.Tests.csproj')) OR
+             $([System.String]::Copy('%(ProjectReference.Identity)').EndsWith('.TestKit.csproj')))"
+           Text="MVP_HOST_BUILD_PROFILE: 生产工程 $(MSBuildProjectName) 不得 ProjectReference 测试工程 %(ProjectReference.Identity)。" />
+
+    <!-- ③ 全部工程单一目标框架与语言版本，无例外。 -->
+    <Error Condition="'$(TargetFramework)' != 'net10.0'"
+           Text="MVP_HOST_BUILD_PROFILE: $(MSBuildProjectName) 的 TargetFramework 必须恰为 net10.0，实际为 '$(TargetFramework)'。" />
+
+    <Error Condition="'$(LangVersion)' != '14.0'"
+           Text="MVP_HOST_BUILD_PROFILE: $(MSBuildProjectName) 的 LangVersion 必须恰为 14.0，实际为 '$(LangVersion)'。" />
+
+  </Target>
+
+</Project>

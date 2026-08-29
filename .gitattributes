@@ -4,3 +4,11 @@
 *.sha256 text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+*.cs text eol=lf
+*.csproj text eol=lf
+*.props text eol=lf
+*.targets text eol=lf
+*.slnx text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf

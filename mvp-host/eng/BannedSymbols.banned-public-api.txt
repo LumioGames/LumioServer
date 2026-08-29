@@ -1,0 +1,4 @@
+T:System.Net.Sockets.Socket;字节载体只经 IByteCarrier 实现，宿主其余部分不直接持有套接字
+T:System.DateTime;墙钟只经 Platform 的 IWallClock 出口；超时/窗口/间隔/顺序判定一律用 IMonotonicClock
+T:System.DateTimeOffset;同上；唯一例外是 Platform 的 IWallClock 实现文件（例外声明在 Directory.Build.props）
+M:System.Threading.Thread.Sleep(System.Int32);等待语义只允许出现在 Platform 工程内，且不得阻塞受监督线程

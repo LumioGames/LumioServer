@@ -1,0 +1,28 @@
+# 刻意不设 root = true，也刻意不放仓库根：放仓根会把将来的 .rs 一并管辖
+# （LumioClient 与 LumioGameRuntime 的 .editorconfig 首行都是 root = true，设计 §3.4）。
+
+[*.{cs,csproj,props,targets,slnx}]
+indent_style = space
+indent_size = 4
+end_of_line = lf
+charset = utf-8
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{json,yml,yaml}]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+charset = utf-8
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{sh,ps1}]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+charset = utf-8
+insert_final_newline = true
+
+[*.cs]
+dotnet_diagnostic.RS0030.severity = error

@@ -37,3 +37,19 @@ jobs:
           grep -q '^## 当前阶段与开发节奏$' README.md
           test -s docs/architecture/.baseline.sha256
           sha256sum -c docs/architecture/.baseline.sha256
+
+  mvp-host:
+    name: MVP C# host policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: mvp-host/global.json
+      - name: Validate mvp-host isolation
+        working-directory: mvp-host
+        run: bash eng/verify-isolation.sh
+      - name: Validate mvp-host build and tests
+        working-directory: mvp-host
+        run: bash eng/verify-all.sh

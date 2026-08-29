@@ -1,0 +1,140 @@
+{
+  "baselineId": "LGE-V1.4-2026-08-27",
+  "note": "缺席登记纪律：缺席不得改变公共接口或状态机的形状——接口保留、返回稳定拒绝或固定成功，不删步骤、不删状态。「简化」「暂时」不是合法的缺席理由。本文件由 scaffold-mvp-host-build-baseline 一次性写定，下游卡只读校验、不追加。",
+  "reasonVocabulary": ["载体已提供", "阶段未到", "决策门冻结", "实现方为 P1"],
+  "absences": [
+    {
+      "id": "ABS-WORLDSLOT-NATIVE",
+      "clause": "WorldSlotHost 的 NativeReady 状态以「无 Native 可加载」的显式空实现穿越；状态本身保留、不删不合并。",
+      "source": "modules/world-slot/README.md",
+      "reason": "阶段未到",
+      "successor": "implement-world-slot-aggregate-epoch-admission-and-quota"
+    },
+    {
+      "id": "ABS-WORLDSLOT-DEFERRED-TRANSITIONS",
+      "clause": "Resume / BeginSnapshot / SnapshotComplete / BeginReload / ReloadComplete / BeginMigrate / MigrationHandedOff 七条迁移的触发方缺席；迁移定义保留在表内、MVP 代码路径不触发。",
+      "source": "modules/world-slot/README.md",
+      "reason": "阶段未到",
+      "successor": "implement-world-slot-quiesce-migration-and-fault-adjudication"
+    },
+    {
+      "id": "ABS-SESSION-FAULTED-UNREACHABLE",
+      "clause": "ServerConnectionSession 的 Faulted 态建模保留但 MVP 期不可达——参考存根恒不产生 SessionLocalProven 见证。",
+      "source": "modules/session/README.md",
+      "reason": "阶段未到",
+      "successor": "implement-session-drain-kick-and-fault-isolation"
+    },
+    {
+      "id": "ABS-RELEASE-EXACTMATCH",
+      "clause": "ExactRelease 的 Catalog 消费、Manifest 校验与 Pool 成员健康缺席；MVP 只与宿主配置的单一 (productId, gameReleaseId) 二元组精确比对，不实现任何降级匹配。",
+      "source": "modules/release-agent/README.md",
+      "reason": "实现方为 P1",
+      "successor": "implement-release-catalog-manifest-verification"
+    },
+    {
+      "id": "ABS-RELEASE-MEMBER-HEALTH",
+      "clause": "本 Release Pool 成员状态与健康上报缺席。",
+      "source": "modules/release-agent/README.md",
+      "reason": "实现方为 P1",
+      "successor": "implement-release-local-member-state-health-and-reporting"
+    },
+    {
+      "id": "ABS-AUDIT-DURABLE-ACK",
+      "clause": "Audit 的 durable ack 与背压关闸完整语义缺席；MVP 只有最小 Audit 写入面加背压状态查询，durable 出口本身不存在。",
+      "source": "modules/observability/README.md",
+      "reason": "实现方为 P1",
+      "successor": "implement-observability-audit-durable-pipeline"
+    },
+    {
+      "id": "ABS-FAILURE-BUNDLE",
+      "clause": "Failure Bundle 装配与崩溃安全紧急通道缺席。",
+      "source": "modules/observability/README.md",
+      "reason": "实现方为 P1",
+      "successor": "implement-observability-failure-bundle-and-emergency-path"
+    },
+    {
+      "id": "ABS-PERSISTENCE-SNAPSHOT",
+      "clause": "持久化缺席：SnapshotCut 只在内存记录句柄，无 WAL、无 Checkpoint；Quiesce 全程不进入 Snapshotting 状态。",
+      "source": "modules/persistence-host/README.md",
+      "reason": "实现方为 P1",
+      "successor": "implement-persistence-recovery-checkpoint-and-migration-adapter"
+    },
+    {
+      "id": "ABS-MAINTENANCE-CONTROLPLANE",
+      "clause": "外部控制面与维护编排缺席；MVP 只发 MaintenanceKick 信封，集群期望状态归外部控制面所有。",
+      "source": "modules/maintenance-agent/README.md",
+      "reason": "实现方为 P1",
+      "successor": "implement-maintenance-command-state-deadline-and-idempotency"
+    },
+    {
+      "id": "ABS-ENVELOPE-POCO",
+      "clause": "架构源未生成 C# ReplicationEnvelope POCO（Lumio.Gen.LanguageBinding 只有名字映射三元组），本仓 MvpEnvelopeDocument 是临时替身，由 ContractArtifactDebtTest 自过期守卫标注到期日。",
+      "source": "docs/specs/2026-08-28-mvp-csharp-host-design.md",
+      "reason": "载体已提供",
+      "successor": "consume-upstream-generated-contract-artifacts"
+    },
+    {
+      "id": "ABS-PERMISSION-VALIDATOR",
+      "clause": "ADR-022 要求的生成式 Protocol/Permission Validator 在 C# 侧只有 15 项字段名表、没有可执行校验方法；本仓 gate 判定是手写替身。",
+      "source": "docs/specs/2026-08-28-mvp-csharp-host-design.md",
+      "reason": "载体已提供",
+      "successor": "consume-upstream-generated-contract-artifacts"
+    },
+    {
+      "id": "ABS-WIRE-FRAGMENTATION",
+      "clause": "transportPolicy.maxFragmentBytes 只作为声明值登记，不实现自定义分片与重组——WSS 与 LocalEmbedded 都天然保消息边界，一消息一信封。",
+      "source": "modules/transport/README.md",
+      "reason": "阶段未到",
+      "successor": "implement-transport-registry-bounded-ingress-egress"
+    },
+    {
+      "id": "ABS-TRANSPORT-PROFILE-ID",
+      "clause": "WebSocket 传输能力字符串是本仓私有 provisional 声明，无注册 Capability ID，不得当作公共 Capability 使用。",
+      "source": "modules/host-profiles/README.md",
+      "reason": "决策门冻结",
+      "successor": "implement-host-profile-resolution-and-capability-matching"
+    },
+    {
+      "id": "ABS-LENGTH-SEMANTICS",
+      "clause": "Envelope 顶层 length 字段无公共语义定义，出入站取非对称私有口径：入站只校验 integer >= 0、不与任何字节数交叉核对；出站写 body 规范 JSON 序列化后的 UTF-8 字节数。",
+      "source": "docs/specs/2026-08-28-mvp-csharp-host-design.md",
+      "reason": "决策门冻结",
+      "successor": "needs-new-card"
+    },
+    {
+      "id": "ABS-AUTH-CREDENTIAL-ERRORCODE",
+      "clause": "43 个已注册 ErrorCode 中没有「凭据无效」语义码，因此通道认证失败不发 Envelope Error，只以 WebSocket close 1008 拒绝并写一条 Release 作用域 Audit。",
+      "source": "modules/auth/README.md",
+      "reason": "决策门冻结",
+      "successor": "needs-new-card"
+    },
+    {
+      "id": "ABS-CLIENT-UPLINK-COMMAND",
+      "clause": "客户端上行 gameplay 命令的 wire 承载缺席（A1-β）：8 个冻结 messageType 中无一可承载 client→server 命令，D-009 禁止任何仓库发明 dispatch wire format。",
+      "source": "modules/protocol-dispatch/README.md",
+      "reason": "决策门冻结",
+      "successor": "needs-new-card"
+    },
+    {
+      "id": "ABS-REPLICATION-STATE-PAYLOAD",
+      "clause": "公共 FullSnapshot / Delta 的 typed body 无状态载荷字段，ADR-028（Accepted）的 Alternatives 明文否决 free-form payload，本仓不自行补字段；MVP 期客户端观察不到世界内容（A1-β 的下行侧前置）。",
+      "source": "contract-mirror/schemas/replication-envelope.schema.json",
+      "reason": "决策门冻结",
+      "successor": "needs-new-card"
+    },
+    {
+      "id": "ABS-REPLICATION-MAPPING-SET",
+      "clause": "mappingSetHash 指向 ADR-005 所述、由 LumioGame 拥有而 MVP 期不存在的公共映射集；出站填本仓单点常量 64 个 0（provisional，含义仅为「本 MVP 宿主不声明任何映射集」），入站只校验 hash256 正则、不做任何交叉核对。",
+      "source": "contract-mirror/schemas/replication-envelope.schema.json",
+      "reason": "阶段未到",
+      "successor": "needs-new-card"
+    },
+    {
+      "id": "ABS-AUTH-CREDENTIAL-CARRIAGE",
+      "clause": "通道认证凭据与 nonce 的线承载无公共定义（架构源 docs/architecture/DECISIONS_PENDING.md 的 D-011），MVP 取 Sec-WebSocket-Protocol 子协议位序 `lumio.mvp.v0, <token>, <nonce>`；名字里的 mvp 与 v0 是退场标记，架构源冻结凭据承载方式后即改用公共形态并删除该位序约定。",
+      "source": "contract-mirror/MIRROR.md",
+      "reason": "决策门冻结",
+      "successor": "needs-new-card"
+    }
+  ]
+}
