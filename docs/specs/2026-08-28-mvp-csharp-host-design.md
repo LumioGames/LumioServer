@@ -983,14 +983,24 @@ public interface IHostTraceSink {
     void Ack(string effect, ulong? admissionAttemptId, ulong? slotEpoch, ulong? connectionEpoch);
     void State(string? sessionId, string? sessionState, ulong? authorityRevision, ulong? slotEpoch, ulong? grantEpoch);
 }
+// 宿主自身的 Release 身份。由组装根从配置读入后注入；本工程不为这两个字段提供任何默认值。
+public readonly record struct HostIdentity(string ProductId, string GameReleaseId, string ProducerId);
+
 public static class ObservabilityModule {
     // IWallClock 只在这里被消费：两个 writer 内部填 EventId 与 Timestamp，调用方签名不变。
     // 全仓「IWallClock 只被 Observability 引用」由 ArchUnitNET 依赖断言守住（§6.0）。
     public static ObservabilityServices Create(IBoundedInbox<AuditRecord> auditInbox,
                                                IBoundedInbox<DiagnosticRecord> diagnosticInbox,
-                                               IWallClock wallClock, IHostTraceSink trace);
+                                               IWallClock wallClock, IHostTraceSink trace,
+                                               in HostIdentity identity);   // ← 第五参数，理由见下
 }
 ```
+
+**`Create` 的第五参数 `identity` 为什么必须存在（2026-08-29 交付时发现，总调度批准扩参）**：本节初版是四参数。但 `IDiagnosticWriter.Write(category, severity, message)` 的签名里**没有任何身份信息**，而 `common.schema.json#/$defs/correlation` 的 `productId` / `gameReleaseId` 是**恒必填**（与 scope 无关，五个基础字段之一）。两者相减，Diagnostic 记录的这两个字段就没有合法来源——实现只剩两条路：由组装根注入，或由实现者临场编一个常量。
+
+**取前者的决定性理由不是「签名不够用」，而是编出来的值会离开本仓**：一个临时编的 `productId` 写进 diagnostic 后就随事件流到下游，读它的人没有任何办法知道它是编的。这会让「本仓不发明任何公共字段取值」这条纪律在一个不起眼处破掉，而破掉的位置恰恰是最难被发现的地方。因此 `Create` 在 `identity` 缺失时**直接抛，不提供任何默认值**。
+
+由此收为通则：**签名类契约面若在实现时发现「必填字段无合法来源」，正确处置是扩签名并上报，不是就地编一个默认值。**
 
 `FaultAdjudication` 的两个 bool 是 §6.4 判定顺序的直接编码：`SessionLocalProven → (false, true)`；`SlotStateUnproven → (true, false)`；`ProcessFault → (true, false)` 且由 `App` 转交进程；`None → (false, false)`；**`null`（无见证）→ `(FaultClass = SlotStateUnproven, true, false)`**（ADR-006 的从严默认）。`FaultAdjudication.FaultClass` 本身**非空**——`Classify` 的职责就是把「无见证」折叠成一个确定的分类。
 
