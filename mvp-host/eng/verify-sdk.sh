@@ -18,8 +18,10 @@ EXPECTED_BAND="10.0."
 sdk_version="$(dotnet --version 2>/dev/null)"
 # 先按期望族过滤再取族内最高：取全机最高会让一台同时装了 .NET 11 预览的开发机
 # 直接 SDK_MISMATCH，尽管匹配的 10.0 runtime 就在机器上。
+# 用 index(...) == 1 做前缀比较而非正则：把 "10.0." 当正则喂给 awk 会触发
+# `escape sequence '\.' treated as plain '.'` 警告，门禁脚本不该在每次 CI 里刷噪音。
 runtime_version="$(dotnet --list-runtimes 2>/dev/null \
-  | awk -v band="^${EXPECTED_BAND//./\\.}" '$1 == "Microsoft.NETCore.App" && $2 ~ band { print $2 }' \
+  | awk -v band="$EXPECTED_BAND" '$1 == "Microsoft.NETCore.App" && index($2, band) == 1 { print $2 }' \
   | sort -V | tail -1)"
 
 if [ -z "$sdk_version" ] || [ -z "$runtime_version" ]; then
