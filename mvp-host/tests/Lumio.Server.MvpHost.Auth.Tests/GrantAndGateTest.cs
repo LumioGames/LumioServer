@@ -62,11 +62,15 @@ public sealed class GrantAndGateTest
 
     /// <summary>
     /// 本工程不提供任何「派生后修改 grant」的 API：整个程序集里能产出
-    /// <c>PermissionGrant</c> 的成员**只有** <c>Authorize</c> 一个。
+    /// <c>PermissionGrant</c> 的成员**只有** <c>Authorize</c>。
     /// 多一个产出点就等于多一条不经授权路径造出 grant 的途径。
+    ///
+    /// 判据按**名字与声明类型**写，不按个数：编译器会为带 <c>in</c> 参数的接口实现
+    /// 额外发出一个显式接口实现桩（实测本程序集里 <c>Authorize</c> 因此出现两次），
+    /// 那是同一个方法的两个入口，不是第二个产出点。写死「恰一个」会把编译细节钉进断言。
     /// </summary>
     [Fact]
-    public void 程序集内产出授权对象的成员只有Authorize一个()
+    public void 程序集内产出授权对象的成员只有Authorize()
     {
         var producers = AuthArchitecture.AllMethods()
             .Where(m => m.ReturnType == typeof(PermissionGrant))
@@ -74,9 +78,12 @@ public sealed class GrantAndGateTest
             .Distinct(StringComparer.Ordinal)
             .ToList();
 
-        Assert.Equal(
-            new[] { $"{typeof(MvpAuthorizationService).FullName}.{nameof(MvpAuthorizationService.Authorize)}" },
-            producers);
+        Assert.NotEmpty(producers);
+        Assert.All(producers, name =>
+        {
+            Assert.StartsWith(typeof(MvpAuthorizationService).FullName!, name, StringComparison.Ordinal);
+            Assert.EndsWith($".{nameof(MvpAuthorizationService.Authorize)}", name, StringComparison.Ordinal);
+        });
     }
 
     /// <summary>重连必须重新派生授权对象（SRV-D-013）：同一主体连续两次 <c>Authorize</c>，代次严格递增。</summary>

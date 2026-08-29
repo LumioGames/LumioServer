@@ -61,9 +61,13 @@ internal sealed class AuthHarness : IDisposable
             AuthProvisionalDefaults.AntiReplayWindowSeconds,
             AuthProvisionalDefaults.ReplayStormThreshold);
 
+        var identity = new HostIdentity(ProductId, GameReleaseId, ProducerId);
+        this.Identity = identity;
         this.Service = MvpAuthorizationService.Create(
-            this.Verifier, this.Window, this.Clock, this.Observability, ReleasePoolId);
+            this.Verifier, this.Window, this.Clock, this.Observability, in identity, ReleasePoolId);
     }
+
+    internal HostIdentity Identity { get; }
 
     internal string SecretPath { get; }
 

@@ -12,6 +12,16 @@ public interface IAuditWriter
     /// <summary>
     /// Release 作用域的拒绝事件。**不带 sessionId**（ADR-011）：
     /// 认证失败发生在 session 创建之前，此时任何 sessionId 都是编造的。
+    ///
+    /// <para>
+    /// <paramref name="reasonCode"/> **可空**，且 <c>null</c> 与「随便填一个」有本质区别：
+    /// 已注册 ErrorCode 集合里不存在「凭据无效」语义码（<c>absences.json</c> 的
+    /// <c>ABS-AUTH-CREDENTIAL-ERRORCODE</c>），而 <c>logging-event.schema.json</c> 的
+    /// <c>required</c> 不含 <c>fields</c>——因此「不写 errorCode」产出的仍是合法事件，
+    /// 而填一个语义不对的已注册码会把缺席伪装成有依据，并让下游把它当真读走。
+    /// 本参数原为非空，交付 auth 存根时发现该形状无法表达最要紧的那条审计事件，故放宽。
+    /// **有已注册码的路径仍必须带上它**——这条由消费方的定向断言守住，放宽不等于可省略。
+    /// </para>
     /// </summary>
     EnqueueResult WriteReleaseScopedReject(
         string releasePoolId,
@@ -20,7 +30,7 @@ public interface IAuditWriter
         string traceId,
         string producerId,
         ulong eventSeq,
-        string reasonCode);
+        string? reasonCode);
 
     EnqueueResult WriteSessionScoped(
         ServerSessionId sessionId,
