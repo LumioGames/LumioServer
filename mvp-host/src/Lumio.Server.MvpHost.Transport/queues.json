@@ -1,0 +1,45 @@
+{
+  "queues": [
+    {
+      "name": "MvpIngressQueue",
+      "owner": "Lumio.Server.MvpHost.Transport",
+      "producer": "该连接的单一接收循环",
+      "consumer": "Slot Owner Thread",
+      "ordering": "严格 FIFO，SPSC",
+      "budget": "SRV-D-001 provisional: 256 条 / 256 KiB",
+      "onFull": "Unreliable 丢弃并计数；Reliable 以 QueueFull 断开连接——绝不静默丢可靠消息",
+      "onClose": "Gate 关闭后停收；Quiesce 按序列处置余量"
+    },
+    {
+      "name": "MvpEgressQueue",
+      "owner": "Lumio.Server.MvpHost.Transport",
+      "producer": "Slot Owner Thread",
+      "consumer": "该连接的发送循环",
+      "ordering": "严格 FIFO，SPSC",
+      "budget": "SRV-D-002 provisional: 512 条 / 1 MiB",
+      "onFull": "可靠积压先降速，持续超阈断开",
+      "onClose": "断开前 flush ≤ 1 秒"
+    },
+    {
+      "name": "MvpConnectionCommandInbox",
+      "owner": "Lumio.Server.MvpHost.Transport",
+      "producer": "Lumio.Server.MvpHost.Session",
+      "consumer": "连接命令循环",
+      "ordering": "FIFO per connection epoch",
+      "budget": "SRV-D-015 provisional: 64 条，ack 超时 5 秒",
+      "onFull": "回 QueueFull ack 给 session",
+      "onClose": "Closed 后只收 Close 并 ack"
+    },
+    {
+      "name": "MvpTransportEventOutbox",
+      "owner": "Lumio.Server.MvpHost.Session",
+      "producer": "Lumio.Server.MvpHost.Transport",
+      "consumer": "Lumio.Server.MvpHost.Session",
+      "ordering": "FIFO",
+      "budget": "provisional: 256 条 + 终态保留槽",
+      "onFull": "Closed / Faulted 走保留槽，终态永不丢弃；非终态满载则关闭该连接并写 diagnostic",
+      "onClose": "保留槽必达"
+    }
+  ],
+  "note": "所有者一栏按「消费者拥有队列」的口径填：MvpTransportEventOutbox 归 Session，因此「终态永不丢弃」是消费者的保证，不是生产者的自觉。七项合同字段齐全由 Architecture.Tests 的 QueueRegistryTest 机器校验。"
+}

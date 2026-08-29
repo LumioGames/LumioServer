@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>4</MvpHostLayer>
+    <RootNamespace>Lumio.Server.MvpHost.Transport</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.Transport</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    零 PackageReference；ProjectReference 恰两个。
+    **不引用 Auth / Session / WorldSlot** —— transport 绝不依赖 auth
+    （PermissionGrantRef 是 transport 自有的不透明值，只搬运不解释），
+    也不认识 session 编排与 slot 生命周期。由 ForbiddenEdgesTest 守住。
+  -->
+  <ItemGroup>
+    <ProjectReference Include="../Lumio.Server.MvpHost.HostContracts/Lumio.Server.MvpHost.HostContracts.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Observability/Lumio.Server.MvpHost.Observability.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.Transport.Tests" />
+  </ItemGroup>
+
+</Project>
