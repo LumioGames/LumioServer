@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>4</MvpHostLayer>
+    <RootNamespace>Lumio.Server.MvpHost.Simulation.Reference</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.Simulation.Reference</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    This is a production absence-filler for the runtime port.  It deliberately
+    depends only on the frozen HostContracts edge; the composition root owns
+    the concrete instance and can replace it when the runtime adapter lands.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="../Lumio.Server.MvpHost.HostContracts/Lumio.Server.MvpHost.HostContracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.Simulation.Reference.Tests" />
+  </ItemGroup>
+
+</Project>

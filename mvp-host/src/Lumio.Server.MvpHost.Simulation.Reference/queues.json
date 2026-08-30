@@ -1,0 +1,15 @@
+{
+  "queues": [
+    {
+      "name": "MvpWorldMutationInbox",
+      "owner": "Lumio.Server.MvpHost.Simulation.Reference",
+      "producer": "test-control thread",
+      "consumer": "Slot Owner Thread",
+      "ordering": "FIFO",
+      "budget": "32 items (provisional)",
+      "onFull": "EnqueueStatus.Full; StableErrorId = QueueFull",
+      "onClose": "reject new mutations"
+    }
+  ],
+  "note": "The mutation inbox is bounded and owner-applied at RunTick start."
+}
