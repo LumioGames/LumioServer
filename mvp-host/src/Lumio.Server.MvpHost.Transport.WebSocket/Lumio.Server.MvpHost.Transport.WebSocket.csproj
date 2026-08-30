@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>5</MvpHostLayer>
+    <RootNamespace>Lumio.Server.MvpHost.Transport.WebSocket</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.Transport.WebSocket</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Lumio.Server.MvpHost.Transport/Lumio.Server.MvpHost.Transport.csproj" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.Transport.WebSocket.Tests" />
+  </ItemGroup>
+
+</Project>
