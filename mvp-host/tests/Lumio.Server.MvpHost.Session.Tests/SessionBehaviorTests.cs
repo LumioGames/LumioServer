@@ -633,7 +633,7 @@ public sealed class SessionBehaviorTests
 
         public AllocateResult Allocate(in SlotBudget budget) => new(true, new WorldSlotId(1), new SlotEpoch(1), null);
         public AdmissionReservationResult ReserveAdmission(AdmissionAttemptId attempt, ServerSessionId session)
-            => new(Reservation.Value != 0, Reservation, new SlotEpoch(1), Reservation.Value == 0 ? "InvalidArgument" : null);
+            => new(Reservation.Value != 0, Reservation, new SlotEpoch(1), new WorldSlotId(1), Reservation.Value == 0 ? "InvalidArgument" : null);
         public AckResult AbortAdmission(SlotReservationId reservation, SlotEpoch epoch) => new(true, null);
         public AckResult BindSession(SlotReservationId reservation, ServerSessionId session, SlotEpoch epoch)
         {

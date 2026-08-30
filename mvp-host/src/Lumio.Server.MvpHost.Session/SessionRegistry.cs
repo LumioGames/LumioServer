@@ -561,7 +561,9 @@ public sealed class SessionRegistry : IDisposable
         admissions[attempt.Value].Reservation = reservation;
         admissions[attempt.Value].SlotEpoch = slotEpoch;
         TraceAck(AdmissionEffectKind.CommitSlot, attempt, slotEpoch, candidate.ConnectionEpoch);
-        var commit = slot.BindSession(reservation, sessionId, slotEpoch);
+        var commit = slot is IWorldSlotAdmissionPort admissionPort
+            ? admissionPort.BindSession(reservation, sessionId, slotEpoch)
+            : new AckResult(false, "InvalidArgument");
         if (!commit.Accepted)
         {
             Reject(attempt, candidate, NormalizeStableError(commit.StableErrorId, "CapacityExceeded"), close: true, traceCompensation: true);
@@ -996,7 +998,7 @@ public sealed class SessionRegistry : IDisposable
         // A reservation must come from the serialized WorldSlot admission
         // operation.  Never derive one from the attempt id or another local
         // value when an adapter does not expose that capability.
-        return new AdmissionReservationResult(false, default, allocation.Epoch, "InvalidArgument");
+        return new AdmissionReservationResult(false, default, allocation.Epoch, allocation.SlotId, "InvalidArgument");
     }
 
     private bool ExactRelease(in EnvelopeHeaderView header)
