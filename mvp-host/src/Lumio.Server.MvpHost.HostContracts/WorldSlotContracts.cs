@@ -92,8 +92,8 @@ public interface IWorldSlotHost
 }
 
 /// <summary>
-/// Narrow admission capability used by Session.  Reservation and compensation
-/// are intentionally separate from the broader WorldSlot lifecycle aggregate.
+/// Narrow admission capability used by Session. Reservation and compensation
+/// are separate from the broader WorldSlot lifecycle aggregate.
 /// </summary>
 public interface IWorldSlotAdmissionPort
 {
@@ -105,7 +105,7 @@ public interface IWorldSlotAdmissionPort
 }
 
 /// <summary>
-/// Narrow pacing capability used by the App owner loop.  A permit carries only
+/// Narrow pacing capability used by the App owner loop. A permit carries only
 /// the logical tick and slot epoch; the aggregate owns the bounded queue and all
 /// epoch/state validation.
 /// </summary>

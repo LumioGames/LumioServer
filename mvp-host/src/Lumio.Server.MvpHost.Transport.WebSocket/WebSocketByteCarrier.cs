@@ -187,7 +187,10 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
                         return new CarrierAccept(
                             Accepted: true,
                             ConnectionId: item.State.Id,
-                            RequestedSubprotocols: item.RequestedSubprotocols);
+                            RequestedSubprotocols: item.RequestedSubprotocols)
+                        {
+                            AuthenticationEvidence = item.AuthenticationEvidence,
+                        };
                     }
                 }
             }
@@ -523,7 +526,13 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
                 state,
                 // Return only the negotiated marker. Keeping credentials in
                 // CarrierAccept would unnecessarily extend their lifetime.
-                ImmutableArray.Create(WebSocketCarrierConstants.Subprotocol));
+                ImmutableArray.Create(WebSocketCarrierConstants.Subprotocol),
+                new TransportAuthenticationEvidence(
+                    verification.Principal,
+                    connectionId,
+                    state.Epoch,
+                    this.options.ProductId,
+                    this.options.GameReleaseId));
             if (this.acceptedQueue.TryPublish(in accepted).Status != EnqueueStatus.Accepted)
             {
                 this.RequestClose(state, ConnectionCloseReason.PolicyReject, flush: false);
@@ -1159,7 +1168,8 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
 
     private readonly record struct AcceptedConnection(
         ConnectionState State,
-        ImmutableArray<string> RequestedSubprotocols);
+        ImmutableArray<string> RequestedSubprotocols,
+        TransportAuthenticationEvidence AuthenticationEvidence);
 
     private sealed class AcceptedQueue : IBoundedOutbox<AcceptedConnection>
     {

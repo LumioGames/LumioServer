@@ -197,6 +197,7 @@ public sealed class TransportService
         }
 
         var entry = this.registry.Add(accept.ConnectionId, IngressBudget, EgressBudget);
+        entry.SetAuthenticationEvidence(accept.AuthenticationEvidence);
         entry.NoteActivity(this.clock.Now);
         this.ArmIdleTimer(entry);
 
@@ -395,7 +396,12 @@ public sealed class TransportService
         {
             entry.TryTransitionTo(TransportConnectionState.EnvelopeValidated);
             this.Publish(new ConnectionEvent.HandshakeEnvelope(
-                entry.Id, entry.Epoch, new ValidatedEnvelopeBytes(message, header)));
+                entry.Id,
+                entry.Epoch,
+                new ValidatedEnvelopeBytes(message, header))
+            {
+                AuthenticationEvidence = entry.AuthenticationEvidence,
+            });
             return true;
         }
 

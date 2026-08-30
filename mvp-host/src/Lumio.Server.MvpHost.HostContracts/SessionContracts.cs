@@ -14,7 +14,14 @@ public abstract record SessionCommand
     public sealed record ConnectionCandidate(
         TransportConnectionId ConnectionId,
         ConnectionEpoch ConnectionEpoch,
-        ValidatedEnvelopeBytes Handshake) : SessionCommand;
+        ValidatedEnvelopeBytes Handshake) : SessionCommand
+    {
+        /// <summary>
+        /// Optional transport-authenticated principal. Legacy in-process
+        /// candidates omit it and retain the credential-verifier path.
+        /// </summary>
+        public TransportAuthenticationEvidence? AuthenticationEvidence { get; init; }
+    }
 
     /// <summary>saga 某一步的依赖方回执。每步都必须有显式 ack，没有隐式成功。</summary>
     public sealed record DependencyResult(

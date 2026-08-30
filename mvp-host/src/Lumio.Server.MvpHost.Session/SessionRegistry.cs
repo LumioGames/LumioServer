@@ -154,7 +154,10 @@ public sealed class SessionRegistry : IDisposable
                 var admission = Enqueue(new SessionCommand.ConnectionCandidate(
                     handshake.Id,
                     handshake.Epoch,
-                    handshake.Envelope));
+                    handshake.Envelope)
+                {
+                    AuthenticationEvidence = handshake.AuthenticationEvidence,
+                });
                 if (!admission.Accepted && admission.StableErrorId == "QueueFull")
                 {
                     _ = transportControl.TrySend(new ConnectionCommand.Close(
@@ -535,8 +538,28 @@ public sealed class SessionRegistry : IDisposable
         worldSlotId = allocation.SlotId;
         worldSlotEpoch = allocation.Epoch;
         worldSlotAllocated = true;
-        var reservation = new SlotReservationId(attempt.Value);
-        var slotEpoch = allocation.Epoch;
+        var reservationResult = ReserveAdmission(attempt, sessionId, allocation);
+        if (!reservationResult.Reserved || reservationResult.Reservation.Value == 0)
+        {
+            Reject(
+                attempt,
+                candidate,
+                NormalizeStableError(reservationResult.StableErrorId, "InvalidArgument"),
+                close: true,
+                traceCompensation: true);
+            return;
+        }
+
+        if (reservationResult.Epoch != allocation.Epoch)
+        {
+            Reject(attempt, candidate, "StaleEpoch", close: true, traceCompensation: true);
+            return;
+        }
+
+        var reservation = reservationResult.Reservation;
+        var slotEpoch = reservationResult.Epoch;
+        admissions[attempt.Value].Reservation = reservation;
+        admissions[attempt.Value].SlotEpoch = slotEpoch;
         TraceAck(AdmissionEffectKind.CommitSlot, attempt, slotEpoch, candidate.ConnectionEpoch);
         var commit = slot.BindSession(reservation, sessionId, slotEpoch);
         if (!commit.Accepted)
@@ -703,6 +726,34 @@ public sealed class SessionRegistry : IDisposable
 
     private AuthenticateResult Authenticate(SessionCommand.ConnectionCandidate candidate, ServerSessionId sessionId)
     {
+        if (candidate.AuthenticationEvidence is { } evidence)
+        {
+            if (evidence.TransportConnectionId != candidate.ConnectionId
+                || evidence.ConnectionEpoch != candidate.ConnectionEpoch)
+            {
+                return new AuthenticateResult(false, "StaleConnectionGeneration", null);
+            }
+
+            if (string.IsNullOrWhiteSpace(evidence.PrincipalId.Value)
+                || !string.Equals(
+                    evidence.ProductId,
+                    candidate.Handshake.Header.ProductId,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    evidence.GameReleaseId,
+                    candidate.Handshake.Header.GameReleaseId,
+                    StringComparison.Ordinal)
+                || !ExactRelease(candidate.Handshake.Header))
+            {
+                return new AuthenticateResult(false, "ReleaseMismatch", null);
+            }
+
+            var evidenceGrant = auth.Authorize(
+                evidence.PrincipalId,
+                new SessionScope(sessionId, config.ProductId, config.GameReleaseId, "Client"));
+            return new AuthenticateResult(true, null, evidenceGrant);
+        }
+
         using var credential = new OpaqueCredentialInput(
             candidate.Handshake.Bytes.IsEmpty ? Array.Empty<byte>() : candidate.Handshake.Bytes.ToArray());
         var context = new VerificationContext(
@@ -930,6 +981,22 @@ public sealed class SessionRegistry : IDisposable
         }
 
         return allocation;
+    }
+
+    private AdmissionReservationResult ReserveAdmission(
+        AdmissionAttemptId attempt,
+        ServerSessionId session,
+        in AllocateResult allocation)
+    {
+        if (slot is IWorldSlotAdmissionPort admissionPort)
+        {
+            return admissionPort.ReserveAdmission(attempt, session);
+        }
+
+        // A reservation must come from the serialized WorldSlot admission
+        // operation.  Never derive one from the attempt id or another local
+        // value when an adapter does not expose that capability.
+        return new AdmissionReservationResult(false, default, allocation.Epoch, "InvalidArgument");
     }
 
     private bool ExactRelease(in EnvelopeHeaderView header)
@@ -1216,6 +1283,14 @@ public sealed class SessionRegistry : IDisposable
             {
                 connectionSessions.Remove(sessionConnection.Value);
             }
+        }
+
+        if (tracked is not null
+            && !tracked.SlotCommitted
+            && tracked.Reservation.Value != 0
+            && slot is IWorldSlotAdmissionPort admissionPort)
+        {
+            _ = admissionPort.AbortAdmission(tracked.Reservation, tracked.SlotEpoch);
         }
 
         admissions.Remove(attempt.Value);

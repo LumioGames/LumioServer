@@ -135,6 +135,75 @@ public sealed class SessionBehaviorTests
     }
 
     [Fact]
+    public void TransportEvidenceUsesVerifiedPrincipalWithoutCallingCredentialAuth()
+    {
+        using var harness = new SessionHarness();
+        var candidate = CandidateWithEvidence(
+            1,
+            "session-1",
+            new TransportAuthenticationEvidence(
+                new PrincipalId("transport-principal"),
+                new TransportConnectionId(1),
+                new ConnectionEpoch(0),
+                "A",
+                "A-1.1.0"));
+
+        harness.Enqueue(candidate);
+
+        Assert.Equal(0, harness.Auth.AuthenticateCalls);
+        Assert.Equal(new PrincipalId("transport-principal"), harness.Auth.LastAuthorizedPrincipal);
+        Assert.True(harness.Registry.TryGet(new ServerSessionId("session-1"), out var session));
+        Assert.Equal(ServerConnectionSessionState.Syncing, session.State);
+    }
+
+    [Fact]
+    public void InvalidTransportEvidenceGenerationIsRejectedBeforeAuthorization()
+    {
+        using var harness = new SessionHarness();
+        var candidate = CandidateWithEvidence(
+            1,
+            "session-1",
+            new TransportAuthenticationEvidence(
+                new PrincipalId("transport-principal"),
+                new TransportConnectionId(99),
+                new ConnectionEpoch(0),
+                "A",
+                "A-1.1.0"));
+
+        harness.Enqueue(candidate);
+
+        Assert.Equal(0, harness.Auth.AuthenticateCalls);
+        Assert.Null(harness.Auth.LastAuthorizedPrincipal);
+        Assert.False(harness.Registry.TryGet(new ServerSessionId("session-1"), out _));
+        Assert.Contains(ConnectionCloseReason.PolicyReject, harness.Transport.CloseReasons);
+    }
+
+    [Fact]
+    public void AdmissionPassesTheWorldSlotReservationBackFromThePort()
+    {
+        using var harness = new SessionHarness();
+        harness.Slot.Reservation = new SlotReservationId(42);
+
+        harness.Enqueue(Candidate(1, "session-1"));
+
+        Assert.Equal(new SlotReservationId(42), harness.Slot.LastReservation);
+        Assert.NotEqual(new SlotReservationId(1), harness.Slot.LastReservation);
+    }
+
+    [Fact]
+    public void AdmissionRejectsWhenWorldSlotDoesNotIssueAReservation()
+    {
+        using var harness = new SessionHarness();
+        harness.Slot.Reservation = default;
+
+        harness.Enqueue(Candidate(1, "session-1"));
+
+        Assert.Equal(0, harness.Slot.BindCalls);
+        Assert.False(harness.Registry.TryGet(new ServerSessionId("session-1"), out _));
+        Assert.Contains(ConnectionCloseReason.PolicyReject, harness.Transport.CloseReasons);
+    }
+
+    [Fact]
     public void BaselineAckDoesNotEmitZeroWidthDelta()
     {
         using var harness = new SessionHarness();
@@ -359,6 +428,18 @@ public sealed class SessionBehaviorTests
             new ConnectionEpoch(0),
             Validated(MvpEnvelopeWriter.WriteClientHandshake(Context(session, connection))));
 
+    private static SessionCommand.ConnectionCandidate CandidateWithEvidence(
+        ulong connection,
+        string session,
+        TransportAuthenticationEvidence evidence)
+        => new(
+            new TransportConnectionId(connection),
+            new ConnectionEpoch(0),
+            Validated(MvpEnvelopeWriter.WriteClientHandshake(Context(session, connection))))
+        {
+            AuthenticationEvidence = evidence,
+        };
+
     private static ValidatedEnvelopeBytes Validated(ReadOnlyMemory<byte> bytes)
     {
         var parsed = MvpEnvelopeReader.TryReadHeader(bytes.Span, out var header);
@@ -474,9 +555,15 @@ public sealed class SessionBehaviorTests
     private sealed class FakeTransport : ITransportControlPort
     {
         internal List<ConnectionCommandKind> Commands { get; } = new();
+        internal List<ConnectionCloseReason> CloseReasons { get; } = new();
 
         public EnqueueResult TrySend(in ConnectionCommand command)
         {
+            if (command is ConnectionCommand.Close close)
+            {
+                CloseReasons.Add(close.Reason);
+            }
+
             Commands.Add(command switch
             {
                 ConnectionCommand.Bind => ConnectionCommandKind.Bind,
@@ -505,6 +592,7 @@ public sealed class SessionBehaviorTests
     {
         private ulong grants;
         internal int AuthenticateCalls { get; private set; }
+        internal PrincipalId? LastAuthorizedPrincipal { get; private set; }
 
         public bool AdmissionMustStop => false;
 
@@ -520,28 +608,37 @@ public sealed class SessionBehaviorTests
         }
 
         public PermissionGrant Authorize(PrincipalId principal, in SessionScope scope)
-            => new(
+        {
+            LastAuthorizedPrincipal = principal;
+            return new PermissionGrant(
                 principal,
                 scope.Role,
                 ImmutableArray<string>.Empty,
                 ImmutableArray<string>.Empty,
                 new GrantEpoch(++grants),
                 new MonotonicInstant(long.MaxValue));
+        }
 
         public AckResult EvaluateMessagePermission(in MvpPermissionGateRequest request)
             => new(true, null);
     }
 
-    private sealed class FakeSlot : IWorldSlotHost
+    private sealed class FakeSlot : IWorldSlotHost, IWorldSlotAdmissionPort
     {
         internal AdmissionGateState GateState { get; set; } = AdmissionGateState.Open;
         internal AckResult BindResult { get; set; } = new(true, null);
         internal int BindCalls { get; private set; }
+        internal SlotReservationId Reservation { get; set; } = new(7);
+        internal SlotReservationId LastReservation { get; private set; }
 
         public AllocateResult Allocate(in SlotBudget budget) => new(true, new WorldSlotId(1), new SlotEpoch(1), null);
+        public AdmissionReservationResult ReserveAdmission(AdmissionAttemptId attempt, ServerSessionId session)
+            => new(Reservation.Value != 0, Reservation, new SlotEpoch(1), Reservation.Value == 0 ? "InvalidArgument" : null);
+        public AckResult AbortAdmission(SlotReservationId reservation, SlotEpoch epoch) => new(true, null);
         public AckResult BindSession(SlotReservationId reservation, ServerSessionId session, SlotEpoch epoch)
         {
             BindCalls++;
+            LastReservation = reservation;
             return BindResult;
         }
         public AckResult Quiesce(string reason, SlotEpoch epoch) => new(true, null);

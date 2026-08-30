@@ -55,6 +55,12 @@ internal sealed class ConnectionEntry
 
     internal PermissionGrantRef Grant { get; private set; }
 
+    /// <summary>
+    /// Principal evidence established by the carrier during channel upgrade.
+    /// It is metadata only; credentials and nonce values are never retained.
+    /// </summary>
+    internal TransportAuthenticationEvidence? AuthenticationEvidence { get; private set; }
+
     /// <summary>per-connection ingress。Reliable 满载断连，Unreliable 丢弃并计数。</summary>
     internal IBoundedInbox<ValidatedEnvelopeBytes> Ingress { get; }
 
@@ -118,6 +124,9 @@ internal sealed class ConnectionEntry
         this.BoundSession = null;
         this.Grant = default;
     }
+
+    internal void SetAuthenticationEvidence(TransportAuthenticationEvidence? evidence)
+        => this.AuthenticationEvidence = evidence;
 
     internal void CountUnreliableDrop() => this.UnreliableDropCount++;
 

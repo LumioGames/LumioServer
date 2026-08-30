@@ -52,7 +52,14 @@ public abstract record ConnectionEvent
     public sealed record HandshakeEnvelope(
         TransportConnectionId Id,
         ConnectionEpoch Epoch,
-        ValidatedEnvelopeBytes Envelope) : ConnectionEvent;
+        ValidatedEnvelopeBytes Envelope) : ConnectionEvent
+    {
+        /// <summary>
+        /// Non-secret authentication evidence produced during transport
+        /// upgrade. Credentials and nonce values never cross this boundary.
+        /// </summary>
+        public TransportAuthenticationEvidence? AuthenticationEvidence { get; init; }
+    }
 
     public sealed record IngressReady(TransportConnectionId Id, ConnectionEpoch Epoch, int PendingCount) : ConnectionEvent;
 
