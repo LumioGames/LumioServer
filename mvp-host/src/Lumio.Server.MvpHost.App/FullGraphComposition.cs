@@ -385,6 +385,17 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                     UpdateEpoch(handshakeEvent.Id);
                     break;
                 case ConnectionEvent.IngressReady ingress:
+                    if (!connections.TryGetValue(ingress.Id.Value, out var activeConnection)
+                        || !IsCurrentIngressGeneration(
+                            activeConnection.Epoch,
+                            transport.EpochOf(ingress.Id),
+                            ingress.Epoch))
+                    {
+                        // A late event from a prior bind/unbind generation must
+                        // not drain frames belonging to the current connection.
+                        break;
+                    }
+
                     var buffer = new ValidatedEnvelopeBytes[WorldSlotProvisionalDefaults.IngressDrainItemsPerTick];
                     var count = transport.Drain(
                         ingress.Id,
@@ -458,6 +469,13 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         ConnectionEpoch current,
         ConnectionEpoch observed)
         => current == observed;
+
+    internal static bool IsCurrentIngressGeneration(
+        ConnectionEpoch activeConnection,
+        ConnectionEpoch transportGeneration,
+        ConnectionEpoch observedEvent)
+        => activeConnection == transportGeneration
+            && activeConnection == observedEvent;
 
     private bool RemoveConnectionIfCurrent(ActiveConnection expected)
     {

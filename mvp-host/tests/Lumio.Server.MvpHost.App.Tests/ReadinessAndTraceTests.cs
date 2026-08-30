@@ -57,6 +57,17 @@ public sealed class ReadinessAndTraceTests
         Assert.False(App.FullGraphComposition.IsCurrentConnectionGeneration(current, new ConnectionEpoch(5)));
     }
 
+    [Fact]
+    public void StaleIngressEventCannotDrainTheCurrentGeneration()
+    {
+        var current = new ConnectionEpoch(4);
+        var stale = new ConnectionEpoch(3);
+
+        Assert.True(App.FullGraphComposition.IsCurrentIngressGeneration(current, current, current));
+        Assert.False(App.FullGraphComposition.IsCurrentIngressGeneration(current, current, stale));
+        Assert.False(App.FullGraphComposition.IsCurrentIngressGeneration(current, stale, current));
+    }
+
     private static EnqueueResult InvokeRoute(
         MethodInfo route,
         AckResult sessionResult,
