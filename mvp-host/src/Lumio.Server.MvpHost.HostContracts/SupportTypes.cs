@@ -94,6 +94,18 @@ public readonly record struct AllocateResult(
     SlotEpoch Epoch,
     string? StableErrorId);
 
+/// <summary>
+/// Result of a WorldSlot admission reservation.  The reservation handle is
+/// returned by the same serialized operation that records it, so callers never
+/// need to consult a process-global or last-result side channel.
+/// </summary>
+public readonly record struct AdmissionReservationResult(
+    bool Reserved,
+    SlotReservationId Reservation,
+    SlotEpoch Epoch,
+    WorldSlotId SlotId,
+    string? StableErrorId);
+
 public readonly record struct QuotaView(int MaxSessions, int BoundSessions);
 
 /// <summary>

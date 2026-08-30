@@ -1,0 +1,35 @@
+{
+  "queues": [
+    {
+      "name": "MvpWorldSlotAggregateInbox",
+      "owner": "Lumio.Server.MvpHost.WorldSlot",
+      "producer": "session / timer / pacing",
+      "consumer": "WorldSlot owner thread",
+      "ordering": "FIFO by (slot epoch, sequence)",
+      "budget": "64 items + 2 reserved slots (provisional)",
+      "onFull": "AggregateBusy mapped to QueueFull",
+      "onClose": "stop accepts terminal queries and late acknowledgements only"
+    },
+    {
+      "name": "MvpTickPermitQueue",
+      "owner": "Lumio.Server.MvpHost.WorldSlot",
+      "producer": "pacing timer",
+      "consumer": "WorldSlot owner thread",
+      "ordering": "strict FIFO SPSC",
+      "budget": "1 item (provisional)",
+      "onFull": "record overrun and return QueueFull; do not accumulate catch-up",
+      "onClose": "close after pacing stops"
+    },
+    {
+      "name": "MvpSlotEventOutbox",
+      "owner": "Lumio.Server.MvpHost.Session",
+      "producer": "Lumio.Server.MvpHost.WorldSlot",
+      "consumer": "session / process",
+      "ordering": "FIFO",
+      "budget": "256 items (provisional)",
+      "onFull": "retain terminal events in a reserved lane",
+      "onClose": "terminal events remain deliverable"
+    }
+  ],
+  "note": "WorldSlot queue contracts are provisional until the corresponding SRV-D decisions are frozen."
+}

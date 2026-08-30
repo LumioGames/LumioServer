@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>4</MvpHostLayer>
+    <RootNamespace>Lumio.Server.MvpHost.WorldSlot</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.WorldSlot</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Lumio.Server.MvpHost.HostContracts/Lumio.Server.MvpHost.HostContracts.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Observability/Lumio.Server.MvpHost.Observability.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.WorldSlot.Tests" />
+  </ItemGroup>
+
+</Project>
