@@ -218,8 +218,12 @@
           "Lumio.Server.MvpHost.HostContracts": "[1.0.0, )",
           "Lumio.Server.MvpHost.Observability": "[1.0.0, )",
           "Lumio.Server.MvpHost.Platform": "[1.0.0, )",
+          "Lumio.Server.MvpHost.Session": "[1.0.0, )",
+          "Lumio.Server.MvpHost.Simulation.Reference": "[1.0.0, )",
           "Lumio.Server.MvpHost.Transport": "[1.0.0, )",
-          "Lumio.Server.MvpHost.Wire": "[1.0.0, )"
+          "Lumio.Server.MvpHost.Transport.WebSocket": "[1.0.0, )",
+          "Lumio.Server.MvpHost.Wire": "[1.0.0, )",
+          "Lumio.Server.MvpHost.WorldSlot": "[1.0.0, )"
         }
       },
       "lumio-mvp-smoke-client": {
@@ -255,6 +259,19 @@
       "lumio.server.mvphost.platform": {
         "type": "Project"
       },
+      "lumio.server.mvphost.session": {
+        "type": "Project",
+        "dependencies": {
+          "Lumio.Server.MvpHost.HostContracts": "[1.0.0, )",
+          "Lumio.Server.MvpHost.Observability": "[1.0.0, )"
+        }
+      },
+      "lumio.server.mvphost.simulation.reference": {
+        "type": "Project",
+        "dependencies": {
+          "Lumio.Server.MvpHost.HostContracts": "[1.0.0, )"
+        }
+      },
       "lumio.server.mvphost.transport": {
         "type": "Project",
         "dependencies": {
@@ -262,10 +279,23 @@
           "Lumio.Server.MvpHost.Observability": "[1.0.0, )"
         }
       },
+      "lumio.server.mvphost.transport.websocket": {
+        "type": "Project",
+        "dependencies": {
+          "Lumio.Server.MvpHost.Transport": "[1.0.0, )"
+        }
+      },
       "lumio.server.mvphost.wire": {
         "type": "Project",
         "dependencies": {
           "Lumio.Server.MvpHost.GeneratedContracts": "[1.0.0, )"
+        }
+      },
+      "lumio.server.mvphost.worldslot": {
+        "type": "Project",
+        "dependencies": {
+          "Lumio.Server.MvpHost.HostContracts": "[1.0.0, )",
+          "Lumio.Server.MvpHost.Observability": "[1.0.0, )"
         }
       }
     }
