@@ -1,0 +1,24 @@
+{
+  "queues": [
+    {
+      "name": "MvpSessionControlInbox",
+      "owner": "Lumio.Server.MvpHost.Session",
+      "producer": "transport/auth/world-slot/maintenance/timer",
+      "consumer": "Lumio.Server.MvpHost.Session",
+      "ordering": "FIFO per session and connection epoch",
+      "budget": "256 items",
+      "onFull": "handshake closes connection; active session is isolated",
+      "onClose": "process terminal close and ack; reject new admission"
+    },
+    {
+      "name": "MvpSessionEventOutbox",
+      "owner": "Lumio.Server.MvpHost.Session",
+      "producer": "Lumio.Server.MvpHost.Session",
+      "consumer": "transport/world-slot/maintenance/process",
+      "ordering": "FIFO per session epoch",
+      "budget": "256 items",
+      "onFull": "retain terminal event; isolate session and emit diagnostic",
+      "onClose": "retain terminal events and reject new publication"
+    }
+  ]
+}
