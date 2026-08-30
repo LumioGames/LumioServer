@@ -170,6 +170,50 @@ public sealed class BoundedQueueTest
     /// 判满的依据取**丢弃计数出现增长**而不是 count 达到容量：后者依赖 Channel 内部
     /// 计数的时序，前者是队列自己给出的「我满了」的答复。
     /// </summary>
+    [Fact]
+    public void DrainDoesNotDropTheFirstItemThatExceedsTheByteBudget()
+    {
+        using var harness = new TransportHarness();
+        var id = ConnectionLifecycleTest.AcceptAndValidate(harness);
+        harness.Carrier.QueueInbound(id, TransportHarness.ValidEnvelope(sequence: 2));
+        harness.Service.PumpReceiveOnce(id);
+        var expected = TransportHarness.ValidEnvelope(sequence: 2);
+
+        var tooSmall = new ValidatedEnvelopeBytes[1];
+        var taken = harness.Service.Drain(id, 1, expected.Length - 1L, tooSmall.AsSpan());
+
+        Assert.Equal(0, taken);
+        var enough = new ValidatedEnvelopeBytes[1];
+        taken = harness.Service.Drain(id, 1, expected.Length, enough.AsSpan());
+
+        Assert.Equal(1, taken);
+        Assert.Equal((ulong)2, enough[0].Header.Sequence);
+    }
+
+    [Fact]
+    public void DrainRetainsFifoWhenALaterItemWouldExceedTheRemainingBudget()
+    {
+        using var harness = new TransportHarness();
+        var id = ConnectionLifecycleTest.AcceptAndValidate(harness);
+        harness.Carrier.QueueInbound(id, TransportHarness.ValidEnvelope(sequence: 2));
+        harness.Carrier.QueueInbound(id, TransportHarness.ValidEnvelope(sequence: 3));
+        harness.Service.PumpReceiveOnce(id);
+        harness.Service.PumpReceiveOnce(id);
+        var itemBytes = TransportHarness.ValidEnvelope(sequence: 2).Length;
+
+        var destination = new ValidatedEnvelopeBytes[2];
+        var taken = harness.Service.Drain(id, 2, itemBytes + itemBytes - 1L, destination.AsSpan());
+
+        Assert.Equal(1, taken);
+        Assert.Equal((ulong)2, destination[0].Header.Sequence);
+
+        var remainder = new ValidatedEnvelopeBytes[1];
+        taken = harness.Service.Drain(id, 1, itemBytes, remainder.AsSpan());
+
+        Assert.Equal(1, taken);
+        Assert.Equal((ulong)3, remainder[0].Header.Sequence);
+    }
+
     private static void FillIngress(TransportHarness harness, TransportConnectionId id)
     {
         for (var i = 0; i < 1024; i++)

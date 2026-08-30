@@ -2,6 +2,10 @@ using System;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
 
@@ -167,7 +171,10 @@ public sealed class ProcessAndExitCodeTests
             appAssembly,
             "--listen", "ws://127.0.0.1:0",
             "--allow-insecure-loopback",
-            "--shared-secret-file", secret);
+            "--shared-secret-file", secret,
+            "--enable-test-control",
+            "--test-control-listen", "http://127.0.0.1:0",
+            "--audit-trace-file", Path.Combine(root, "server.jsonl"));
         Process? first = null;
         Process? second = null;
 
@@ -180,6 +187,8 @@ public sealed class ProcessAndExitCodeTests
                 Task.Delay(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));
             Assert.Same(readyRead, completed);
             Assert.True(App.HostReadyLine.TryParse(await readyRead, out var ready));
+            Assert.True(Uri.TryCreate(ready.TestControlUri, UriKind.Absolute, out var controlUri));
+            Assert.NotEqual(0, controlUri!.Port);
 
             first = StartChild(
                 smokeAssembly,
@@ -207,6 +216,26 @@ public sealed class ProcessAndExitCodeTests
             var firstError = first.StandardError.ReadToEndAsync(cancellationToken);
             var secondOutput = second.StandardOutput.ReadToEndAsync(cancellationToken);
             var secondError = second.StandardError.ReadToEndAsync(cancellationToken);
+
+            var firstTrace = Path.Combine(root, "client-one.jsonl");
+            var secondTrace = Path.Combine(root, "client-two.jsonl");
+            await WaitForTraceAsync(firstTrace, "\"messageType\":\"BaselineAck\"", cancellationToken);
+            await WaitForTraceAsync(secondTrace, "\"messageType\":\"BaselineAck\"", cancellationToken);
+
+            using var http = new HttpClient { BaseAddress = controlUri };
+            using var mutationContent = new StringContent(
+                "{\"sessionId\":\"admin-session\",\"opaqueCommandBase64\":\"AQI=\"}",
+                Encoding.UTF8,
+                "application/json");
+            using var mutationResponse = await http.PostAsync(
+                "/test-control/inject-world-mutation",
+                mutationContent,
+                cancellationToken);
+            mutationResponse.EnsureSuccessStatusCode();
+            using var mutationDocument = JsonDocument.Parse(
+                await mutationResponse.Content.ReadAsStringAsync(cancellationToken));
+            Assert.True(mutationDocument.RootElement.GetProperty("accepted").GetBoolean());
+
             await Task.WhenAll(
                 first.WaitForExitAsync(TestContext.Current.CancellationToken),
                 second.WaitForExitAsync(TestContext.Current.CancellationToken),
@@ -215,10 +244,18 @@ public sealed class ProcessAndExitCodeTests
                 secondOutput,
                 secondError);
 
+            // The host owns the append-only server trace for its lifetime. Stop
+            // it before taking the final snapshot of that file on Windows.
+            StopChild(host);
+
             Assert.Equal(SmokeClient.SmokeClientExitCodes.Success, first.ExitCode);
             Assert.Equal(SmokeClient.SmokeClientExitCodes.Success, second.ExitCode);
-            Assert.True(File.Exists(Path.Combine(root, "client-one.jsonl")));
-            Assert.True(File.Exists(Path.Combine(root, "client-two.jsonl")));
+            Assert.Contains("\"messageType\":\"Delta\"", File.ReadAllText(firstTrace), StringComparison.Ordinal);
+            Assert.Contains("\"messageType\":\"DeltaAck\"", File.ReadAllText(firstTrace), StringComparison.Ordinal);
+            Assert.Contains("\"messageType\":\"Delta\"", File.ReadAllText(secondTrace), StringComparison.Ordinal);
+            Assert.Contains("\"messageType\":\"DeltaAck\"", File.ReadAllText(secondTrace), StringComparison.Ordinal);
+            var serverTrace = File.ReadAllText(Path.Combine(root, "server.jsonl"));
+            Assert.Contains("\"authorityRevision\":1", serverTrace, StringComparison.Ordinal);
         }
         finally
         {
@@ -250,6 +287,58 @@ public sealed class ProcessAndExitCodeTests
         }
 
         return process;
+    }
+
+    private static async Task WaitForTraceAsync(
+        string path,
+        string marker,
+        CancellationToken cancellationToken)
+    {
+        var deadline = Stopwatch.GetTimestamp()
+            + (long)(Stopwatch.Frequency * TimeSpan.FromSeconds(10).TotalSeconds);
+        while (Stopwatch.GetTimestamp() < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (File.Exists(path))
+            {
+                try
+                {
+                    if (ReadSharedText(path).Contains(marker, StringComparison.Ordinal))
+                    {
+                        return;
+                    }
+                }
+                catch (IOException)
+                {
+                    // The writer may be between flushes; retry until the bound.
+                }
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(20), cancellationToken);
+        }
+
+        string current;
+        try
+        {
+            current = File.Exists(path) ? ReadSharedText(path) : "<trace file missing>";
+        }
+        catch (IOException)
+        {
+            current = "<trace file locked>";
+        }
+        throw new TimeoutException(
+            $"Timed out waiting for trace marker {marker} in {path}; current trace: {current}");
+    }
+
+    private static string ReadSharedText(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false);
+        return reader.ReadToEnd();
     }
 
     private static void StopChild(Process? process)

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Net.WebSockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -91,6 +92,32 @@ public sealed class CarrierSmokeTests
     }
 
     [Fact]
+    public async Task RealSecretAndBase64UrlNonceReachTheAcceptedCarrierQueue()
+    {
+        using var clock = new DummyClock();
+        using var timers = new DummyTimers();
+        var options = Options();
+        await using var carrier = WebSocketByteCarrier.Create(
+            in options,
+            new ExactVerifier(Encoding.UTF8.GetBytes("test-secret")),
+            new DummyReplay(),
+            clock,
+            timers,
+            new DummyAudit());
+
+        using var client = new ClientWebSocket();
+        client.Options.AddSubProtocol(WebSocketCarrierConstants.Subprotocol);
+        client.Options.AddSubProtocol("dGVzdC1zZWNyZXQ");
+        client.Options.AddSubProtocol("dual-client-one");
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await client.ConnectAsync(new Uri(carrier.BoundUri), cancellation.Token);
+
+        var accepted = await carrier.AcceptAsync(cancellation.Token);
+        Assert.True(accepted.Accepted);
+        Assert.NotNull(accepted.AuthenticationEvidence);
+    }
+
+    [Fact]
     public async Task ServerCloseFlushesQueuedMessageBeforeCloseFrame()
     {
         using var clock = new DummyClock();
@@ -155,6 +182,18 @@ public sealed class CarrierSmokeTests
     {
         public CredentialVerification Verify(OpaqueCredentialInput credential, in VerificationContext context)
             => new(CredentialVerdict.Accepted, new PrincipalId("p"), null);
+    }
+
+    private sealed class ExactVerifier : ICredentialVerifier
+    {
+        private readonly byte[] expected;
+
+        internal ExactVerifier(byte[] expected) => this.expected = expected;
+
+        public CredentialVerification Verify(OpaqueCredentialInput credential, in VerificationContext context)
+            => CryptographicOperations.FixedTimeEquals(credential.Span, expected)
+                ? new CredentialVerification(CredentialVerdict.Accepted, new PrincipalId("p"), null)
+                : new CredentialVerification(CredentialVerdict.Rejected, default, "mismatch");
     }
 
     private sealed class RejectingVerifier : ICredentialVerifier

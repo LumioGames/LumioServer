@@ -27,7 +27,10 @@ public sealed class SmokeTraceWriter : IDisposable
         }
 
         writer = new StreamWriter(
-            new FileStream(fullPath, FileMode.Create, FileAccess.Write, FileShare.Read),
+            // The parent acceptance process tails this write-only evidence file
+            // while the child scenario is running. Allow concurrent readers and
+            // a second read handle on Windows without exposing the credential.
+            new FileStream(fullPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite),
             new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
         {
             AutoFlush = true,

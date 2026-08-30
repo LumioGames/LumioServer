@@ -1,13 +1,71 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using System.Text.Json;
+using Lumio.Server.MvpHost.HostContracts;
+using Lumio.Server.MvpHost.Platform;
 using Xunit;
 
 namespace Lumio.Server.MvpHost.App.Tests;
 
 public sealed class ReadinessAndTraceTests
 {
+    [Fact]
+    public void IngressRoutingRejectsStaleFramesAndReportsWorldQueueFull()
+    {
+        var composition = typeof(App.Program).Assembly.GetType(
+            "Lumio.Server.MvpHost.App.FullGraphComposition",
+            throwOnError: true)!;
+        var ingressType = composition.GetNestedType("MultiplexedIngress", BindingFlags.NonPublic)!;
+        var ingress = ingressType
+            .GetConstructor(
+                BindingFlags.Instance | BindingFlags.NonPublic,
+                binder: null,
+                new[] { typeof(QueueBudget) },
+                modifiers: null)!
+            .Invoke(new object[] { new QueueBudget(1, 16) });
+        var route = composition.GetMethod(
+            "RouteIngress",
+            BindingFlags.Static | BindingFlags.NonPublic);
+
+        Assert.NotNull(route);
+
+        var envelope = new ValidatedEnvelopeBytes(new byte[] { 1 }, default);
+        var rejected = InvokeRoute(
+            route,
+            new AckResult(false, "StaleConnectionGeneration"),
+            ingress,
+            envelope);
+        var accepted = InvokeRoute(route, new AckResult(true, null), ingress, envelope);
+        var full = InvokeRoute(route, new AckResult(true, null), ingress, envelope);
+
+        Assert.Equal(EnqueueStatus.Closed, rejected.Status);
+        Assert.Equal("StaleConnectionGeneration", rejected.StableErrorId);
+        Assert.Equal(EnqueueStatus.Accepted, accepted.Status);
+        Assert.Equal(EnqueueStatus.Full, full.Status);
+        Assert.Equal("QueueFull", full.StableErrorId);
+    }
+
+    [Fact]
+    public void StaleConnectionGenerationCannotMatchTheCurrentConnection()
+    {
+        var current = new ConnectionEpoch(4);
+
+        Assert.True(App.FullGraphComposition.IsCurrentConnectionGeneration(current, new ConnectionEpoch(4)));
+        Assert.False(App.FullGraphComposition.IsCurrentConnectionGeneration(current, new ConnectionEpoch(3)));
+        Assert.False(App.FullGraphComposition.IsCurrentConnectionGeneration(current, new ConnectionEpoch(5)));
+    }
+
+    private static EnqueueResult InvokeRoute(
+        MethodInfo route,
+        AckResult sessionResult,
+        object ingress,
+        ValidatedEnvelopeBytes envelope)
+        => (EnqueueResult)route.Invoke(
+            obj: null,
+            parameters: new object[] { sessionResult, ingress, envelope })!;
+
     [Fact]
     public void ReadyLineIsSingleAndParsable()
     {

@@ -64,6 +64,54 @@ internal sealed class ConnectionEntry
     /// <summary>per-connection ingress。Reliable 满载断连，Unreliable 丢弃并计数。</summary>
     internal IBoundedInbox<ValidatedEnvelopeBytes> Ingress { get; }
 
+    // Drain may stop at a byte-budget boundary. Keep one item outside the
+    // inbox so a frame that did not fit is still the next FIFO item.
+    private bool hasDeferredIngress;
+    private ValidatedEnvelopeBytes deferredIngress;
+
+    internal int IngressCount
+        => this.Ingress.Count + (this.hasDeferredIngress ? 1 : 0);
+
+    internal bool TryTakeIngress(out ValidatedEnvelopeBytes item)
+    {
+        if (this.hasDeferredIngress)
+        {
+            item = this.deferredIngress;
+            this.deferredIngress = default;
+            this.hasDeferredIngress = false;
+            return true;
+        }
+
+        return this.Ingress.TryDequeue(out item);
+    }
+
+    internal void DeferIngress(in ValidatedEnvelopeBytes item)
+    {
+        if (this.hasDeferredIngress)
+        {
+            throw new InvalidOperationException("Only one ingress item may be deferred");
+        }
+
+        this.deferredIngress = item;
+        this.hasDeferredIngress = true;
+    }
+
+    internal EnqueueResult TryEnqueueIngress(in ValidatedEnvelopeBytes item)
+    {
+        if (this.IngressCount >= this.Ingress.Budget.MaxItems)
+        {
+            return new EnqueueResult(EnqueueStatus.Full, "QueueFull");
+        }
+
+        return this.Ingress.TryEnqueue(in item);
+    }
+
+    internal void ClearDeferredIngress()
+    {
+        this.deferredIngress = default;
+        this.hasDeferredIngress = false;
+    }
+
     /// <summary>per-connection egress。</summary>
     internal IBoundedInbox<OutboundEnvelopeBytes> Egress { get; }
 

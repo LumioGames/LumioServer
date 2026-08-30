@@ -154,19 +154,26 @@ public sealed class TransportService
         var taken = 0;
         long bytes = 0;
 
+        if (maxItems <= 0 || maxBytes <= 0)
+        {
+            return 0;
+        }
+
         while (taken < maxItems && taken < destination.Length)
         {
-            if (!entry.Ingress.TryDequeue(out var item))
+            if (!entry.TryTakeIngress(out var item))
             {
                 break;
             }
 
-            bytes += item.Bytes.Length;
-            if (bytes > maxBytes)
+            var itemBytes = item.Bytes.Length;
+            if (itemBytes > maxBytes - bytes)
             {
+                entry.DeferIngress(in item);
                 break;
             }
 
+            bytes += itemBytes;
             destination[taken++] = item;
         }
 
@@ -315,7 +322,10 @@ public sealed class TransportService
     //    但不构成对外契约——别的模块只收类型化事件。
 
     internal bool IngressIsFullForTest(TransportConnectionId connection)
-        => this.registry.TryGet(connection, out var entry) && entry.Ingress.Count >= entry.Ingress.Budget.MaxItems;
+        => this.registry.TryGet(connection, out var entry) && entry.IngressCount >= entry.Ingress.Budget.MaxItems;
+
+    internal int IngressCountForTest(TransportConnectionId connection)
+        => this.registry.TryGet(connection, out var entry) ? entry.IngressCount : 0;
 
     internal void FillEventOutboxForTest()
     {
@@ -355,6 +365,7 @@ public sealed class TransportService
             if (this.registry.TryGet(new TransportConnectionId(id), out var entry))
             {
                 entry.Ingress.Close();
+                entry.ClearDeferredIngress();
                 entry.Egress.Close();
             }
         }
@@ -420,7 +431,7 @@ public sealed class TransportService
         }
 
         var validated = new ValidatedEnvelopeBytes(message, header);
-        var enqueued = entry.Ingress.TryEnqueue(in validated);
+        var enqueued = entry.TryEnqueueIngress(in validated);
 
         if (enqueued.Status == EnqueueStatus.Full)
         {
@@ -441,7 +452,7 @@ public sealed class TransportService
             entry.TryTransitionTo(TransportConnectionState.Active);
         }
 
-        this.Publish(new ConnectionEvent.IngressReady(entry.Id, entry.Epoch, entry.Ingress.Count));
+        this.Publish(new ConnectionEvent.IngressReady(entry.Id, entry.Epoch, entry.IngressCount));
         return true;
     }
 
@@ -494,6 +505,7 @@ public sealed class TransportService
 
         entry.TryTransitionTo(TransportConnectionState.Closed);
         entry.Ingress.Close();
+        entry.ClearDeferredIngress();
         entry.Egress.Close();
         this.carrier.Close(entry.Id, reason);
 

@@ -20,6 +20,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.App.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="../Lumio.Server.MvpHost.GeneratedContracts/Lumio.Server.MvpHost.GeneratedContracts.csproj" />
     <ProjectReference Include="../Lumio.Server.MvpHost.Wire/Lumio.Server.MvpHost.Wire.csproj" />
     <ProjectReference Include="../Lumio.Server.MvpHost.Platform/Lumio.Server.MvpHost.Platform.csproj" />

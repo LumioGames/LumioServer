@@ -29,7 +29,9 @@ internal sealed class FullGraphComposition : IAsyncDisposable
     private const int AntiReplayWindow = 1_024;
     private const int MaxConnections = 64;
     private const int MaxSessions = 64;
-    private static readonly TimeSpan CarrierPollInterval = TimeSpan.FromMilliseconds(10);
+    // The carrier facade waits only on the wrapper task.  It never cancels the
+    // underlying WebSocket receive, because cancellation aborts Kestrel sockets.
+    private static readonly TimeSpan CarrierPollInterval = TimeSpan.FromMilliseconds(25);
 
     private readonly string productId;
     private readonly string gameReleaseId;
@@ -291,10 +293,14 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                 {
                     if (owner.transport.StateOf(connection.Id) == TransportConnectionState.Closed)
                     {
-                        owner.connections.Remove(connection.Id.Value);
+                        owner.RemoveConnectionIfCurrent(connection);
                         continue;
                     }
 
+                    // A newly accepted connection has a server-first handshake.
+                    // Drain egress before starting the receive task so the peer
+                    // can make progress without a first-frame deadlock.
+                    _ = owner.transport.PumpSendOnce(connection.Id);
                     _ = owner.transport.PumpReceiveOnce(connection.Id);
                     owner.ProcessEvents();
                     _ = owner.transport.PumpSendOnce(connection.Id);
@@ -387,17 +393,36 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                         buffer.AsSpan());
                     for (var index = 0; index < count; index++)
                     {
-                        _ = worldIngress.TryEnqueue(in buffer[index]);
+                        AckResult sessionResult;
                         lock (sessionsGate)
                         {
-                            _ = sessions.HandleInbound(ingress.Id, ingress.Epoch, in buffer[index]);
+                            sessionResult = sessions.HandleInbound(
+                                ingress.Id,
+                                ingress.Epoch,
+                                in buffer[index]);
                             sessions.PumpOnce();
+                        }
+
+                        var routed = RouteIngress(sessionResult, worldIngress, buffer[index]);
+                        if (sessionResult.Accepted && routed.Status != EnqueueStatus.Accepted)
+                        {
+                            var closed = transport.TrySend(new ConnectionCommand.Close(
+                                ingress.Id,
+                                ingress.Epoch,
+                                ConnectionCloseReason.Fault));
+                            if (closed.Status != EnqueueStatus.Accepted
+                                && transport.StateOf(ingress.Id) != TransportConnectionState.Closed)
+                            {
+                                MarkFatalFault();
+                            }
+
+                            break;
                         }
                     }
 
                     break;
                 case ConnectionEvent.Closed closedEvent:
-                    connections.Remove(closedEvent.Id.Value);
+                    RemoveConnectionIfCurrent(closedEvent.Id, closedEvent.Epoch);
                     lock (sessionsGate)
                     {
                         _ = sessions.HandleConnectionEvent(in connectionEvent);
@@ -405,7 +430,7 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                     }
                     break;
                 case ConnectionEvent.Faulted faultedEvent:
-                    connections.Remove(faultedEvent.Id.Value);
+                    RemoveConnectionIfCurrent(faultedEvent.Id, faultedEvent.Epoch);
                     lock (sessionsGate)
                     {
                         _ = sessions.HandleConnectionEvent(in connectionEvent);
@@ -414,6 +439,49 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                     break;
             }
         }
+    }
+
+    private static EnqueueResult RouteIngress(
+        AckResult sessionResult,
+        MultiplexedIngress ingress,
+        ValidatedEnvelopeBytes envelope)
+    {
+        if (!sessionResult.Accepted)
+        {
+            return new EnqueueResult(EnqueueStatus.Closed, sessionResult.StableErrorId);
+        }
+
+        return ingress.TryEnqueue(in envelope);
+    }
+
+    internal static bool IsCurrentConnectionGeneration(
+        ConnectionEpoch current,
+        ConnectionEpoch observed)
+        => current == observed;
+
+    private bool RemoveConnectionIfCurrent(ActiveConnection expected)
+    {
+        if (!connections.TryGetValue(expected.Id.Value, out var current)
+            || !ReferenceEquals(current, expected)
+            || !IsCurrentConnectionGeneration(current.Epoch, expected.Epoch))
+        {
+            return false;
+        }
+
+        return connections.Remove(expected.Id.Value);
+    }
+
+    private bool RemoveConnectionIfCurrent(
+        TransportConnectionId id,
+        ConnectionEpoch observedEpoch)
+    {
+        if (!connections.TryGetValue(id.Value, out var current)
+            || !IsCurrentConnectionGeneration(current.Epoch, observedEpoch))
+        {
+            return false;
+        }
+
+        return connections.Remove(id.Value);
     }
 
     private void UpdateEpoch(TransportConnectionId id)
@@ -496,11 +564,25 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         }
     }
 
-    /// <summary>Bounded polling facade around the async carrier.</summary>
+    /// <summary>
+    /// Non-blocking facade around the async carrier.  Transport owns a synchronous
+    /// single-writer pump, so each call starts at most one receive/accept operation
+    /// and waits only on a wrapper timeout.  The underlying operation always uses
+    /// CancellationToken.None; cancelling a Kestrel WebSocket ReceiveAsync aborts
+    /// the socket and turns an idle connection into a false transport close.
+    /// </summary>
     private sealed class PollingByteCarrier : IByteCarrier
     {
+        private static readonly CarrierAccept NoAccept =
+            new(false, default, ImmutableArray<string>.Empty);
+        private static readonly CarrierReceive NoReceive =
+            new(false, 0, false, false);
+
+        private readonly object gate = new();
         private readonly IByteCarrier inner;
         private readonly TimeSpan pollInterval;
+        private readonly Dictionary<ulong, PendingReceive> pendingReceives = new();
+        private Task<CarrierAccept>? pendingAccept;
 
         internal PollingByteCarrier(IByteCarrier inner, TimeSpan pollInterval)
         {
@@ -510,15 +592,33 @@ internal sealed class FullGraphComposition : IAsyncDisposable
 
         public async ValueTask<CarrierAccept> AcceptAsync(CancellationToken cancellationToken)
         {
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(pollInterval);
+            cancellationToken.ThrowIfCancellationRequested();
+            Task<CarrierAccept> operation;
+            lock (this.gate)
+            {
+                if (this.pendingAccept is null)
+                {
+                    this.pendingAccept = this.inner.AcceptAsync(CancellationToken.None).AsTask();
+                }
+
+                operation = this.pendingAccept;
+            }
+
             try
             {
-                return await inner.AcceptAsync(timeout.Token).ConfigureAwait(false);
+                var result = await operation.WaitAsync(this.pollInterval, cancellationToken)
+                    .ConfigureAwait(false);
+                this.ClearAccept(operation);
+                return result;
             }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            catch (TimeoutException)
             {
-                return new CarrierAccept(false, default, ImmutableArray<string>.Empty);
+                return NoAccept;
+            }
+            catch
+            {
+                this.ClearAccept(operation);
+                throw;
             }
         }
 
@@ -527,15 +627,57 @@ internal sealed class FullGraphComposition : IAsyncDisposable
             Memory<byte> buffer,
             CancellationToken cancellationToken)
         {
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(pollInterval);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            PendingReceive pending;
+            lock (this.gate)
+            {
+                if (!this.pendingReceives.TryGetValue(connection.Value, out pending!))
+                {
+                    // Own the storage for the operation.  Transport's buffer is
+                    // a per-call local and may be reclaimed before the task ends.
+                    var source = new byte[Math.Max(1, buffer.Length)];
+                    var operation = this.inner.ReceiveAsync(
+                        connection,
+                        source,
+                        CancellationToken.None).AsTask();
+                    pending = new PendingReceive(source, operation);
+                    this.pendingReceives.Add(connection.Value, pending);
+                }
+            }
+
             try
             {
-                return await inner.ReceiveAsync(connection, buffer, timeout.Token).ConfigureAwait(false);
+                var result = await pending.Operation.WaitAsync(this.pollInterval, cancellationToken)
+                    .ConfigureAwait(false);
+                this.RemoveReceive(connection, pending);
+
+                if (!result.Received)
+                {
+                    return result;
+                }
+
+                if (result.ByteCount < 0
+                    || result.ByteCount > pending.Buffer.Length
+                    || result.ByteCount > buffer.Length)
+                {
+                    // Never truncate a framed message.  The transport will turn
+                    // this terminal carrier result into a connection close.
+                    _ = this.inner.Close(connection, ConnectionCloseReason.Fault);
+                    return new CarrierReceive(false, 0, true, true);
+                }
+
+                pending.Buffer.AsMemory(0, result.ByteCount).CopyTo(buffer);
+                return result;
             }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            catch (TimeoutException)
             {
-                return new CarrierReceive(false, 0, false, false);
+                return NoReceive;
+            }
+            catch
+            {
+                this.RemoveReceive(connection, pending);
+                throw;
             }
         }
 
@@ -543,7 +685,60 @@ internal sealed class FullGraphComposition : IAsyncDisposable
             => inner.TrySend(connection, bytes);
 
         public bool Close(TransportConnectionId connection, ConnectionCloseReason reason)
-            => inner.Close(connection, reason);
+        {
+            PendingReceive? pending;
+            lock (this.gate)
+            {
+                this.pendingReceives.Remove(connection.Value, out pending);
+            }
+
+            if (pending is not null)
+            {
+                // The operation cannot be cancelled safely.  Observe a late
+                // fault after the transport has closed the connection.
+                _ = Observe(pending.Operation);
+            }
+
+            return this.inner.Close(connection, reason);
+        }
+
+        private void ClearAccept(Task<CarrierAccept> operation)
+        {
+            lock (this.gate)
+            {
+                if (ReferenceEquals(this.pendingAccept, operation))
+                {
+                    this.pendingAccept = null;
+                }
+            }
+        }
+
+        private void RemoveReceive(TransportConnectionId connection, PendingReceive pending)
+        {
+            lock (this.gate)
+            {
+                if (this.pendingReceives.TryGetValue(connection.Value, out var current)
+                    && ReferenceEquals(current, pending))
+                {
+                    this.pendingReceives.Remove(connection.Value);
+                }
+            }
+        }
+
+        private static async Task Observe(Task task)
+        {
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            catch
+            {
+                // Closing a carrier is best effort; the transport already
+                // published its terminal event to the owning session.
+            }
+        }
+
+        private sealed record PendingReceive(byte[] Buffer, Task<CarrierReceive> Operation);
     }
 
     private sealed class ActiveConnection
