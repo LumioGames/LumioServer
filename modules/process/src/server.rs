@@ -8,21 +8,20 @@
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use futures_util::StreamExt;
 use futures_util::sink::SinkExt;
-use serde_json::{Value, json};
+use futures_util::StreamExt;
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_hdr_async_with_config;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::ErrorResponse;
 use tokio_tungstenite::tungstenite::handshake::server::Request;
 use tokio_tungstenite::tungstenite::handshake::server::Response;
@@ -30,6 +29,8 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::Response as HttpResponse;
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 
 use crate::audit::SharedAudit;
 use crate::runtime_bridge::RuntimeBridge;
@@ -38,9 +39,9 @@ use crate::wire::ErrorCode;
 use crate::wire::Limits;
 use crate::wire::Role;
 use crate::wire::WireContract;
+use crate::world::run_world;
 use crate::world::WorldArgs;
 use crate::world::WorldOutcome;
-use crate::world::run_world;
 
 /// Prefix of the single-line readiness signal on stdout.
 pub const SERVER_READY_PREFIX: &str = "SERVER_READY ";
@@ -48,7 +49,7 @@ pub const SERVER_READY_PREFIX: &str = "SERVER_READY ";
 /// Egress channel item: a wire message or a server-initiated close.
 #[derive(Debug, Clone)]
 pub(crate) enum Egress {
-    /// Serialized wire JSON (HandshakeAck / FullSnapshot / Delta / Error).
+    /// Serialized wire JSON (`HandshakeAck` / `FullSnapshot` / `Delta` / `Error`).
     Text(String),
     /// Ask the writer to run the WebSocket close handshake.
     Close,
@@ -64,12 +65,12 @@ pub(crate) enum IngressEvent {
         /// Client-provided name.
         client_name: String,
     },
-    /// BaselineAck envelope.
+    /// `BaselineAck` envelope.
     BaselineAck {
         /// Acknowledged revision.
         revision: u64,
     },
-    /// InputCommand envelope (original JSON kept for the runtime bridge).
+    /// `InputCommand` envelope (original JSON kept for the runtime bridge).
     Command {
         /// Declared sender.
         sender: Role,
@@ -99,14 +100,11 @@ pub(crate) struct EnvelopeError {
 
 /// Events consumed by the world loop.
 #[derive(Debug)]
-#[allow(dead_code)] // Red-phase stub: all variants are consumed by the world implementation.
 pub(crate) enum WorldEvent {
     /// A connection completed the WebSocket handshake and registered.
     Opened {
         /// Server-assigned session id.
         session_id: String,
-        /// Remote socket address.
-        remote: String,
         /// World-held egress sender.
         egress: mpsc::Sender<Egress>,
         /// Per-session bounded ingress queue (capacity from the contract).
@@ -122,13 +120,6 @@ pub(crate) enum WorldEvent {
         session_id: String,
         /// The event.
         event: IngressEvent,
-    },
-    /// A connection's read loop ended (close frame, error, or fatal reject).
-    Disconnected {
-        /// Session id.
-        session_id: String,
-        /// Why the read loop ended (audit vocabulary).
-        code: &'static str,
     },
 }
 
@@ -190,26 +181,42 @@ pub async fn start(config: ServerConfig) -> Result<ServerInstance, String> {
 /// writer falls behind far enough that the session is closed instead.
 const EGRESS_CAPACITY: usize = 128;
 
+/// How long a closing reader keeps draining the peer's side of the close
+/// handshake before the connection is dropped.
+const CLOSE_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+
 /// Disconnection notifications from connection readers to the world.
 pub(crate) type DisconnectTx = Sender<(String, &'static str)>;
 
 /// Spawn the world loop and accept loop around an already-bound listener.
 fn spawn_server(listener: TcpListener, port: u16, config: ServerConfig) -> ServerInstance {
-    let ServerConfig { bridge, audit, contract } = config;
+    let ServerConfig {
+        bridge,
+        audit,
+        contract,
+    } = config;
     // The world inbox mirrors the per-session ingress bound so backpressure
     // reaches the reader queues (queue_full) instead of growing unbounded.
-    let (world_tx, world_rx) = mpsc::channel(contract.limits.ingress_queue_per_session);
+    let (inbox_tx, inbox_rx) = mpsc::channel(contract.limits.ingress_queue_per_session);
     let (disconnect_tx, disconnect_rx) = mpsc::channel::<(String, &'static str)>(32);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let world = tokio::spawn(run_world(WorldArgs {
         bridge,
         audit: std::sync::Arc::clone(&audit),
         contract: contract.clone(),
-        world_rx,
+        inbox_tx: mpsc::Sender::clone(&inbox_tx),
+        inbox_rx,
         disconnect_rx,
         shutdown_rx: shutdown_rx.clone(),
     }));
-    tokio::spawn(accept_loop(listener, world_tx, disconnect_tx, audit, contract, shutdown_rx));
+    tokio::spawn(accept_loop(
+        listener,
+        inbox_tx,
+        disconnect_tx,
+        audit,
+        contract,
+        shutdown_rx,
+    ));
     ServerInstance {
         port,
         pid: std::process::id(),
@@ -255,17 +262,26 @@ struct SubprotocolGuard {
 }
 
 impl tokio_tungstenite::tungstenite::handshake::server::Callback for SubprotocolGuard {
-    fn on_request(self, request: &Request, mut response: Response) -> Result<Response, ErrorResponse> {
-        subprotocol_guard(request, &mut response, &self.subprotocol)?;
+    fn on_request(
+        self,
+        request: &Request,
+        mut response: Response,
+    ) -> Result<Response, ErrorResponse> {
+        if let Err(boxed) = subprotocol_guard(request, &mut response, &self.subprotocol) {
+            return Err(*boxed);
+        }
         Ok(response)
     }
 }
 
+/// The callback trait fixes this signature; the boxed error keeps the (rarely
+/// constructed) HTTP error response off the hot path.
+#[allow(clippy::result_large_err)]
 fn subprotocol_guard(
     request: &Request,
     response: &mut Response,
     subprotocol: &str,
-) -> Result<(), ErrorResponse> {
+) -> Result<(), Box<ErrorResponse>> {
     let header = request
         .headers()
         .get("sec-websocket-protocol")
@@ -277,10 +293,12 @@ fn subprotocol_guard(
             .status(StatusCode::BAD_REQUEST)
             .body(Some(format!("subprotocol `{subprotocol}` is required")))
             .expect("static error response builds");
-        return Err(error);
+        return Err(Box::new(error));
     }
     if let Ok(value) = HeaderValue::from_str(subprotocol) {
-        response.headers_mut().insert("sec-websocket-protocol", value);
+        response
+            .headers_mut()
+            .insert("sec-websocket-protocol", value);
     }
     Ok(())
 }
@@ -298,7 +316,7 @@ async fn connection_task(
     let config = WebSocketConfig::default()
         .max_message_size(Some(frame_limit))
         .max_frame_size(Some(frame_limit));
-    let ws = match accept_hdr_async_with_config(
+    let Ok(ws) = accept_hdr_async_with_config(
         stream,
         SubprotocolGuard {
             subprotocol: subprotocol.clone(),
@@ -306,11 +324,10 @@ async fn connection_task(
         Some(config),
     )
     .await
-    {
-        Ok(ws) => ws,
+    else {
         // HTTP-level rejection (missing subprotocol) or a malformed opening
         // handshake: no session was opened, nothing to audit.
-        Err(_) => return,
+        return;
     };
 
     let session_id = next_session_id();
@@ -335,17 +352,15 @@ async fn connection_task(
 
     let opened = WorldEvent::Opened {
         session_id: session_id.clone(),
-        remote: remote.to_string(),
         egress: egress_tx,
         ingress_rx,
         reader,
         writer,
     };
-    if world_tx.send(opened).await.is_err() {
-        // The world is gone (shutdown race); aborting is safe here because
-        // the tasks own nothing but the socket and this connection's queues.
-        return;
-    }
+    // The world is gone (shutdown race): the send fails and the connection
+    // tasks finalize themselves — they own only the socket and this
+    // connection's queues.
+    let _ = world_tx.send(opened).await;
 }
 
 async fn writer_task(
@@ -389,45 +404,42 @@ async fn reader_task(
             None => break "client_closed",
         };
         match message {
-            Message::Text(text) => {
-                match parse_envelope(text.as_str(), &limits) {
-                    Ok(event) => {
-                        if let Some(code) = push_ingress(
-                            &ingress_tx,
-                            &egress_tx,
-                            &audit,
-                            &session_id,
-                            event,
-                        ) {
-                            break code;
-                        }
-                    }
-                    Err(error) => {
-                        if matches!(
-                            error.code,
-                            ErrorCode::UnsupportedContract
-                        ) || (error.code == ErrorCode::UnknownRole && error.fatal)
-                        {
-                            let mut log = audit.lock().expect("audit lock");
-                            log.handshake_rejected(
-                                &session_id,
-                                error.code.as_str(),
-                                &error.detail,
-                            );
-                        }
-                        let _ = egress_tx.try_send(Egress::Text(error_message(
-                            error.code,
-                            &error.detail,
-                            error.sender,
-                            error.sequence,
-                        )));
-                        if error.fatal {
-                            let _ = egress_tx.try_send(Egress::Close);
-                            break error.code.as_str();
-                        }
+            Message::Text(text) => match parse_envelope(text.as_str(), &limits) {
+                Ok(event) => {
+                    if let Some(code) =
+                        push_ingress(&ingress_tx, &egress_tx, &audit, &session_id, event)
+                    {
+                        break code;
                     }
                 }
-            }
+                Err(error) => {
+                    if matches!(error.code, ErrorCode::UnsupportedContract)
+                        || (error.code == ErrorCode::UnknownRole && error.fatal)
+                    {
+                        let mut log = audit.lock().expect("audit lock");
+                        log.handshake_rejected(&session_id, error.code.as_str(), &error.detail);
+                    }
+                    if let (Some(role), Some(sequence)) = (error.sender, error.sequence) {
+                        let mut log = audit.lock().expect("audit lock");
+                        log.ingress_rejected(
+                            &session_id,
+                            role.as_str(),
+                            sequence,
+                            error.code.as_str(),
+                        );
+                    }
+                    let _ = egress_tx.try_send(Egress::Text(error_message(
+                        error.code,
+                        &error.detail,
+                        error.sender,
+                        error.sequence,
+                    )));
+                    if error.fatal {
+                        let _ = egress_tx.try_send(Egress::Close);
+                        break error.code.as_str();
+                    }
+                }
+            },
             Message::Binary(_) => {
                 let _ = egress_tx.try_send(Egress::Text(error_message(
                     ErrorCode::BadEnvelope,
@@ -440,10 +452,27 @@ async fn reader_task(
             }
             Message::Close(_) => break "client_closed",
             // Ping/Pong are handled by tungstenite itself.
-            _ => continue,
+            _ => {}
         }
     };
-    let _ = disconnect_tx.try_send((session_id, code));
+    // Report the teardown reason first so the world can audit the real close
+    // code while the drain below is still protecting queued frames.
+    let _ = disconnect_tx.try_send((session_id.clone(), code));
+    // Finish the close handshake: keep draining (and discarding) frames until
+    // the peer closes or a short budget passes. Dropping the socket while the
+    // peer still has data in flight would reset the TCP connection and eat
+    // the Error/Close frames we just queued.
+    let deadline = tokio::time::Instant::now() + CLOSE_DRAIN_BUDGET;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(None | Some(Err(_) | Ok(Message::Close(_)))) | Err(_) => break,
+            Ok(Some(Ok(_))) => {}
+        }
+    }
 }
 
 /// Push one validated event into the bounded session queue.
@@ -458,7 +487,9 @@ fn push_ingress(
     event: IngressEvent,
 ) -> Option<&'static str> {
     let command_meta = match &event {
-        IngressEvent::Command { sender, sequence, .. } => Some((*sender, *sequence)),
+        IngressEvent::Command {
+            sender, sequence, ..
+        } => Some((*sender, *sequence)),
         _ => None,
     };
     match ingress_tx.try_send(event) {
@@ -466,7 +497,12 @@ fn push_ingress(
         Err(TrySendError::Full(_)) => {
             if let Some((role, sequence)) = command_meta {
                 let mut log = audit.lock().expect("audit lock");
-                log.ingress_rejected(session_id, role.as_str(), sequence, ErrorCode::QueueFull.as_str());
+                log.ingress_rejected(
+                    session_id,
+                    role.as_str(),
+                    sequence,
+                    ErrorCode::QueueFull.as_str(),
+                );
             }
             let _ = egress_tx.try_send(Egress::Text(error_message(
                 ErrorCode::QueueFull,
@@ -492,7 +528,12 @@ pub fn readiness_json(port: u16, pid: u32, contract_id: &str) -> String {
 /// # Errors
 ///
 /// Propagates filesystem errors from creating/writing the ready file.
-pub fn write_ready_file(path: &Path, port: u16, pid: u32, contract_id: &str) -> std::io::Result<()> {
+pub fn write_ready_file(
+    path: &Path,
+    port: u16,
+    pid: u32,
+    contract_id: &str,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -530,9 +571,8 @@ pub(crate) fn error_message(
     value.to_string()
 }
 
-/// Build a HandshakeAck wire message.
+/// Build a `HandshakeAck` wire message.
 #[must_use]
-#[allow(dead_code)] // Red-phase stub: consumed by the world implementation.
 pub(crate) fn handshake_ack(
     session_id: &str,
     role: Role,
@@ -552,9 +592,8 @@ pub(crate) fn handshake_ack(
     value.to_string()
 }
 
-/// Build a FullSnapshot wire message from a snapshot view.
+/// Build a `FullSnapshot` wire message from a snapshot view.
 #[must_use]
-#[allow(dead_code)] // Red-phase stub: consumed by the world implementation.
 pub(crate) fn full_snapshot(session_id: &str, view: &SnapshotView) -> String {
     json!({
         "messageType": "FullSnapshot",
@@ -577,18 +616,30 @@ fn bad(code: ErrorCode, detail: &str, fatal: bool) -> EnvelopeError {
 }
 
 fn field_u64(object: &serde_json::Map<String, Value>, name: &str) -> Result<u64, EnvelopeError> {
-    object
-        .get(name)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| bad(ErrorCode::BadEnvelope, &format!("field `{name}` must be an unsigned integer"), true))
+    object.get(name).and_then(Value::as_u64).ok_or_else(|| {
+        bad(
+            ErrorCode::BadEnvelope,
+            &format!("field `{name}` must be an unsigned integer"),
+            true,
+        )
+    })
 }
 
-fn field_string(object: &serde_json::Map<String, Value>, name: &str) -> Result<String, EnvelopeError> {
+fn field_string(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<String, EnvelopeError> {
     object
         .get(name)
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| bad(ErrorCode::BadEnvelope, &format!("field `{name}` must be a string"), true))
+        .ok_or_else(|| {
+            bad(
+                ErrorCode::BadEnvelope,
+                &format!("field `{name}` must be a string"),
+                true,
+            )
+        })
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -613,13 +664,22 @@ fn payload_sha256(payload: &str) -> String {
 ///
 /// Shape/const violations are `bad_envelope` (fatal); an unknown
 /// `messageType` is `unknown_mapping` (fatal, contract fieldSemantics); a
-/// payload hash mismatch is `bad_payload_hash` (recoverable); an InputCommand
-/// from an unparseable sender is `unknown_role` (recoverable).
+/// payload hash mismatch is `bad_payload_hash` (recoverable); an
+/// `InputCommand` from an unparseable sender is `unknown_role` (recoverable).
 pub(crate) fn parse_envelope(text: &str, limits: &Limits) -> Result<IngressEvent, EnvelopeError> {
-    let value: Value = serde_json::from_str(text)
-        .map_err(|error| bad(ErrorCode::BadEnvelope, &format!("not valid JSON: {error}"), true))?;
+    let value: Value = serde_json::from_str(text).map_err(|error| {
+        bad(
+            ErrorCode::BadEnvelope,
+            &format!("not valid JSON: {error}"),
+            true,
+        )
+    })?;
     let Value::Object(object) = &value else {
-        return Err(bad(ErrorCode::BadEnvelope, "envelope must be a JSON object", true));
+        return Err(bad(
+            ErrorCode::BadEnvelope,
+            "envelope must be a JSON object",
+            true,
+        ));
     };
     let message_type = object
         .get("messageType")
@@ -628,7 +688,9 @@ pub(crate) fn parse_envelope(text: &str, limits: &Limits) -> Result<IngressEvent
 
     match message_type {
         "Handshake" => parse_handshake(object),
-        "BaselineAck" => Ok(IngressEvent::BaselineAck { revision: revision(object)? }),
+        "BaselineAck" => Ok(IngressEvent::BaselineAck {
+            revision: revision(object)?,
+        }),
         "InputCommand" => parse_command(object, text, limits),
         // The Shutdown shape exists for in-process test vocabulary only; a
         // real server never accepts it from a client.
@@ -680,19 +742,30 @@ fn parse_command(
     let sequence = field_u64(object, "sequence")?;
     let kind = field_string(object, "kind")?;
     if kind != "hello" {
-        return Err(bad(ErrorCode::BadEnvelope, &format!("kind `{kind}` is not supported"), true));
+        return Err(bad(
+            ErrorCode::BadEnvelope,
+            &format!("kind `{kind}` is not supported"),
+            true,
+        ));
     }
     let payload = field_string(object, "payload")?;
     if payload.len() > limits.max_payload_bytes {
         return Err(bad(
             ErrorCode::BadEnvelope,
-            &format!("payload exceeds maxPayloadBytes ({})", limits.max_payload_bytes),
+            &format!(
+                "payload exceeds maxPayloadBytes ({})",
+                limits.max_payload_bytes
+            ),
             true,
         ));
     }
     let payload_sha = field_string(object, "payloadSha256")?;
     if !is_sha256_hex(&payload_sha) {
-        return Err(bad(ErrorCode::BadEnvelope, "payloadSha256 must be lowercase hex sha256", true));
+        return Err(bad(
+            ErrorCode::BadEnvelope,
+            "payloadSha256 must be lowercase hex sha256",
+            true,
+        ));
     }
     let _ = field_u64(object, "sentAtMs")?;
     let sender = sender.ok_or(EnvelopeError {
@@ -796,7 +869,13 @@ mod tests {
         assert_eq!(event, IngressEvent::BaselineAck { revision: 4 });
 
         let event = parse_envelope(&command_body().to_string(), &limits()).expect("command");
-        let IngressEvent::Command { sender, sequence, payload_sha256, envelope } = event else {
+        let IngressEvent::Command {
+            sender,
+            sequence,
+            payload_sha256,
+            envelope,
+        } = event
+        else {
             panic!("expected command");
         };
         assert_eq!(sender, Role::Browser);
@@ -857,28 +936,36 @@ mod tests {
         let mut body = command_body();
         body["kind"] = json!("move");
         assert_eq!(
-            parse_envelope(&body.to_string(), &limits()).unwrap_err().code,
+            parse_envelope(&body.to_string(), &limits())
+                .unwrap_err()
+                .code,
             ErrorCode::BadEnvelope
         );
 
         let mut body = command_body();
         body["payloadSha256"] = json!("nothex");
         assert_eq!(
-            parse_envelope(&body.to_string(), &limits()).unwrap_err().code,
+            parse_envelope(&body.to_string(), &limits())
+                .unwrap_err()
+                .code,
             ErrorCode::BadEnvelope
         );
 
         let mut body = command_body();
         body["sequence"] = json!(-1);
         assert_eq!(
-            parse_envelope(&body.to_string(), &limits()).unwrap_err().code,
+            parse_envelope(&body.to_string(), &limits())
+                .unwrap_err()
+                .code,
             ErrorCode::BadEnvelope
         );
 
         let mut body = command_body();
         body["payload"] = json!("x".repeat(4097));
         assert_eq!(
-            parse_envelope(&body.to_string(), &limits()).unwrap_err().code,
+            parse_envelope(&body.to_string(), &limits())
+                .unwrap_err()
+                .code,
             ErrorCode::BadEnvelope
         );
     }
@@ -921,7 +1008,11 @@ mod tests {
 
         let snapshot = full_snapshot(
             "s-1",
-            &SnapshotView { tick_id: 2, revision: 3, hello_log: vec![json!({"sender": "bot"})] },
+            &SnapshotView {
+                tick_id: 2,
+                revision: 3,
+                hello_log: vec![json!({"sender": "bot"})],
+            },
         );
         let value: Value = serde_json::from_str(&snapshot).expect("json");
         assert_eq!(value["messageType"], "FullSnapshot");

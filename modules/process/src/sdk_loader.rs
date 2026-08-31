@@ -5,10 +5,10 @@
 //! root table (`abiHash`, `buildId`), then probes `ping`. Any mismatch is a
 //! startup failure (exit code 1) naming the failed check.
 //!
-//! Root table layout: `engine/abi/native-abi.json` in the architecture repo,
-//! extended with the CoreCLR host slots (`create_clr_host`, `clr_host_call`,
-//! `destroy_clr_host`). This crate codes against the extended layout ahead of
-//! the schema update; the real DLL is exercised in the integration phase.
+//! Root table layout: `engine/abi/native-abi.json` in the architecture repo
+//! (commit cef0b03), including the `CoreCLR` host slots (`create_clr_host`,
+//! `clr_host_call`, `destroy_clr_host`). The real DLL is exercised in the
+//! integration phase.
 #![allow(unsafe_code)] // FFI boundary: unsafe is the point of this module.
 
 use std::ffi::c_void;
@@ -77,13 +77,13 @@ pub(crate) struct RootApiV1 {
     pub build_id: [u8; 16],
     /// Liveness probe: writes 1 into `*mut u32` marker, returns status.
     pub ping: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
-    /// Creates the CoreCLR host; resolves the managed entry fail-fast.
+    /// Creates the `CoreCLR` host; resolves the managed entry fail-fast.
     pub create_clr_host: Option<
         unsafe extern "C" fn(
-            *const u8,       // hostfxr_path (UTF-8 NUL-terminated)
-            *const u8,       // runtime_config_path
-            *const u8,       // assembly_path
-            *const u8,       // entry_spec: '<assembly-qualified type>;<method>'
+            *const u8,        // hostfxr_path (UTF-8 NUL-terminated)
+            *const u8,        // runtime_config_path
+            *const u8,        // assembly_path
+            *const u8,        // entry_spec: '<assembly-qualified type>;<method>'
             *mut *mut c_void, // out opaque handle
         ) -> i32,
     >,
@@ -98,7 +98,7 @@ pub(crate) struct RootApiV1 {
             *mut u32,    // out bytes_written
         ) -> i32,
     >,
-    /// Destroys the CoreCLR host.
+    /// Destroys the `CoreCLR` host.
     pub destroy_clr_host: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
 }
 
@@ -107,7 +107,7 @@ pub(crate) struct RootApiV1 {
 pub(crate) struct ClrCall {
     /// Raw status word (see [`SdkStatus`]).
     pub status: i32,
-    /// Bytes written (Success) or required size (BufferTooSmall).
+    /// Bytes written (`Success`) or required size (`BufferTooSmall`).
     pub written: u32,
 }
 
@@ -195,7 +195,10 @@ impl Display for LoadError {
             ),
             Self::InvalidRootTable(detail) => write!(f, "root API table invalid: {detail}"),
             Self::UnsupportedVersion(status) => {
-                write!(f, "entry symbol rejected ABI version {ABI_VERSION} (status {status})")
+                write!(
+                    f,
+                    "entry symbol rejected ABI version {ABI_VERSION} (status {status})"
+                )
             }
             Self::EntryMissing => write!(f, "export `{ENTRY_SYMBOL}` not found in DLL"),
             Self::LibraryLoadFailed(path) => write!(f, "LoadLibraryW failed: {}", path.display()),
@@ -219,7 +222,7 @@ fn hex(bytes: &[u8]) -> String {
 fn file_sha256(path: &Path) -> std::io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -309,7 +312,9 @@ pub(crate) fn verify_root_table(root: &RootApiV1, info: &BuildInfo) -> Result<()
         ("destroy_clr_host", root.destroy_clr_host.is_none()),
     ] {
         if slot {
-            return Err(LoadError::InvalidRootTable(format!("`{name}` slot is null")));
+            return Err(LoadError::InvalidRootTable(format!(
+                "`{name}` slot is null"
+            )));
         }
     }
     let abi_hash = hex(&root.abi_hash);
@@ -338,7 +343,7 @@ impl std::fmt::Debug for SdkLease {
     }
 }
 
-/// Opaque CoreCLR host handle.
+/// Opaque `CoreCLR` host handle.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ClrHostHandle(*mut c_void);
 
@@ -369,13 +374,14 @@ impl SdkLease {
     /// [`LoadError::PingFailed`] when the status is non-zero or the marker is
     /// not written.
     pub fn ping(&self) -> Result<(), LoadError> {
-        let ping = self.root.ping.ok_or_else(|| {
-            LoadError::InvalidRootTable("`ping` slot vanished".to_owned())
-        })?;
+        let ping = self
+            .root
+            .ping
+            .ok_or_else(|| LoadError::InvalidRootTable("`ping` slot vanished".to_owned()))?;
         let mut marker: u32 = 0;
         // SAFETY: ping writes a single u32 into our stack marker when the
         // pointer is non-null, which is exactly what we pass.
-        let status = unsafe { ping((&mut marker as *mut u32).cast::<c_void>()) };
+        let status = unsafe { ping(std::ptr::from_mut(&mut marker).cast::<c_void>()) };
         if status != 0 {
             return Err(LoadError::PingFailed(format!("status {status}")));
         }
@@ -385,10 +391,14 @@ impl SdkLease {
         Ok(())
     }
 
-    /// Create the CoreCLR host (safe wrapper over the root table slot).
+    /// Create the `CoreCLR` host (safe wrapper over the root table slot).
     ///
     /// `entry_spec` is `'<assembly-qualified type name>;<entry method name>'`
     /// (split at the last `;`), exactly as the ABI expects.
+    ///
+    /// The `CoreCLR` runtime cannot be unloaded and re-initialized within one
+    /// process: this must succeed at most once per process, balanced by one
+    /// [`Self::destroy_clr_host`] at shutdown.
     ///
     /// # Errors
     ///
@@ -418,7 +428,7 @@ impl SdkLease {
                 runtime_config.as_ptr(),
                 assembly.as_ptr(),
                 entry.as_ptr(),
-                &mut handle,
+                std::ptr::from_mut(&mut handle),
             )
         };
         if status != SdkStatus::Success as i32 || handle.is_null() {
@@ -465,12 +475,19 @@ impl SdkLease {
         // lengths are consistent with the buffers above (null only when the
         // matching length is zero) and `written` is valid storage.
         let status = unsafe {
-            call(handle.0, input_ptr, input_len, output_ptr, capacity, &mut written)
+            call(
+                handle.0,
+                input_ptr,
+                input_len,
+                output_ptr,
+                capacity,
+                std::ptr::from_mut(&mut written),
+            )
         };
         Ok(ClrCall { status, written })
     }
 
-    /// Destroy the CoreCLR host.
+    /// Destroy the `CoreCLR` host.
     ///
     /// # Errors
     ///
@@ -490,18 +507,6 @@ impl SdkLease {
             return Err(format!("destroy_clr_host failed with status {status}"));
         }
         Ok(())
-    }
-
-    /// Raw root table access for diagnostics.
-    #[allow(dead_code)] // Red-phase stub: consumed by the CLR bridge.
-    pub(crate) const fn root(&self) -> &RootApiV1 {
-        &self.root
-    }
-
-    /// Raw module handle (teardown only).
-    #[allow(dead_code)] // Red-phase stub: consumed by the CLR bridge.
-    pub(crate) const fn module(&self) -> isize {
-        self.module
     }
 }
 
@@ -545,7 +550,7 @@ pub fn load(native_path: &Path) -> Result<SdkLease, LoadError> {
     // SAFETY: the module handle is valid and non-zero; `load_entry` only uses
     // it for GetProcAddress and the root-table fetch, and hands it back inside
     // the returned lease (or it is freed by the caller below on error).
-    let lease = unsafe { load_entry(module, info) };
+    let lease = unsafe { load_entry(module, &info) };
     match lease {
         Ok(lease) => Ok(lease),
         Err(error) => {
@@ -557,7 +562,7 @@ pub fn load(native_path: &Path) -> Result<SdkLease, LoadError> {
     }
 }
 
-unsafe fn load_entry(module: isize, info: BuildInfo) -> Result<SdkLease, LoadError> {
+unsafe fn load_entry(module: isize, info: &BuildInfo) -> Result<SdkLease, LoadError> {
     let symbol = utf8_null(ENTRY_SYMBOL);
     // SAFETY: `symbol` is a valid null-terminated name and the module handle
     // is valid for the lifetime of this call.
@@ -571,7 +576,7 @@ unsafe fn load_entry(module: isize, info: BuildInfo) -> Result<SdkLease, LoadErr
 
     let mut root_ptr: *const RootApiV1 = std::ptr::null();
     // SAFETY: root_ptr is writable storage for one pointer.
-    let status = unsafe { entry(ABI_VERSION, &mut root_ptr) };
+    let status = unsafe { entry(ABI_VERSION, std::ptr::from_mut(&mut root_ptr)) };
     if status != 0 {
         return Err(LoadError::UnsupportedVersion(status));
     }
@@ -583,7 +588,7 @@ unsafe fn load_entry(module: isize, info: BuildInfo) -> Result<SdkLease, LoadErr
     // SAFETY: the SDK contract keeps the root table at static storage for the
     // lifetime of the module; we copy the plain-old-data table out.
     let root = unsafe { *root_ptr };
-    verify_root_table(&root, &info)?;
+    verify_root_table(&root, info)?;
 
     let lease = SdkLease { module, root };
     lease.ping()?;
@@ -803,11 +808,17 @@ mod tests {
         // destroy_clr_host at 80.
         assert_eq!(std::mem::size_of::<RootApiV1>(), 88);
         let root = sample_root();
-        let base = &root as *const RootApiV1 as usize;
-        assert_eq!(&root.ping as *const _ as usize - base, 56);
-        assert_eq!(&root.create_clr_host as *const _ as usize - base, 64);
-        assert_eq!(&root.clr_host_call as *const _ as usize - base, 72);
-        assert_eq!(&root.destroy_clr_host as *const _ as usize - base, 80);
+        let base = std::ptr::from_ref(&root) as usize;
+        assert_eq!(std::ptr::from_ref(&root.ping) as usize - base, 56);
+        assert_eq!(
+            std::ptr::from_ref(&root.create_clr_host) as usize - base,
+            64
+        );
+        assert_eq!(std::ptr::from_ref(&root.clr_host_call) as usize - base, 72);
+        assert_eq!(
+            std::ptr::from_ref(&root.destroy_clr_host) as usize - base,
+            80
+        );
     }
 
     #[test]

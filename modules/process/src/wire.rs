@@ -63,7 +63,7 @@ pub enum ErrorCode {
     BadPayloadHash,
     /// sequence is not above the committed watermark.
     DuplicateSequence,
-    /// BaselineAck references a revision other than the sent baseline.
+    /// `BaselineAck` references a revision other than the sent baseline.
     StaleRevision,
     /// sender is not a known role / does not match the session role.
     UnknownRole,
@@ -138,7 +138,7 @@ impl Display for ErrorCode {
 /// Numeric limits block of the contract; the server enforces these values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
-    /// Maximum UTF-8 byte length of an InputCommand payload.
+    /// Maximum UTF-8 byte length of an `InputCommand` payload.
     pub max_payload_bytes: usize,
     /// Maximum concurrently admitted sessions.
     pub max_sessions: usize,
@@ -148,7 +148,7 @@ pub struct Limits {
     pub hello_log_capacity: usize,
     /// Handshake must arrive within this budget after connect.
     pub handshake_timeout_ms: u64,
-    /// BaselineAck must arrive within this budget after FullSnapshot.
+    /// `BaselineAck` must arrive within this budget after `FullSnapshot`.
     pub baseline_timeout_ms: u64,
     /// Whole-scenario budget (consumed by the integration launcher).
     pub scenario_timeout_ms: u64,
@@ -254,9 +254,7 @@ fn validate(path: &Path, raw: &RawContract) -> Result<WireContract, String> {
         .ok_or_else(|| format!("{}missing roles", where_()))?;
     let roles = roles_raw
         .iter()
-        .map(|r| {
-            Role::parse(r).ok_or_else(|| format!("{}unknown role `{r}`", where_()))
-        })
+        .map(|r| Role::parse(r).ok_or_else(|| format!("{}unknown role `{r}`", where_())))
         .collect::<Result<Vec<Role>, String>>()?;
     if roles != [Role::Browser, Role::Bot] {
         return Err(format!(
@@ -270,9 +268,9 @@ fn validate(path: &Path, raw: &RawContract) -> Result<WireContract, String> {
         .clone()
         .ok_or_else(|| format!("{}missing limits", where_()))?;
     let positive = |field: &str, value: Option<usize>| {
-        value.filter(|v| *v > 0).ok_or_else(|| {
-            format!("{}limits.{field} must be present and positive", where_())
-        })
+        value
+            .filter(|v| *v > 0)
+            .ok_or_else(|| format!("{}limits.{field} must be present and positive", where_()))
     };
     let present = |field: &str, value: Option<u64>| {
         value.ok_or_else(|| format!("{}limits.{field} must be present", where_()))
@@ -383,10 +381,13 @@ mod tests {
     fn error_codes_match_contract_vocabulary() {
         assert_eq!(ErrorCode::all().len(), 12);
         for code in ErrorCode::all() {
-            assert_eq!(code.as_str().len() > 3, true);
+            assert!(code.as_str().len() > 3);
         }
         assert_eq!(ErrorCode::BadEnvelope.as_str(), "bad_envelope");
         assert_eq!(ErrorCode::QueueFull.as_str(), "queue_full");
-        assert_eq!(ErrorCode::UnsupportedContract.as_str(), "unsupported_contract");
+        assert_eq!(
+            ErrorCode::UnsupportedContract.as_str(),
+            "unsupported_contract"
+        );
     }
 }

@@ -8,8 +8,8 @@ async fn main() {
             println!("{}", lumio_server_process::cli::USAGE);
             std::process::exit(0);
         }
-        Ok(lumio_server_process::cli::Parsed::Args(args)) => {
-            std::process::exit(lumio_server_process::run(args).await);
+        Ok(lumio_server_process::cli::Parsed::Args(boxed)) => {
+            std::process::exit(lumio_server_process::run(*boxed).await);
         }
         Err(message) => {
             eprintln!("error: {message}\n\n{}", lumio_server_process::cli::USAGE);

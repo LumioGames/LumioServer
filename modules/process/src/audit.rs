@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Shared audit handle used by every server task.
 pub type SharedAudit = Arc<Mutex<AuditLog>>;
@@ -87,7 +87,10 @@ impl AuditLog {
 
     /// `session_open` — required: sessionId, remote.
     pub fn session_open(&mut self, session_id: &str, remote: &str) {
-        self.emit("session_open", json!({ "sessionId": session_id, "remote": remote }));
+        self.emit(
+            "session_open",
+            json!({ "sessionId": session_id, "remote": remote }),
+        );
     }
 
     /// `handshake_accepted` — required: sessionId, role, clientName.
@@ -116,7 +119,10 @@ impl AuditLog {
 
     /// `baseline_acked` — required: sessionId, revision.
     pub fn baseline_acked(&mut self, session_id: &str, revision: u64) {
-        self.emit("baseline_acked", json!({ "sessionId": session_id, "revision": revision }));
+        self.emit(
+            "baseline_acked",
+            json!({ "sessionId": session_id, "revision": revision }),
+        );
     }
 
     /// `ingress_received` — required: sessionId, sender, sequence, payloadSha256.
@@ -139,13 +145,7 @@ impl AuditLog {
     }
 
     /// `ingress_rejected` — required: sessionId, sender, sequence, code.
-    pub fn ingress_rejected(
-        &mut self,
-        session_id: &str,
-        sender: &str,
-        sequence: u64,
-        code: &str,
-    ) {
+    pub fn ingress_rejected(&mut self, session_id: &str, sender: &str, sequence: u64, code: &str) {
         self.emit(
             "ingress_rejected",
             json!({
@@ -158,7 +158,13 @@ impl AuditLog {
     }
 
     /// `tick_committed` — required: tickId, revision, deltaCount, senders.
-    pub fn tick_committed(&mut self, tick_id: u64, revision: u64, delta_count: usize, senders: &[String]) {
+    pub fn tick_committed(
+        &mut self,
+        tick_id: u64,
+        revision: u64,
+        delta_count: usize,
+        senders: &[String],
+    ) {
         self.emit(
             "tick_committed",
             json!({
@@ -195,12 +201,18 @@ impl AuditLog {
 
     /// `session_closed` — required: sessionId, code.
     pub fn session_closed(&mut self, session_id: &str, code: &str) {
-        self.emit("session_closed", json!({ "sessionId": session_id, "code": code }));
+        self.emit(
+            "session_closed",
+            json!({ "sessionId": session_id, "code": code }),
+        );
     }
 
     /// `server_shutdown` — required: reason, sessions.
     pub fn server_shutdown(&mut self, reason: &str, sessions: usize) {
-        self.emit("server_shutdown", json!({ "reason": reason, "sessions": sessions }));
+        self.emit(
+            "server_shutdown",
+            json!({ "reason": reason, "sessions": sessions }),
+        );
     }
 
     /// Sync the audit file to disk (shutdown gate before exit).
@@ -265,8 +277,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), KINDS.len());
         for (line, kind) in lines.iter().zip(KINDS) {
-            let event: Value =
-                serde_json::from_str(line).unwrap_or_else(|e| panic!("{kind}: {e}"));
+            let event: Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("{kind}: {e}"));
             assert_eq!(event["kind"], kind, "line: {line}");
             assert!(event["ts"].is_u64(), "ts missing on {kind}");
             for field in required_fields(kind) {

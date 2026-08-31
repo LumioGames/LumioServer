@@ -25,7 +25,7 @@ const VALUE_FLAGS: [&str; 10] = [
 pub struct Args {
     /// Native SDK DLL path (`lumio_engine_get_api_v1` provider).
     pub engine_native: PathBuf,
-    /// `hostfxr.dll` path for the CoreCLR host.
+    /// `hostfxr.dll` path for the `CoreCLR` host.
     pub hostfxr: PathBuf,
     /// `runtimeconfig.json` for the managed runtime.
     pub runtime_config: PathBuf,
@@ -33,7 +33,8 @@ pub struct Args {
     pub assembly: PathBuf,
     /// Entry type full name (`Lumio.GameRuntime.HelloEntry.HelloEntry, ...`).
     pub entry_type: String,
-    /// Entry method name (`lumio_hello_entry`).
+    /// Entry method name (`lumio_hello_entry`; the ABI joins it into
+    /// `'<type>;<method>'` — see [`crate::runtime_bridge::ClrStart`]).
     pub entry_method: String,
     /// Wire contract JSON (`hello-wire-v1.json`).
     pub wire_contract: PathBuf,
@@ -48,8 +49,8 @@ pub struct Args {
 /// Result of parsing the process arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
-    /// Runnable arguments.
-    Args(Args),
+    /// Runnable arguments (boxed: the variant dwarfs [`Parsed::Help`]).
+    Args(Box<Args>),
     /// `--help`/`-h` was requested; print [`USAGE`] and exit 0.
     Help,
 }
@@ -102,7 +103,7 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
             .ok_or_else(|| format!("missing required argument `{name}`"))
     };
 
-    Ok(Parsed::Args(Args {
+    Ok(Parsed::Args(Box::new(Args {
         engine_native: PathBuf::from(get("--engine-native")?),
         hostfxr: PathBuf::from(get("--hostfxr")?),
         runtime_config: PathBuf::from(get("--runtime-config")?),
@@ -116,7 +117,7 @@ pub fn parse(argv: &[String]) -> Result<Parsed, String> {
             .iter()
             .find(|(existing, _)| *existing == "--client")
             .map(|(_, value)| value.clone()),
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -162,9 +163,9 @@ mod tests {
 
     #[test]
     fn accepts_optional_client_flag() {
-        let mut argv = full();
-        argv.extend(["--client".to_owned(), "wwwroot".to_owned()]);
-        let Parsed::Args(args) = parse(&argv).expect("client flag parses") else {
+        let mut argument_list = full();
+        argument_list.extend(["--client".to_owned(), "wwwroot".to_owned()]);
+        let Parsed::Args(args) = parse(&argument_list).expect("client flag parses") else {
             panic!("expected runnable args");
         };
         assert_eq!(args.client.as_deref(), Some("wwwroot"));

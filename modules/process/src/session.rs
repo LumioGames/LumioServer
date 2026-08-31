@@ -15,7 +15,7 @@ use crate::wire::Role;
 pub enum SessionPhase {
     /// Connected, waiting for a Handshake envelope.
     AwaitHandshake,
-    /// Admitted, FullSnapshot sent, waiting for BaselineAck.
+    /// Admitted, `FullSnapshot` sent, waiting for `BaselineAck`.
     Baselined,
     /// Baseline acknowledged; may send commands and receive deltas.
     Active,
@@ -109,11 +109,11 @@ impl SessionTable {
         };
         state.phase = SessionPhase::Baselined;
         state.role = Some(role);
-        state.client_name = client_name.to_owned();
+        state.client_name = client_name.to_string();
         Ok(())
     }
 
-    /// Record the revision the FullSnapshot carried (enter [`SessionPhase::Baselined`]).
+    /// Record the revision the `FullSnapshot` carried (enter [`SessionPhase::Baselined`]).
     pub fn mark_baselined(&mut self, session_id: &str, revision: u64) {
         if let Some(state) = self.sessions.get_mut(session_id) {
             state.phase = SessionPhase::Baselined;
@@ -121,7 +121,7 @@ impl SessionTable {
         }
     }
 
-    /// BaselineAck accepted (enter [`SessionPhase::Active`]).
+    /// `BaselineAck` accepted (enter [`SessionPhase::Active`]).
     pub fn mark_active(&mut self, session_id: &str) {
         if let Some(state) = self.sessions.get_mut(session_id) {
             state.phase = SessionPhase::Active;
@@ -148,10 +148,12 @@ impl SessionTable {
         self.sessions.get(session_id).and_then(|s| s.role)
     }
 
-    /// Revision carried by the FullSnapshot sent to this session.
+    /// Revision carried by the `FullSnapshot` sent to this session.
     #[must_use]
     pub fn baselined_revision(&self, session_id: &str) -> Option<u64> {
-        self.sessions.get(session_id).and_then(|s| s.baselined_revision)
+        self.sessions
+            .get(session_id)
+            .and_then(|s| s.baselined_revision)
     }
 
     /// True when `sequence` is not strictly above the role's committed max.
@@ -210,10 +212,15 @@ mod tests {
         for id in ["s-1", "s-2", "s-3"] {
             table.open(id);
         }
-        table.admit("s-1", Role::Browser, "b").expect("browser admitted");
+        table
+            .admit("s-1", Role::Browser, "b")
+            .expect("browser admitted");
         table.admit("s-2", Role::Bot, "c").expect("bot admitted");
         // Third session: capacity fires before role uniqueness.
-        assert_eq!(table.admit("s-3", Role::Browser, "d"), Err(AdmissionError::SessionLimit));
+        assert_eq!(
+            table.admit("s-3", Role::Browser, "d"),
+            Err(AdmissionError::SessionLimit)
+        );
         assert_eq!(table.live_count(), 3);
     }
 
@@ -222,7 +229,9 @@ mod tests {
         let mut table = SessionTable::new(2);
         table.open("s-1");
         table.open("s-2");
-        table.admit("s-1", Role::Browser, "b").expect("first browser admitted");
+        table
+            .admit("s-1", Role::Browser, "b")
+            .expect("first browser admitted");
         assert_eq!(
             table.admit("s-2", Role::Browser, "c"),
             Err(AdmissionError::RoleTaken(Role::Browser))
@@ -240,7 +249,9 @@ mod tests {
         assert_eq!(table.phase("s-1"), Some(SessionPhase::Closed));
         assert_eq!(table.session_with_role(Role::Browser), None);
         table.open("s-2");
-        table.admit("s-2", Role::Browser, "b2").expect("role freed after close");
+        table
+            .admit("s-2", Role::Browser, "b2")
+            .expect("role freed after close");
     }
 
     #[test]

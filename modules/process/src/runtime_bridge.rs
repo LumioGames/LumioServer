@@ -12,11 +12,11 @@
 //! fields flat on the request root; a domain rejection answers `rc=0` with
 //! `{"ok":false,"code":"<wire code>"}`; a malformed request answers non-zero.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::sdk_loader::ClrHostHandle;
-use crate::sdk_loader::SdkStatus;
 use crate::sdk_loader::SdkLease;
+use crate::sdk_loader::SdkStatus;
 use crate::wire::ErrorCode;
 
 /// Initial output buffer for one op call (64 KiB, per the milestone brief).
@@ -43,7 +43,7 @@ pub struct SnapshotView {
     pub tick_id: u64,
     /// Current revision.
     pub revision: u64,
-    /// Hello log records (wire HelloRecord objects).
+    /// Hello log records (wire `HelloRecord` objects).
     pub hello_log: Vec<Value>,
 }
 
@@ -77,7 +77,7 @@ impl BridgeError {
 
 /// Authoritative runtime boundary owned by the world loop.
 pub trait RuntimeBridge: Send {
-    /// Queue one InputCommand envelope (full wire JSON).
+    /// Queue one `InputCommand` envelope (full wire JSON).
     ///
     /// # Errors
     ///
@@ -169,9 +169,10 @@ impl ClrBridge {
         let written = match SdkStatus::from_i32(result.status) {
             Some(SdkStatus::Success) => result.written,
             Some(SdkStatus::BufferTooSmall) => {
-                let required = usize::try_from(result.written).map_err(|_| BridgeError::Failed {
-                    detail: "required size overflow",
-                })?;
+                let required =
+                    usize::try_from(result.written).map_err(|_| BridgeError::Failed {
+                        detail: "required size overflow",
+                    })?;
                 if required > MAX_OUTPUT_BUFFER_BYTES || required <= output.len() {
                     return Err(BridgeError::Failed {
                         detail: "op response exceeds the output buffer bound",
@@ -197,7 +198,9 @@ impl ClrBridge {
                 });
             }
         };
-        let written = usize::try_from(written).unwrap_or(output.len()).min(output.len());
+        let written = usize::try_from(written)
+            .unwrap_or(output.len())
+            .min(output.len());
         String::from_utf8(output[..written].to_vec()).map_err(|_| BridgeError::Failed {
             detail: "op response is not UTF-8",
         })
@@ -264,8 +267,9 @@ pub fn shutdown_request() -> String {
 }
 
 fn expect_ok(response: &str) -> Result<(), BridgeError> {
-    let value: Value = serde_json::from_str(response)
-        .map_err(|_| BridgeError::Failed { detail: "malformed op response" })?;
+    let value: Value = serde_json::from_str(response).map_err(|_| BridgeError::Failed {
+        detail: "malformed op response",
+    })?;
     match value.get("ok").and_then(Value::as_bool) {
         Some(true) => Ok(()),
         Some(false) => {
@@ -276,7 +280,9 @@ fn expect_ok(response: &str) -> Result<(), BridgeError> {
                 .unwrap_or(ErrorCode::RuntimeFailure);
             Err(BridgeError::Rejected { code })
         }
-        None => Err(BridgeError::Failed { detail: "op response missing ok" }),
+        None => Err(BridgeError::Failed {
+            detail: "op response missing ok",
+        }),
     }
 }
 
@@ -383,7 +389,10 @@ pub(crate) mod tests {
 
     #[test]
     fn op_requests_carry_the_runtime_field_names() {
-        assert_eq!(serde_json::from_str::<Value>(&tick_request(7)).unwrap()["nowMs"], 7);
+        assert_eq!(
+            serde_json::from_str::<Value>(&tick_request(7)).unwrap()["nowMs"],
+            7
+        );
         assert_eq!(
             serde_json::from_str::<Value>(&snapshot_request()).unwrap()["op"],
             "snapshot"
@@ -419,17 +428,36 @@ pub(crate) mod tests {
     #[test]
     fn op_rejections_map_to_wire_codes() {
         for (body, code) in [
-            (r#"{"ok":false,"code":"duplicate_sequence"}"#, ErrorCode::DuplicateSequence),
-            (r#"{"ok":false,"code":"bad_payload_hash"}"#, ErrorCode::BadPayloadHash),
+            (
+                r#"{"ok":false,"code":"duplicate_sequence"}"#,
+                ErrorCode::DuplicateSequence,
+            ),
+            (
+                r#"{"ok":false,"code":"bad_payload_hash"}"#,
+                ErrorCode::BadPayloadHash,
+            ),
             (r#"{"ok":false,"code":"queue_full"}"#, ErrorCode::QueueFull),
-            (r#"{"ok":false,"code":"unknown_role"}"#, ErrorCode::UnknownRole),
-            (r#"{"ok":false,"code":"made_up"}"#, ErrorCode::RuntimeFailure),
+            (
+                r#"{"ok":false,"code":"unknown_role"}"#,
+                ErrorCode::UnknownRole,
+            ),
+            (
+                r#"{"ok":false,"code":"made_up"}"#,
+                ErrorCode::RuntimeFailure,
+            ),
             (r#"{"ok":false}"#, ErrorCode::RuntimeFailure),
         ] {
-            assert_eq!(expect_ok(body), Err(BridgeError::Rejected { code }), "{body}");
+            assert_eq!(
+                expect_ok(body),
+                Err(BridgeError::Rejected { code }),
+                "{body}"
+            );
         }
         assert_eq!(expect_ok(r#"{"ok":true}"#), Ok(()));
-        assert!(matches!(expect_ok("not json"), Err(BridgeError::Failed { .. })));
+        assert!(matches!(
+            expect_ok("not json"),
+            Err(BridgeError::Failed { .. })
+        ));
     }
 
     /// Gate that can hold the (sync) world loop inside `tick` so a test can
@@ -460,7 +488,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// In-test authoritative runtime: mirrors the real HelloEntry op protocol
+    /// In-test authoritative runtime: mirrors the real `HelloEntry` op protocol
     /// (runtime-shaped deltas without `messageType`) with injectable failures
     /// and an optional tick stall.
     pub(crate) struct TestBridge {
@@ -509,11 +537,10 @@ pub(crate) mod tests {
                     detail: "test-induced enqueue failure",
                 });
             }
-            let command: Value = serde_json::from_str(command_json).map_err(|_| {
-                BridgeError::Failed {
+            let command: Value =
+                serde_json::from_str(command_json).map_err(|_| BridgeError::Failed {
                     detail: "malformed command",
-                }
-            })?;
+                })?;
             self.pending.push_back(command);
             Ok(())
         }

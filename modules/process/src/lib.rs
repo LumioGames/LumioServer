@@ -1,7 +1,7 @@
 //! `lumio-server` — MS-00002 Hello World dedicated server process.
 //!
 //! Composition root for this milestone: dynamic-port loopback WebSocket
-//! listener, two-session admission, SDK DLL verification, CoreCLR runtime
+//! listener, two-session admission, SDK DLL verification, `CoreCLR` runtime
 //! bridge, authoritative tick routing and NDJSON audit. Wire truth is the
 //! architecture repo's `engine/wire/hello-wire-v1.json`, loaded at startup
 //! via `--wire-contract`; process behaviour (readiness, shutdown, exit codes,
@@ -13,8 +13,8 @@
 pub mod audit;
 pub mod cli;
 pub mod runtime_bridge;
-pub mod server;
 pub mod sdk_loader;
+pub mod server;
 pub mod session;
 pub mod wire;
 pub mod world;
@@ -55,7 +55,10 @@ pub async fn run(args: Args) -> i32 {
     let audit = match AuditLog::open(&args.audit_file) {
         Ok(audit) => Arc::new(Mutex::new(audit)),
         Err(error) => {
-            eprintln!("initialization failure: audit {}: {error}", args.audit_file.display());
+            eprintln!(
+                "initialization failure: audit {}: {error}",
+                args.audit_file.display()
+            );
             return 1;
         }
     };
@@ -83,7 +86,13 @@ pub async fn run(args: Args) -> i32 {
         }
     };
 
-    let instance = match server::start(ServerConfig { bridge: Box::new(bridge), audit: Arc::clone(&audit), contract: contract.clone() }).await {
+    let instance = match server::start(ServerConfig {
+        bridge: Box::new(bridge),
+        audit: Arc::clone(&audit),
+        contract: contract.clone(),
+    })
+    .await
+    {
         Ok(instance) => instance,
         Err(error) => {
             eprintln!("initialization failure: {error}");
@@ -91,8 +100,16 @@ pub async fn run(args: Args) -> i32 {
         }
     };
 
-    if let Err(error) = server::write_ready_file(&args.ready_file, instance.port, instance.pid, &contract.contract_id) {
-        eprintln!("initialization failure: ready file {}: {error}", args.ready_file.display());
+    if let Err(error) = server::write_ready_file(
+        &args.ready_file,
+        instance.port,
+        instance.pid,
+        &contract.contract_id,
+    ) {
+        eprintln!(
+            "initialization failure: ready file {}: {error}",
+            args.ready_file.display()
+        );
         return 1;
     }
     {

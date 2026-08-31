@@ -46,7 +46,7 @@ LumioServer 是七仓库体系中的 Rust Dedicated Server Host 与网络基础�
 
 | 模块 | 一句话职责 | 层 | 首批状态 |
 | --- | --- | --- | --- |
-| [process](process/README.md) | 进程入口与组装根：启动/关闭编排、信号、配置快照、进程级 Watchdog、组装期端口接线 | 组装根 | P0 |
+| [process](process/README.md) | 进程入口与组装根：启动/关闭编排、信号、配置快照、进程级 Watchdog、组装期端口接线 | 组装根 | P0（MS-00002 Hello World 垂直切片已实现） |
 | [host-runtime](host-runtime/README.md) | 单调时钟、Timer 服务、取消树、任务监督、有界执行原语 | 基础 | P0 |
 | [host-profiles](host-profiles/README.md) | Host Capability/Preset 声明与匹配、LocalEmbedded 保真约束、Fault Decorator 配置、测试 Host 组装矩阵 | 基础 | P1 |
 | [observability](observability/README.md) | 异步日志 Sink、Audit 队列与 durable ack、Metrics/Trace、Failure Bundle 装配、应急同步落盘与脱敏 | 基础 | P1 |
