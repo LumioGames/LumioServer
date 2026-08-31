@@ -18,6 +18,8 @@ internal sealed class ConnectionRegistry
 
     internal IReadOnlyCollection<ulong> ConnectionIds => this.entries.Keys;
 
+    internal int Count => this.entries.Count;
+
     internal bool TryGet(TransportConnectionId id, out ConnectionEntry entry)
         => this.entries.TryGetValue(id.Value, out entry!);
 
@@ -59,10 +61,17 @@ internal sealed class ConnectionEntry
     /// Principal evidence established by the carrier during channel upgrade.
     /// It is metadata only; credentials and nonce values are never retained.
     /// </summary>
-    internal TransportAuthenticationEvidence? AuthenticationEvidence { get; private set; }
+    internal (PrincipalId PrincipalId, string ProductId, string GameReleaseId)? AuthenticationMetadata { get; private set; }
+
+    private readonly object authenticationGate = new();
 
     /// <summary>per-connection ingress。Reliable 满载断连，Unreliable 丢弃并计数。</summary>
     internal IBoundedInbox<ValidatedEnvelopeBytes> Ingress { get; }
+
+    private readonly object ingressGate = new();
+    private long ingressQueuedBytes;
+    private bool hasInFlightIngress;
+    private int inFlightIngressBytes;
 
     // Drain may stop at a byte-budget boundary. Keep one item outside the
     // inbox so a frame that did not fit is still the next FIFO item.
@@ -70,58 +79,296 @@ internal sealed class ConnectionEntry
     private ValidatedEnvelopeBytes deferredIngress;
 
     internal int IngressCount
-        => this.Ingress.Count + (this.hasDeferredIngress ? 1 : 0);
+    {
+        get
+        {
+            lock (this.ingressGate)
+            {
+                return this.Ingress.Count
+                    + (this.hasDeferredIngress ? 1 : 0)
+                    + (this.hasInFlightIngress ? 1 : 0);
+            }
+        }
+    }
 
     internal bool TryTakeIngress(out ValidatedEnvelopeBytes item)
     {
-        if (this.hasDeferredIngress)
+        lock (this.ingressGate)
         {
-            item = this.deferredIngress;
-            this.deferredIngress = default;
-            this.hasDeferredIngress = false;
+            if (this.hasInFlightIngress)
+            {
+                throw new InvalidOperationException("Complete or defer the in-flight ingress item first");
+            }
+
+            if (this.hasDeferredIngress)
+            {
+                item = this.deferredIngress;
+                this.deferredIngress = default;
+                this.hasDeferredIngress = false;
+                this.hasInFlightIngress = true;
+                this.inFlightIngressBytes = item.Bytes.Length;
+                return true;
+            }
+
+            if (!this.Ingress.TryDequeue(out item))
+            {
+                return false;
+            }
+
+            this.hasInFlightIngress = true;
+            this.inFlightIngressBytes = item.Bytes.Length;
             return true;
         }
-
-        return this.Ingress.TryDequeue(out item);
     }
 
     internal void DeferIngress(in ValidatedEnvelopeBytes item)
     {
-        if (this.hasDeferredIngress)
+        lock (this.ingressGate)
         {
-            throw new InvalidOperationException("Only one ingress item may be deferred");
-        }
+            if (!this.hasInFlightIngress || this.inFlightIngressBytes != item.Bytes.Length)
+            {
+                throw new InvalidOperationException("No matching ingress item is in flight");
+            }
 
-        this.deferredIngress = item;
-        this.hasDeferredIngress = true;
+            if (this.hasDeferredIngress)
+            {
+                throw new InvalidOperationException("Only one ingress item may be deferred");
+            }
+
+            this.deferredIngress = item;
+            this.hasDeferredIngress = true;
+            this.hasInFlightIngress = false;
+            this.inFlightIngressBytes = 0;
+        }
+    }
+
+    internal void CommitIngressTake()
+    {
+        lock (this.ingressGate)
+        {
+            if (!this.hasInFlightIngress)
+            {
+                return;
+            }
+
+            this.ingressQueuedBytes -= this.inFlightIngressBytes;
+            this.hasInFlightIngress = false;
+            this.inFlightIngressBytes = 0;
+        }
     }
 
     internal EnqueueResult TryEnqueueIngress(in ValidatedEnvelopeBytes item)
     {
-        if (this.IngressCount >= this.Ingress.Budget.MaxItems)
+        lock (this.ingressGate)
         {
-            return new EnqueueResult(EnqueueStatus.Full, "QueueFull");
-        }
+            if (this.Ingress.Count
+                    + (this.hasDeferredIngress ? 1 : 0)
+                    + (this.hasInFlightIngress ? 1 : 0) >= this.Ingress.Budget.MaxItems
+                || item.Bytes.Length > this.Ingress.Budget.MaxBytes - this.ingressQueuedBytes)
+            {
+                return new EnqueueResult(EnqueueStatus.Full, "QueueFull");
+            }
 
-        return this.Ingress.TryEnqueue(in item);
+            var result = this.Ingress.TryEnqueue(in item);
+            if (result.Status == EnqueueStatus.Accepted)
+            {
+                this.ingressQueuedBytes += item.Bytes.Length;
+            }
+
+            return result;
+        }
     }
 
     internal void ClearDeferredIngress()
     {
-        this.deferredIngress = default;
-        this.hasDeferredIngress = false;
+        lock (this.ingressGate)
+        {
+            while (this.Ingress.TryDequeue(out _))
+            {
+            }
+
+            if (this.hasDeferredIngress)
+            {
+                this.deferredIngress = default;
+                this.hasDeferredIngress = false;
+            }
+
+            if (this.hasInFlightIngress)
+            {
+                this.hasInFlightIngress = false;
+                this.inFlightIngressBytes = 0;
+            }
+
+            this.ingressQueuedBytes = 0;
+        }
     }
 
     /// <summary>per-connection egress。</summary>
     internal IBoundedInbox<OutboundEnvelopeBytes> Egress { get; }
 
+    private readonly object egressGate = new();
+    private long egressQueuedBytes;
+    private bool hasInFlightEgress;
+    private int inFlightEgressBytes;
+
+    private bool hasDeferredEgress;
+    private OutboundEnvelopeBytes deferredEgress;
+
+    internal int EgressCount
+    {
+        get
+        {
+            lock (this.egressGate)
+            {
+                return this.Egress.Count
+                    + (this.hasDeferredEgress ? 1 : 0)
+                    + (this.hasInFlightEgress ? 1 : 0);
+            }
+        }
+    }
+
+    internal bool TryTakeEgress(out OutboundEnvelopeBytes item)
+    {
+        lock (this.egressGate)
+        {
+            if (this.hasInFlightEgress)
+            {
+                throw new InvalidOperationException("Complete or defer the in-flight egress item first");
+            }
+
+            if (this.hasDeferredEgress)
+            {
+                item = this.deferredEgress;
+                this.deferredEgress = default;
+                this.hasDeferredEgress = false;
+                this.hasInFlightEgress = true;
+                this.inFlightEgressBytes = item.Bytes.Length;
+                return true;
+            }
+
+            if (!this.Egress.TryDequeue(out item))
+            {
+                return false;
+            }
+
+            this.hasInFlightEgress = true;
+            this.inFlightEgressBytes = item.Bytes.Length;
+            return true;
+        }
+    }
+
+    internal void DeferEgress(in OutboundEnvelopeBytes item)
+    {
+        lock (this.egressGate)
+        {
+            if (!this.hasInFlightEgress || this.inFlightEgressBytes != item.Bytes.Length)
+            {
+                throw new InvalidOperationException("No matching egress item is in flight");
+            }
+
+            if (this.hasDeferredEgress)
+            {
+                throw new InvalidOperationException("Only one egress item may be deferred");
+            }
+
+            this.deferredEgress = item;
+            this.hasDeferredEgress = true;
+            this.hasInFlightEgress = false;
+            this.inFlightEgressBytes = 0;
+        }
+    }
+
+    internal void CommitEgressTake()
+    {
+        lock (this.egressGate)
+        {
+            if (!this.hasInFlightEgress)
+            {
+                return;
+            }
+
+            this.egressQueuedBytes -= this.inFlightEgressBytes;
+            this.hasInFlightEgress = false;
+            this.inFlightEgressBytes = 0;
+        }
+    }
+
+    internal EnqueueResult TryEnqueueEgress(in OutboundEnvelopeBytes item)
+    {
+        lock (this.egressGate)
+        {
+            if (this.Egress.Count
+                    + (this.hasDeferredEgress ? 1 : 0)
+                    + (this.hasInFlightEgress ? 1 : 0) >= this.Egress.Budget.MaxItems
+                || item.Bytes.Length > this.Egress.Budget.MaxBytes - this.egressQueuedBytes)
+            {
+                return new EnqueueResult(EnqueueStatus.Full, "QueueFull");
+            }
+
+            var result = this.Egress.TryEnqueue(in item);
+            if (result.Status == EnqueueStatus.Accepted)
+            {
+                this.egressQueuedBytes += item.Bytes.Length;
+            }
+
+            return result;
+        }
+    }
+
+    internal void ClearDeferredEgress()
+    {
+        lock (this.egressGate)
+        {
+            while (this.Egress.TryDequeue(out _))
+            {
+            }
+
+            if (this.hasDeferredEgress)
+            {
+                this.deferredEgress = default;
+                this.hasDeferredEgress = false;
+            }
+            if (this.hasInFlightEgress)
+            {
+                this.hasInFlightEgress = false;
+                this.inFlightEgressBytes = 0;
+            }
+
+            this.egressQueuedBytes = 0;
+        }
+    }
+
+    internal ConnectionCloseReason? PendingCloseReason { get; private set; }
+
+    internal string? PendingCloseStableErrorId { get; private set; }
+
+    internal MonotonicInstant? PendingCloseDeadline { get; private set; }
+
+    internal void SetPendingClose(
+        ConnectionCloseReason reason,
+        string? stableErrorId,
+        MonotonicInstant deadline)
+    {
+        this.PendingCloseReason = reason;
+        this.PendingCloseStableErrorId = stableErrorId;
+        this.PendingCloseDeadline ??= deadline;
+    }
+
+    internal void ClearPendingClose()
+    {
+        this.PendingCloseReason = null;
+        this.PendingCloseStableErrorId = null;
+        this.PendingCloseDeadline = null;
+    }
+
     internal int UnreliableDropCount { get; private set; }
 
     internal long InboundBytesThisMessage { get; private set; }
 
-    internal int InboundMessagesInWindow { get; private set; }
-
-    internal MonotonicInstant RateWindowStart { get; private set; }
+    private readonly object rateGate = new();
+    private long inboundRateCredit =
+        (long)TransportProvisionalLimits.InboundBurst * TimeSpan.TicksPerSecond;
+    private long inboundRateLastRefillTicks;
 
     internal MonotonicInstant LastActivity { get; private set; }
 
@@ -173,8 +420,48 @@ internal sealed class ConnectionEntry
         this.Grant = default;
     }
 
-    internal void SetAuthenticationEvidence(TransportAuthenticationEvidence? evidence)
-        => this.AuthenticationEvidence = evidence;
+    internal void SetAuthenticationMetadata(
+        PrincipalId principalId,
+        string productId,
+        string gameReleaseId)
+    {
+        lock (this.authenticationGate)
+        {
+            this.AuthenticationMetadata = (principalId, productId, gameReleaseId);
+        }
+    }
+
+    internal bool TryTakeAuthenticationMetadata(
+        out PrincipalId principalId,
+        out string productId,
+        out string gameReleaseId)
+    {
+        lock (this.authenticationGate)
+        {
+            var metadata = this.AuthenticationMetadata;
+            this.AuthenticationMetadata = null;
+            if (metadata is not { } value)
+            {
+                principalId = default;
+                productId = string.Empty;
+                gameReleaseId = string.Empty;
+                return false;
+            }
+
+            principalId = value.PrincipalId;
+            productId = value.ProductId;
+            gameReleaseId = value.GameReleaseId;
+            return true;
+        }
+    }
+
+    internal void ClearAuthenticationMetadata()
+    {
+        lock (this.authenticationGate)
+        {
+            this.AuthenticationMetadata = null;
+        }
+    }
 
     internal void CountUnreliableDrop() => this.UnreliableDropCount++;
 
@@ -189,16 +476,29 @@ internal sealed class ConnectionEntry
     /// <summary>限流窗口：稳态速率 + 突发上限，超限按可拒绝处理（只断该连接）。</summary>
     internal bool TryAdmitInbound(MonotonicInstant now)
     {
-        var windowTicks = TimeSpan.TicksPerSecond;
-
-        if (now.Ticks - this.RateWindowStart.Ticks >= windowTicks)
+        lock (this.rateGate)
         {
-            this.RateWindowStart = now;
-            this.InboundMessagesInWindow = 0;
-        }
+            var capacity = (long)TransportProvisionalLimits.InboundBurst * TimeSpan.TicksPerSecond;
+            if (now.Ticks > this.inboundRateLastRefillTicks)
+            {
+                var elapsed = now.Ticks - this.inboundRateLastRefillTicks;
+                var headroom = capacity - this.inboundRateCredit;
+                var refillRate = TransportProvisionalLimits.InboundMessagesPerSecond;
+                var saturatingElapsed = (headroom + refillRate - 1) / refillRate;
+                this.inboundRateCredit = elapsed >= saturatingElapsed
+                    ? capacity
+                    : this.inboundRateCredit + (elapsed * refillRate);
+                this.inboundRateLastRefillTicks = now.Ticks;
+            }
 
-        this.InboundMessagesInWindow++;
-        return this.InboundMessagesInWindow <= TransportProvisionalLimits.InboundBurst;
+            if (this.inboundRateCredit < TimeSpan.TicksPerSecond)
+            {
+                return false;
+            }
+
+            this.inboundRateCredit -= TimeSpan.TicksPerSecond;
+            return true;
+        }
     }
 }
 

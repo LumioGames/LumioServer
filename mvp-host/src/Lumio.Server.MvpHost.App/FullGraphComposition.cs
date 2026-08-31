@@ -40,6 +40,8 @@ internal sealed class FullGraphComposition : IAsyncDisposable
     private readonly WorldSlotHost worldSlot;
     private readonly ReferenceWorldSimulation simulation;
     private readonly SessionRegistry sessions;
+    private readonly MvpPacingController pacing;
+    private readonly IBoundedInbox<SessionEvent> sessionEvents;
     private readonly IBoundedInbox<WorldSlotEvent> worldEvents;
     private readonly MultiplexedIngress worldIngress;
     private readonly INamedThreadSupervisor threads;
@@ -48,9 +50,9 @@ internal sealed class FullGraphComposition : IAsyncDisposable
     private readonly object sessionsGate = new();
     private readonly TaskCompletionSource<object?> faultSignal = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<object?> completionSignal = new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
     private ulong observedRevision;
-    private ulong nextTick;
-    private bool tickPermitOutstanding;
     private volatile bool fatalFault;
     private bool disposed;
 
@@ -62,6 +64,8 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         WorldSlotHost worldSlot,
         ReferenceWorldSimulation simulation,
         SessionRegistry sessions,
+        MvpPacingController pacing,
+        IBoundedInbox<SessionEvent> sessionEvents,
         IBoundedInbox<WorldSlotEvent> worldEvents,
         MultiplexedIngress worldIngress,
         INamedThreadSupervisor threads,
@@ -74,6 +78,8 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         this.worldSlot = worldSlot;
         this.simulation = simulation;
         this.sessions = sessions;
+        this.pacing = pacing;
+        this.sessionEvents = sessionEvents;
         this.worldEvents = worldEvents;
         this.worldIngress = worldIngress;
         this.threads = threads;
@@ -194,8 +200,9 @@ internal sealed class FullGraphComposition : IAsyncDisposable
             options.ReconnectWindowSeconds,
             SessionProvisionalDefaults.AdmissionAttemptBudget,
             options.EnableTestControl);
+        var sessionWorldSlot = new SessionWorldSlotPort(worldSlot);
         var sessions = SessionRegistry.Create(
-            worldSlot,
+            sessionWorldSlot,
             authorization,
             transport,
             transport,
@@ -206,6 +213,9 @@ internal sealed class FullGraphComposition : IAsyncDisposable
             PlatformModule.CreateOutbox(sessionEvents),
             observability,
             in sessionConfig);
+        sessions.AttachEventInbox(sessionEvents);
+        worldSlot.AttachEventInbox(worldEvents);
+        var pacing = new MvpPacingController(worldSlot, clock, timers);
 
         return new FullGraphComposition(
             options.ProductId,
@@ -215,6 +225,8 @@ internal sealed class FullGraphComposition : IAsyncDisposable
             worldSlot,
             simulation,
             sessions,
+            pacing,
+            sessionEvents,
             worldEvents,
             worldIngress,
             threads,
@@ -231,6 +243,7 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                 $"WorldSlot failed to start: {started.StableErrorId ?? "InternalInvariant"}");
         }
 
+        pacing.Start();
         // The accept and transport calls are owned by one named supervisor
         // thread; no untracked Task.Run/background thread is introduced by App.
         _ = threads.Start("mvp-host-pump", new PumpBody(this));
@@ -240,6 +253,16 @@ internal sealed class FullGraphComposition : IAsyncDisposable
 
     internal Task FatalTask => faultSignal.Task;
 
+    internal Task CompletionTask => completionSignal.Task;
+
+    internal AckResult BeginShutdown(MonotonicInstant deadline)
+    {
+        lock (sessionsGate)
+        {
+            return sessions.BeginDrain(deadline);
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (disposed)
@@ -248,6 +271,7 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         }
 
         disposed = true;
+        pacing.Dispose();
         sessions.Dispose();
         // Closing the carrier first releases the blocking AcceptAsync call in
         // the named pump thread; the remaining owners can then join promptly.
@@ -255,22 +279,6 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         worldSlot.Dispose();
         transport.Dispose();
         _ = trace;
-    }
-
-    private void QueueTickPermit()
-    {
-        if (tickPermitOutstanding || worldSlot.State != WorldSlotHostState.Running)
-        {
-            return;
-        }
-
-        var result = worldSlot.EnqueueTickPermit(
-            new LogicalTickToken(++nextTick),
-            worldSlot.Epoch);
-        if (result.Status == EnqueueStatus.Accepted)
-        {
-            tickPermitOutstanding = true;
-        }
     }
 
     private sealed class PumpBody(FullGraphComposition owner) : IThreadBody
@@ -284,6 +292,13 @@ internal sealed class FullGraphComposition : IAsyncDisposable
 
             try
             {
+                owner.transport.PumpCommandsOnce();
+                lock (owner.sessionsGate)
+                {
+                    owner.sessions.PumpOnce();
+                }
+                owner.ProcessSessionEvents();
+
                 // PollingByteCarrier bounds each wait, so every connection gets
                 // a receive/send turn on this single TransportService writer.
                 _ = owner.transport.TryAcceptOne();
@@ -307,17 +322,36 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                 }
 
                 owner.ProcessEvents();
-                owner.QueueTickPermit();
+                owner.ProcessSessionEvents();
                 owner.ProcessWorldEvents();
+                if (owner.completionSignal.Task.IsCompleted)
+                {
+                    return new ThreadStepResult(false, null);
+                }
+
                 var revision = owner.simulation.AuthorityRevision;
                 if (revision != owner.observedRevision)
                 {
-                    owner.observedRevision = revision;
+                    AckResult revisionResult;
                     lock (owner.sessionsGate)
                     {
-                        _ = owner.sessions.NotifyAuthorityRevision(revision);
+                        revisionResult = owner.sessions.NotifyAuthorityRevision(revision);
                         owner.sessions.PumpOnce();
                     }
+
+                    if (!revisionResult.Accepted)
+                    {
+                        // A revision conflict means the session replication
+                        // cursor no longer agrees with the authoritative owner.
+                        // Continuing would silently lose a state transition, so
+                        // fail-stop and leave the conflict observable to the host.
+                        owner.MarkFatalFault();
+                        return new ThreadStepResult(
+                            false,
+                            revisionResult.StableErrorId ?? "RevisionConflict");
+                    }
+
+                    owner.observedRevision = revision;
                 }
 
                 if (owner.worldSlot.State == WorldSlotHostState.Faulted || owner.fatalFault)
@@ -379,8 +413,27 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                 case ConnectionEvent.HandshakeEnvelope handshakeEvent:
                     lock (sessionsGate)
                     {
-                        _ = sessions.HandleConnectionEvent(in connectionEvent);
-                        sessions.PumpOnce();
+                        if (!transport.TryTakeAuthenticationMetadata(
+                                handshakeEvent.Id,
+                                handshakeEvent.Epoch,
+                                out var principal,
+                                out var authenticatedProductId,
+                                out var authenticatedGameReleaseId))
+                        {
+                            _ = transport.TrySend(new ConnectionCommand.Close(
+                                handshakeEvent.Id,
+                                handshakeEvent.Epoch,
+                                ConnectionCloseReason.PolicyReject));
+                        }
+                        else
+                        {
+                            _ = sessions.HandleAuthenticatedConnectionEvent(
+                                in handshakeEvent,
+                                principal,
+                                authenticatedProductId,
+                                authenticatedGameReleaseId);
+                            sessions.PumpOnce();
+                        }
                     }
                     UpdateEpoch(handshakeEvent.Id);
                     break;
@@ -452,6 +505,13 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         }
     }
 
+    private void ProcessSessionEvents()
+    {
+        while (sessions.TryDequeueEvent(out _))
+        {
+        }
+    }
+
     private static EnqueueResult RouteIngress(
         AckResult sessionResult,
         MultiplexedIngress ingress,
@@ -514,18 +574,37 @@ internal sealed class FullGraphComposition : IAsyncDisposable
     {
         // WorldSlot owns simulation state. Consume its typed event lane only to
         // surface a fail-stop event to the process boundary.
-        while (worldEvents.TryDequeue(out var evt))
+        while (worldSlot.TryDequeueEvent(out var evt))
         {
             if (evt is WorldSlotEvent.TickCompleted)
             {
-                tickPermitOutstanding = false;
+                continue;
             }
-            else if (evt is WorldSlotEvent.FaultAdjudicated)
+            else if (evt is WorldSlotEvent.FaultAdjudicated fault)
             {
-                MarkFatalFault();
+                if (ShouldEscalateFault(fault.Adjudication))
+                {
+                    MarkFatalFault();
+                }
+                else
+                {
+                    lock (sessionsGate)
+                    {
+                        sessions.RecordUnroutableSessionFault(
+                            fault.Epoch,
+                            fault.Adjudication.FaultClass);
+                    }
+                }
+            }
+            else if (evt is WorldSlotEvent.ReadyToStop)
+            {
+                completionSignal.TrySetResult(null);
             }
         }
     }
+
+    internal static bool ShouldEscalateFault(in FaultAdjudication adjudication)
+        => adjudication.SlotMustFailStop;
 
     private sealed class MultiplexedIngress : IIngressReader
     {
@@ -589,7 +668,7 @@ internal sealed class FullGraphComposition : IAsyncDisposable
     /// CancellationToken.None; cancelling a Kestrel WebSocket ReceiveAsync aborts
     /// the socket and turns an idle connection into a false transport close.
     /// </summary>
-    private sealed class PollingByteCarrier : IByteCarrier
+    private sealed class PollingByteCarrier : IByteCarrier, ITransportAuthenticationMetadataSource
     {
         private static readonly CarrierAccept NoAccept =
             new(false, default, ImmutableArray<string>.Empty);
@@ -638,6 +717,39 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                 this.ClearAccept(operation);
                 throw;
             }
+        }
+
+        bool ITransportAuthenticationMetadataSource.TryTakeAuthenticationMetadata(
+            TransportConnectionId connectionId,
+            ConnectionEpoch connectionEpoch,
+            out PrincipalId principalId,
+            out string productId,
+            out string gameReleaseId)
+        {
+            if (this.inner is WebSocketByteCarrier webSocket)
+            {
+                return webSocket.TryTakeAuthenticationMetadata(
+                    connectionId,
+                    connectionEpoch,
+                    out principalId,
+                    out productId,
+                    out gameReleaseId);
+            }
+
+            if (this.inner is ITransportAuthenticationMetadataSource source)
+            {
+                return source.TryTakeAuthenticationMetadata(
+                    connectionId,
+                    connectionEpoch,
+                    out principalId,
+                    out productId,
+                    out gameReleaseId);
+            }
+
+            principalId = default;
+            productId = string.Empty;
+            gameReleaseId = string.Empty;
+            return false;
         }
 
         public async ValueTask<CarrierReceive> ReceiveAsync(
@@ -774,6 +886,58 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         internal ConnectionEpoch Epoch { get; set; }
 
         internal ulong NextSequence() => ++sequence;
+    }
+
+    private sealed class SessionWorldSlotPort(WorldSlotHost owner)
+        : IWorldSlotHost, ISessionWorldSlotPort
+    {
+        public AdmissionGateState Gate => owner.Gate;
+
+        public QuotaView Capacity => owner.Capacity;
+
+        public AllocateResult Allocate(in SlotBudget budget) => owner.Allocate(in budget);
+
+        public SessionReservationResult ReserveAdmission(
+            AdmissionAttemptId attempt,
+            ServerSessionId session)
+        {
+            var result = owner.ReserveAdmission(attempt, session);
+            return new SessionReservationResult(
+                result.Reserved,
+                result.Reservation,
+                result.Epoch,
+                result.SlotId,
+                result.StableErrorId);
+        }
+
+        public AckResult BindSession(
+            SlotReservationId reservation,
+            ServerSessionId session,
+            SlotEpoch epoch)
+            => owner.BindSession(reservation, session, epoch);
+
+        public AckResult AbortAdmission(SlotReservationId reservation, SlotEpoch epoch)
+            => owner.AbortAdmission(reservation, epoch);
+
+        public AckResult ReleaseCommittedReservation(
+            SlotReservationId reservation,
+            ServerSessionId session,
+            SlotEpoch epoch)
+            => owner.ReleaseCommittedReservation(reservation, session, epoch);
+
+        public AckResult Quiesce(string reason, SlotEpoch epoch)
+            => owner.Quiesce(reason, epoch.Value == 0 ? owner.Epoch : epoch);
+
+        public SnapshotCutRef FixSnapshotCut(SlotEpoch epoch)
+            => owner.FixSnapshotCut(epoch);
+
+        public AckResult Destroy(SlotEpoch epoch) => owner.Destroy(epoch);
+
+        public AckResult ReportFault(
+            string registeredErrorCode,
+            HostFaultClass faultClass,
+            SlotEpoch epoch)
+            => owner.ReportFault(registeredErrorCode, faultClass, epoch);
     }
 }
 #endif

@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Net;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
@@ -17,6 +20,20 @@ public static class SmokeClientRunner
     private const int AntiReplayWindow = 1_024;
     private const string AuthBinding = "SessionAdmission";
     private const string ErrorClass = "Rejectable";
+    private static readonly string[] FullSnapshotBodyKeys =
+    {
+        "snapshotId", "tickId", "sessionRevisionVector", "schemaEpoch", "mappingSetHash",
+    };
+    private static readonly string[] SessionRevisionVectorKeys =
+    {
+        "tickId", "gameRevision", "voxelWorldRevision", "chunkRevisionSet",
+        "replicationRevision", "configRevision", "schemaEpoch",
+    };
+    private static readonly string[] DeltaBodyKeys =
+    {
+        "baseSnapshotId", "fromRevision", "toRevision", "mappingSetHash",
+        "confirmationSequence", "tombstones",
+    };
 
     public static async Task<int> RunAsync(
         SmokeClientCommandLineOptions options,
@@ -51,7 +68,7 @@ public static class SmokeClientRunner
                 "replay-nonce" => await RunReplayScenarioAsync(options, trace, token, cancellationToken).ConfigureAwait(false),
                 "release-mismatch" => await RunExpectedReleaseRejectAsync(options, trace, token, cancellationToken).ConfigureAwait(false),
                 "oversize-message" => await RunExpectedOversizeRejectAsync(options, trace, token, cancellationToken).ConfigureAwait(false),
-                "stale-generation" => await RunExpectedStaleRejectAsync(options, trace, token, cancellationToken).ConfigureAwait(false),
+                "stale-generation" => ReportUnprovableStaleGeneration(trace),
                 "reconnect" => await RunReconnectScenarioAsync(options, trace, token, cancellationToken).ConfigureAwait(false),
                 "gap-resync" => await RunReplicationScenarioAsync(options, trace, token, includeResync: true, cancellationToken).ConfigureAwait(false),
                 _ => await RunReplicationScenarioAsync(options, trace, token, includeResync: false, cancellationToken).ConfigureAwait(false),
@@ -69,13 +86,23 @@ public static class SmokeClientRunner
         }
         catch (WebSocketException ex)
         {
-            trace.Record("in", null, "websocket transport remains available", false, ex.WebSocketErrorCode.ToString());
+            trace.Record(
+                "in",
+                null,
+                "websocket transport remains available",
+                false,
+                $"{ex.WebSocketErrorCode}: {ex.Message}");
             return SmokeClientExitCodes.TransportFatal;
         }
         catch (IOException ex)
         {
             trace.Record("in", null, "websocket transport remains available", false, ex.GetType().Name);
             return SmokeClientExitCodes.TransportFatal;
+        }
+        finally
+        {
+            Array.Clear(token);
+            token = Array.Empty<byte>();
         }
     }
 
@@ -84,13 +111,13 @@ public static class SmokeClientRunner
         SmokeTraceWriter trace,
         byte[] token,
         bool includeResync,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool awaitDelta = true)
     {
         using var client = await ConnectAsync(options, token, options.Nonce!, trace, cancellationToken).ConfigureAwait(false);
         var sequence = 1UL;
         var first = await ReceiveEnvelopeAsync(client, trace, cancellationToken).ConfigureAwait(false);
-        AssertMessage(first, "Handshake", trace, "server sends the first handshake");
-        AssertBodyString(first, "role", "Server", trace, "server handshake role is Server");
+        AssertServerHandshake(first, trace);
 
         await SendEnvelopeAsync(
             client,
@@ -100,7 +127,23 @@ public static class SmokeClientRunner
             cancellationToken).ConfigureAwait(false);
 
         var snapshot = await ReceiveEnvelopeAsync(client, trace, cancellationToken).ConfigureAwait(false);
-        AssertMessage(snapshot, "FullSnapshot", trace, "admission starts with a full snapshot");
+        if (options.Nonce!.EndsWith("-expired-reconnect", StringComparison.Ordinal))
+        {
+            MvpEnvelopeReader.TryReadHeader(snapshot.Span, out var responseHeader);
+            if (string.Equals(responseHeader.MessageType, "Error", StringComparison.Ordinal))
+            {
+                AssertMessage(
+                    snapshot,
+                    "Error",
+                    trace,
+                    "expired reconnect loser receives an error envelope");
+                AssertError(snapshot, "Rejectable", "SessionMismatch", trace);
+                await CloseQuietlyAsync(client).ConfigureAwait(false);
+                return SmokeClientExitCodes.Success;
+            }
+        }
+
+        AssertFullSnapshot(snapshot, trace);
         var snapshotId = ReadBodyString(snapshot, "snapshotId");
         var revision = ReadBodyUInt64(snapshot, "sessionRevisionVector", "gameRevision");
 
@@ -111,8 +154,19 @@ public static class SmokeClientRunner
             "BaselineAck",
             cancellationToken).ConfigureAwait(false);
 
+        // A reconnect run proves the new authenticated connection and the
+        // strictly newer full-snapshot baseline. It intentionally does not
+        // wait for another world mutation: the out-of-band mutation belongs
+        // to the first connection and no-op waiting would only hit idle close.
+        if (!awaitDelta)
+        {
+            trace.Record("in", null, "reconnect baseline is acknowledged", true, null);
+            await CloseQuietlyAsync(client).ConfigureAwait(false);
+            return SmokeClientExitCodes.Success;
+        }
+
         var delta = await ReceiveEnvelopeAsync(client, trace, cancellationToken).ConfigureAwait(false);
-        AssertMessage(delta, "Delta", trace, "delta follows baseline acknowledgement");
+        AssertDelta(delta, snapshotId, revision, trace);
         var toRevision = ReadBodyUInt64(delta, "toRevision");
         var confirmationSequence = ReadBodyUInt64(delta, "confirmationSequence");
 
@@ -133,7 +187,9 @@ public static class SmokeClientRunner
                 cancellationToken).ConfigureAwait(false);
 
             var resync = await ReceiveEnvelopeAsync(client, trace, cancellationToken).ConfigureAwait(false);
-            AssertMessage(resync, "FullSnapshot", trace, "a local gap requests a full resync");
+            AssertFullSnapshot(resync, trace);
+            trace.Record("in", null, "same-connection resync does not repeat handshake", true, null);
+            trace.Record("in", null, "server never sends ResyncRequest", true, null);
         }
 
         trace.Record("in", null, "scenario assertions complete", true, null);
@@ -180,8 +236,17 @@ public static class SmokeClientRunner
         }
         catch (WebSocketException ex)
         {
-            trace.Record("in", null, "invalid credential rejection has an observable close frame", false, ex.WebSocketErrorCode.ToString());
+            trace.Record(
+                "in",
+                null,
+                "invalid credential rejection has an observable close frame",
+                false,
+                $"{ex.WebSocketErrorCode}: {ex.Message}");
             return SmokeClientExitCodes.TransportFatal;
+        }
+        finally
+        {
+            Array.Clear(supplied);
         }
     }
 
@@ -213,13 +278,28 @@ public static class SmokeClientRunner
                 "replayed nonce is rejected before an envelope",
                 passed,
                 result.CloseStatus?.ToString());
-            return passed ? SmokeClientExitCodes.Success : SmokeClientExitCodes.AssertionFailed;
+            if (!passed)
+            {
+                return SmokeClientExitCodes.AssertionFailed;
+            }
         }
         catch (WebSocketException ex)
         {
             trace.Record("in", null, "replayed nonce rejection has an observable close frame", false, ex.WebSocketErrorCode.ToString());
             return SmokeClientExitCodes.TransportFatal;
         }
+
+        using var fresh = await ConnectAsync(
+            options,
+            token,
+            options.Nonce + "-fresh",
+            trace,
+            cancellationToken).ConfigureAwait(false);
+        var handshake = await ReceiveEnvelopeAsync(fresh, trace, cancellationToken).ConfigureAwait(false);
+        AssertServerHandshake(handshake, trace);
+        trace.Record("in", null, "replay rejection does not consume the next valid nonce", true, null);
+        await CloseQuietlyAsync(fresh).ConfigureAwait(false);
+        return SmokeClientExitCodes.Success;
     }
 
     private static async Task<int> RunExpectedReleaseRejectAsync(
@@ -274,20 +354,15 @@ public static class SmokeClientRunner
         return SmokeClientExitCodes.Success;
     }
 
-    private static async Task<int> RunExpectedStaleRejectAsync(
-        SmokeClientCommandLineOptions options,
-        SmokeTraceWriter trace,
-        byte[] token,
-        CancellationToken cancellationToken)
+    private static int ReportUnprovableStaleGeneration(SmokeTraceWriter trace)
     {
-        using var client = await ConnectAsync(options, token, options.Nonce!, trace, cancellationToken).ConfigureAwait(false);
-        var first = await ReceiveEnvelopeAsync(client, trace, cancellationToken).ConfigureAwait(false);
-        AssertMessage(first, "Handshake", trace, "server handshake is available before generation check");
-        await SendEnvelopeAsync(client, ClientHandshake(options, 1), trace, "Handshake", cancellationToken).ConfigureAwait(false);
-        _ = await ReceiveEnvelopeAsync(client, trace, cancellationToken).ConfigureAwait(false);
-        await CloseQuietlyAsync(client).ConfigureAwait(false);
-        trace.Record("in", null, "stale generation path closes the old connection", true, null);
-        return SmokeClientExitCodes.Success;
+        trace.Record(
+            "in",
+            null,
+            "stale generation rejection has real socket evidence",
+            false,
+            "the frozen wire contract carries no connection generation");
+        return SmokeClientExitCodes.AssertionFailed;
     }
 
     private static async Task<int> RunReconnectScenarioAsync(
@@ -296,14 +371,103 @@ public static class SmokeClientRunner
         byte[] token,
         CancellationToken cancellationToken)
     {
-        var first = await RunReplicationScenarioAsync(options, trace, token, includeResync: false, cancellationToken).ConfigureAwait(false);
-        if (first != SmokeClientExitCodes.Success)
+        ulong lastDeltaRevision;
+        using (var first = await ConnectAsync(options, token, options.Nonce!, trace, cancellationToken).ConfigureAwait(false))
         {
-            return first;
+            var sequence = 1UL;
+            var serverHandshake = await ReceiveEnvelopeAsync(first, trace, cancellationToken).ConfigureAwait(false);
+            AssertServerHandshake(serverHandshake, trace);
+            await SendEnvelopeAsync(
+                first,
+                ClientHandshake(options, sequence++),
+                trace,
+                "Handshake",
+                cancellationToken).ConfigureAwait(false);
+
+            var snapshot = await ReceiveEnvelopeAsync(first, trace, cancellationToken).ConfigureAwait(false);
+            AssertFullSnapshot(snapshot, trace);
+            var snapshotId = ReadBodyString(snapshot, "snapshotId");
+            var snapshotRevision = ReadBodyUInt64(snapshot, "sessionRevisionVector", "gameRevision");
+            await SendEnvelopeAsync(
+                first,
+                BaselineAck(options, sequence++, snapshotId, snapshotRevision),
+                trace,
+                "BaselineAck",
+                cancellationToken).ConfigureAwait(false);
+
+            var delta = await ReceiveEnvelopeAsync(first, trace, cancellationToken).ConfigureAwait(false);
+            AssertDelta(delta, snapshotId, snapshotRevision, trace);
+            lastDeltaRevision = ReadBodyUInt64(delta, "toRevision");
+            var confirmationSequence = ReadBodyUInt64(delta, "confirmationSequence");
+            await SendEnvelopeAsync(
+                first,
+                DeltaAck(options, sequence++, confirmationSequence, lastDeltaRevision),
+                trace,
+                "DeltaAck",
+                cancellationToken).ConfigureAwait(false);
+
+            var kick = await ReceiveEnvelopeAsync(first, trace, cancellationToken).ConfigureAwait(false);
+            AssertMessage(kick, "MaintenanceKick", trace, "maintenance kick envelope precedes close");
+            AssertBodyString(
+                kick,
+                "reasonCode",
+                "MaintenanceKick",
+                trace,
+                "maintenance kick carries the registered reason",
+                "MaintenanceKick");
+            var closed = await ReceiveRawAsync(first, cancellationToken).ConfigureAwait(false);
+            var closeObserved = closed.MessageType is null;
+            trace.Record("in", null, "connection closes after maintenance kick", closeObserved, closed.CloseDescription);
+            if (!closeObserved)
+            {
+                return SmokeClientExitCodes.AssertionFailed;
+            }
         }
 
         var reconnectOptions = options with { Nonce = options.Nonce + "-reconnect" };
-        return await RunReplicationScenarioAsync(reconnectOptions, trace, token, includeResync: false, cancellationToken).ConfigureAwait(false);
+        using var reconnect = await ConnectAsync(
+            reconnectOptions,
+            token,
+            reconnectOptions.Nonce!,
+            trace,
+            cancellationToken).ConfigureAwait(false);
+        var reconnectSequence = 1UL;
+        var reconnectHandshake = await ReceiveEnvelopeAsync(reconnect, trace, cancellationToken).ConfigureAwait(false);
+        AssertServerHandshake(reconnectHandshake, trace);
+        await SendEnvelopeAsync(
+            reconnect,
+            ClientHandshake(reconnectOptions, reconnectSequence++),
+            trace,
+            "Handshake",
+            cancellationToken).ConfigureAwait(false);
+        var reconnectSnapshot = await ReceiveEnvelopeAsync(reconnect, trace, cancellationToken).ConfigureAwait(false);
+        AssertFullSnapshot(reconnectSnapshot, trace);
+        var reconnectRevision = ReadBodyUInt64(reconnectSnapshot, "sessionRevisionVector", "gameRevision");
+        var revisionAdvanced = reconnectRevision > lastDeltaRevision;
+        trace.Record(
+            "in",
+            "FullSnapshot",
+            "reconnect full snapshot is strictly newer than the last delta",
+            revisionAdvanced,
+            $"lastDelta={lastDeltaRevision}; reconnect={reconnectRevision}");
+        if (!revisionAdvanced)
+        {
+            return SmokeClientExitCodes.AssertionFailed;
+        }
+
+        await SendEnvelopeAsync(
+            reconnect,
+            BaselineAck(
+                reconnectOptions,
+                reconnectSequence,
+                ReadBodyString(reconnectSnapshot, "snapshotId"),
+                reconnectRevision),
+            trace,
+            "BaselineAck",
+            cancellationToken).ConfigureAwait(false);
+        trace.Record("in", null, "reconnect baseline is acknowledged", true, null);
+        await CloseQuietlyAsync(reconnect).ConfigureAwait(false);
+        return SmokeClientExitCodes.Success;
     }
 
     private static async Task<ClientWebSocket> ConnectAsync(
@@ -321,7 +485,30 @@ public static class SmokeClientRunner
         try
         {
             await client.ConnectAsync(new Uri(options.Endpoint), cancellationToken).ConfigureAwait(false);
-            trace.Record("out", null, "websocket upgrade completed", true, null);
+            // ClientWebSocket completes ConnectAsync only after a successful
+            // switching-protocols response; the Windows implementation reports
+            // status 0 on that success path, so Open is the portable 101 proof.
+            var switchedProtocols = client.State == WebSocketState.Open;
+            trace.Record(
+                "out",
+                null,
+                "websocket upgrade returned HTTP 101",
+                switchedProtocols,
+                client.HttpStatusCode == 0
+                    ? HttpStatusCode.SwitchingProtocols.ToString()
+                    : client.HttpStatusCode.ToString());
+            var selectedProtocol = string.Equals(client.SubProtocol, "lumio.mvp.v0", StringComparison.Ordinal);
+            trace.Record(
+                "in",
+                null,
+                "server selected lumio.mvp.v0",
+                selectedProtocol,
+                client.SubProtocol);
+            if (!switchedProtocols || !selectedProtocol)
+            {
+                throw new ScenarioAssertionException(null, "websocket upgrade negotiation is exact", client.SubProtocol);
+            }
+
             return client;
         }
         catch
@@ -420,20 +607,120 @@ public static class SmokeClientRunner
         trace.Record("in", expected, assertion, true, null);
     }
 
+    private static void AssertServerHandshake(ReadOnlyMemory<byte> bytes, SmokeTraceWriter trace)
+    {
+        AssertMessage(bytes, "Handshake", trace, "server sends the first handshake");
+        using var document = JsonDocument.Parse(bytes);
+        var body = document.RootElement.GetProperty("body");
+        var keys = body.EnumerateObject().Select(property => property.Name).ToArray();
+        if (keys.Length != 1 || !string.Equals(keys[0], "role", StringComparison.Ordinal))
+        {
+            throw new ScenarioAssertionException("Handshake", "server handshake body has the exact role key", string.Join(",", keys));
+        }
+
+        trace.Record("in", "Handshake", "server handshake body has the exact role key", true, null);
+        AssertBodyString(bytes, "role", "Server", trace, "server handshake role is Server");
+    }
+
+    private static void AssertFullSnapshot(ReadOnlyMemory<byte> bytes, SmokeTraceWriter trace)
+    {
+        AssertMessage(bytes, "FullSnapshot", trace, "admission or resync starts with a full snapshot");
+        using var document = JsonDocument.Parse(bytes);
+        var root = document.RootElement;
+        var body = root.GetProperty("body");
+        AssertExactKeys(
+            body,
+            FullSnapshotBodyKeys,
+            "FullSnapshot",
+            "full snapshot body has the frozen key set");
+        var vector = body.GetProperty("sessionRevisionVector");
+        AssertExactKeys(
+            vector,
+            SessionRevisionVectorKeys,
+            "FullSnapshot",
+            "session revision vector has all seven frozen fields");
+        var chunkKeys = vector.GetProperty("chunkRevisionSet")
+            .EnumerateObject()
+            .Select(property => property.Name)
+            .ToArray();
+        if (chunkKeys.Length == 0 || chunkKeys.Any(key => !System.Text.RegularExpressions.Regex.IsMatch(
+                key,
+                "^c:(0|-?[1-9][0-9]{0,9}):(0|-?[1-9][0-9]{0,9}):(0|-?[1-9][0-9]{0,9})$",
+                System.Text.RegularExpressions.RegexOptions.CultureInvariant)))
+        {
+            throw new ScenarioAssertionException("FullSnapshot", "chunk revision keys are canonical", string.Join(",", chunkKeys));
+        }
+
+        if (!string.Equals(root.GetProperty("reliability").GetString(), MvpWireConstants.Reliability, StringComparison.Ordinal)
+            || !string.Equals(body.GetProperty("mappingSetHash").GetString(), MvpWireConstants.MappingSetHash, StringComparison.Ordinal))
+        {
+            throw new ScenarioAssertionException("FullSnapshot", "full snapshot reliability and mapping hash are canonical", null);
+        }
+
+        trace.Record("in", "FullSnapshot", "full snapshot frozen structure is exact", true, null);
+    }
+
+    private static void AssertDelta(
+        ReadOnlyMemory<byte> bytes,
+        string expectedSnapshotId,
+        ulong expectedFromRevision,
+        SmokeTraceWriter trace)
+    {
+        AssertMessage(bytes, "Delta", trace, "delta follows baseline acknowledgement");
+        using var document = JsonDocument.Parse(bytes);
+        var body = document.RootElement.GetProperty("body");
+        AssertExactKeys(
+            body,
+            DeltaBodyKeys,
+            "Delta",
+            "delta body has the frozen key set");
+        var fromRevision = body.GetProperty("fromRevision").GetUInt64();
+        var toRevision = body.GetProperty("toRevision").GetUInt64();
+        var tombstones = body.GetProperty("tombstones");
+        if (fromRevision != expectedFromRevision
+            || toRevision <= fromRevision
+            || !string.Equals(body.GetProperty("baseSnapshotId").GetString(), expectedSnapshotId, StringComparison.Ordinal)
+            || !string.Equals(body.GetProperty("mappingSetHash").GetString(), MvpWireConstants.MappingSetHash, StringComparison.Ordinal)
+            || tombstones.ValueKind != JsonValueKind.Array
+            || tombstones.GetArrayLength() != 0)
+        {
+            throw new ScenarioAssertionException(
+                "Delta",
+                "delta advances the acknowledged snapshot without tombstones",
+                $"from={fromRevision}; to={toRevision}");
+        }
+
+        trace.Record("in", "Delta", "delta advances the acknowledged snapshot without tombstones", true, null);
+    }
+
+    private static void AssertExactKeys(
+        JsonElement element,
+        IReadOnlyCollection<string> expected,
+        string messageType,
+        string assertion)
+    {
+        var actual = element.EnumerateObject().Select(property => property.Name).ToHashSet(StringComparer.Ordinal);
+        if (!actual.SetEquals(expected))
+        {
+            throw new ScenarioAssertionException(messageType, assertion, string.Join(",", actual.OrderBy(value => value, StringComparer.Ordinal)));
+        }
+    }
+
     private static void AssertBodyString(
         ReadOnlyMemory<byte> bytes,
         string property,
         string expected,
         SmokeTraceWriter trace,
-        string assertion)
+        string assertion,
+        string messageType = "Handshake")
     {
         var actual = ReadBodyString(bytes, property);
         if (!string.Equals(actual, expected, StringComparison.Ordinal))
         {
-            throw new ScenarioAssertionException("Handshake", assertion, $"expected {expected}, got {actual}");
+            throw new ScenarioAssertionException(messageType, assertion, $"expected {expected}, got {actual}");
         }
 
-        trace.Record("in", "Handshake", assertion, true, null);
+        trace.Record("in", messageType, assertion, true, null);
     }
 
     private static void AssertError(

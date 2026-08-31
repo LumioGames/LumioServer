@@ -2,7 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Text;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using Lumio.Server.MvpHost.HostContracts;
 using Lumio.Server.MvpHost.Platform;
 using Xunit;
@@ -11,6 +14,68 @@ namespace Lumio.Server.MvpHost.App.Tests;
 
 public sealed class ReadinessAndTraceTests
 {
+    private static readonly string[] QuiesceEffects =
+    {
+        "AdmissionClosed", "Drained", "SnapshotCut", "Stopped",
+    };
+
+    [Fact]
+    public async Task SignalShutdownWaitsForQuiesceBeforeReturningSuccess()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"lumio-signal-quiesce-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var secret = Path.Combine(root, "secret.bin");
+        var trace = Path.Combine(root, "server.jsonl");
+        File.WriteAllBytes(secret, Encoding.UTF8.GetBytes("test-secret"));
+        var options = new App.HostCommandLineOptions(
+            "ws://127.0.0.1:0",
+            true,
+            App.HostCommandLineOptions.DefaultHostProfile,
+            App.HostCommandLineOptions.DefaultProductId,
+            App.HostCommandLineOptions.DefaultGameReleaseId,
+            secret,
+            1,
+            true,
+            "http://127.0.0.1:0",
+            trace);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+
+        try
+        {
+            await using var composition = App.HostComposition.Create(options);
+            await composition.StartAsync(timeout.Token);
+
+            var exitCode = await App.Program.QuiesceForSignalAsync(composition, timeout.Token);
+
+            Assert.Equal(App.HostExitCodes.Success, exitCode);
+            await composition.DisposeAsync();
+            var effects = new List<string>();
+            foreach (var line in File.ReadLines(trace))
+            {
+                using var document = JsonDocument.Parse(line);
+                var traceEntry = document.RootElement;
+                if (traceEntry.GetProperty("kind").GetString() == "ack"
+                    && traceEntry.GetProperty("effect").ValueKind == JsonValueKind.String
+                    && traceEntry.GetProperty("effect").GetString() is { } effect
+                    && Array.IndexOf(QuiesceEffects, effect) >= 0)
+                {
+                    effects.Add(effect);
+                }
+            }
+
+            Assert.Equal(QuiesceEffects, effects);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     [Fact]
     public void IngressRoutingRejectsStaleFramesAndReportsWorldQueueFull()
     {
@@ -66,6 +131,42 @@ public sealed class ReadinessAndTraceTests
         Assert.True(App.FullGraphComposition.IsCurrentIngressGeneration(current, current, current));
         Assert.False(App.FullGraphComposition.IsCurrentIngressGeneration(current, current, stale));
         Assert.False(App.FullGraphComposition.IsCurrentIngressGeneration(current, stale, current));
+    }
+
+    [Fact]
+    public void SessionLocalFaultAdjudicationDoesNotEscalateToProcessFatal()
+    {
+        var method = typeof(App.Program).Assembly
+            .GetType("Lumio.Server.MvpHost.App.FullGraphComposition", throwOnError: true)!
+            .GetMethod("ShouldEscalateFault", BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+
+        var local = new FaultAdjudication(HostFaultClass.SessionLocalProven, false, true);
+        var slot = new FaultAdjudication(HostFaultClass.SlotStateUnproven, true, false);
+        var process = new FaultAdjudication(HostFaultClass.ProcessFault, true, false);
+
+        Assert.False((bool)method!.Invoke(null, new object[] { local })!);
+        Assert.True((bool)method.Invoke(null, new object[] { slot })!);
+        Assert.True((bool)method.Invoke(null, new object[] { process })!);
+    }
+
+    [Fact]
+    public void FullGraphUsesTimerDrivenPacingInsteadOfItsTransportPump()
+    {
+        var composition = typeof(App.Program).Assembly.GetType(
+            "Lumio.Server.MvpHost.App.FullGraphComposition",
+            throwOnError: true)!;
+        var pacing = typeof(App.Program).Assembly.GetType(
+            "Lumio.Server.MvpHost.App.MvpPacingController",
+            throwOnError: false);
+
+        Assert.NotNull(pacing);
+        Assert.Contains(
+            composition.GetFields(BindingFlags.Instance | BindingFlags.NonPublic),
+            field => field.FieldType == pacing);
+        Assert.Null(composition.GetMethod(
+            "QueueTickPermit",
+            BindingFlags.Instance | BindingFlags.NonPublic));
     }
 
     private static EnqueueResult InvokeRoute(

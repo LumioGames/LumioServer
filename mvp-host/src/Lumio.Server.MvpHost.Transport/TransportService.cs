@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
 using Lumio.Server.MvpHost.HostContracts;
 using Lumio.Server.MvpHost.Observability;
 using Lumio.Server.MvpHost.Platform;
@@ -28,11 +30,15 @@ public sealed class TransportService
     private static readonly QueueBudget CommandBudget = new(64, 64 * 1024);
 
     /// <summary>
-    /// transport → session：256 条。**外加两个保留槽**给终态事件——
+    /// transport → session：256 条。终态保留槽按每条 live connection 最多
+    /// 一个 <c>Faulted</c> 加一个 <c>Closed</c> 有界配置——
     /// <c>Closed</c> / <c>Faulted</c> 永不丢弃。丢一个 <c>Closed</c> 的后果是
     /// session 侧永远留着一条已经不存在的连接。
     /// </summary>
     private static readonly QueueBudget EventBudget = new(256, 256 * 1024);
+
+    private const int ReceiveBufferDiagnosticCapacity = 256;
+    private const long TerminalCloseFlushTimeoutTicks = TimeSpan.TicksPerSecond;
 
     private readonly IByteCarrier carrier;
     private readonly ITransportFaultPolicy faultPolicy;
@@ -40,15 +46,25 @@ public sealed class TransportService
     private readonly ITimerService timers;
     private readonly ObservabilityServices observability;
     private readonly TransportEndpointOptions options;
+    private readonly int terminalReserveCapacity;
+    private readonly int eventReserveCapacity;
     private readonly ConnectionRegistry registry = new();
+    private readonly object lifecycleGate = new();
 
     private readonly IBoundedInbox<ConnectionCommand> commandInbox;
     private readonly IBoundedInbox<ConnectionEvent> eventOutbox;
 
-    /// <summary>终态事件的保留槽。队列满时它们仍然必达。</summary>
-    private readonly Queue<ConnectionEvent> terminalReserve = new();
+    /// <summary>
+    /// Event-outbox overflow tail. Once a terminal event enters this queue, all
+    /// later events join the same bounded tail until it drains, preserving the
+    /// registered FIFO order across the primary queue and its reserve.
+    /// </summary>
+    private readonly Queue<ConnectionEvent> eventReserve = new();
 
     private readonly List<int> receiveBufferSizes = new();
+    private readonly HashSet<(ulong ConnectionId, ulong Epoch)> retiringConnections = new();
+    private int reservedTerminalEvents;
+    private int disposed;
 
     private TransportService(
         IByteCarrier carrier,
@@ -64,6 +80,13 @@ public sealed class TransportService
         this.timers = timers;
         this.observability = observability;
         this.options = options;
+        var terminalCapacity = options.MaxConnections <= int.MaxValue / 2
+            ? Math.Max(1, options.MaxConnections) * 2
+            : int.MaxValue;
+        this.terminalReserveCapacity = terminalCapacity;
+        this.eventReserveCapacity = terminalCapacity > int.MaxValue - EventBudget.MaxItems
+            ? int.MaxValue
+            : EventBudget.MaxItems + terminalCapacity;
 
         this.commandInbox = PlatformModule.CreateInbox<ConnectionCommand>(in CommandBudget);
         this.eventOutbox = PlatformModule.CreateInbox<ConnectionEvent>(in EventBudget);
@@ -101,43 +124,99 @@ public sealed class TransportService
     /// </summary>
     public EnqueueResult TrySend(in ConnectionCommand command)
     {
-        var (id, epoch) = Address(command);
-
-        if (!this.registry.TryGet(id, out var entry))
+        if (Volatile.Read(ref this.disposed) != 0)
         {
-            return new EnqueueResult(EnqueueStatus.Closed, "StaleConnectionGeneration");
+            return new EnqueueResult(EnqueueStatus.Closed, "ContextClosing");
         }
 
-        if (entry.Epoch != epoch)
-        {
-            return new EnqueueResult(EnqueueStatus.Closed, "StaleConnectionGeneration");
-        }
-
-        // Closed 之后只收 Close 并 ack，其余一律拒绝。
-        if (entry.State == TransportConnectionState.Closed && command is not ConnectionCommand.Close)
-        {
-            return new EnqueueResult(EnqueueStatus.Closed, "StaleConnectionGeneration");
-        }
+        this.PumpCommandsOnce();
 
         var admitted = this.commandInbox.TryEnqueue(in command);
-        if (admitted.Status == EnqueueStatus.Full)
+        if (admitted.Status != EnqueueStatus.Accepted)
         {
-            return new EnqueueResult(EnqueueStatus.Full, "QueueFull");
+            return admitted.Status == EnqueueStatus.Full
+                ? new EnqueueResult(EnqueueStatus.Full, "QueueFull")
+                : new EnqueueResult(EnqueueStatus.Closed, "ContextClosing");
         }
 
-        this.commandInbox.TryDequeue(out _);
+        return this.PumpCommands(command);
+    }
+
+    internal void PumpCommandsOnce() => _ = this.PumpCommands(awaited: null);
+
+    internal EnqueueResult EnqueueCommandForTest(ConnectionCommand command)
+        => this.commandInbox.TryEnqueue(in command);
+
+    private EnqueueResult PumpCommands(ConnectionCommand? awaited)
+    {
+        this.RetryPendingCloses();
+        var observed = awaited is null;
+        var awaitedResult = new EnqueueResult(EnqueueStatus.Accepted, null);
+        var budget = Math.Max(1, this.commandInbox.Budget.MaxItems);
+        var processed = 0;
+        while (processed++ < budget && this.commandInbox.TryDequeue(out var queued))
+        {
+            var result = this.ApplyQueuedCommand(queued);
+            if (ReferenceEquals(queued, awaited))
+            {
+                observed = true;
+                awaitedResult = result;
+            }
+        }
+
+        return observed
+            ? awaitedResult
+            : new EnqueueResult(EnqueueStatus.Closed, "InternalInvariant");
+    }
+
+    private EnqueueResult ApplyQueuedCommand(ConnectionCommand command)
+    {
+        var (id, epoch) = Address(command);
+        if (!this.registry.TryGet(id, out var entry) || entry.Epoch != epoch)
+        {
+            return new EnqueueResult(EnqueueStatus.Closed, "StaleConnectionGeneration");
+        }
+
+        if (entry.State == TransportConnectionState.Closed
+            && command is not ConnectionCommand.Close)
+        {
+            return new EnqueueResult(EnqueueStatus.Closed, "StaleConnectionGeneration");
+        }
+
         return this.Apply(entry, command);
     }
 
     public bool TryReceive(out ConnectionEvent evt)
     {
-        if (this.terminalReserve.Count > 0)
+        lock (this.lifecycleGate)
         {
-            evt = this.terminalReserve.Dequeue();
-            return true;
-        }
+            if (Volatile.Read(ref this.disposed) != 0
+                && this.eventOutbox.Count == 0
+                && this.eventReserve.Count == 0)
+            {
+                evt = null!;
+                return false;
+            }
 
-        return this.eventOutbox.TryDequeue(out evt!);
+            if (this.eventOutbox.TryDequeue(out evt!))
+            {
+                return true;
+            }
+
+            if (this.eventReserve.Count > 0)
+            {
+                evt = this.eventReserve.Dequeue();
+                if (evt is ConnectionEvent.Closed or ConnectionEvent.Faulted)
+                {
+                    this.reservedTerminalEvents--;
+                }
+
+                return true;
+            }
+
+            evt = null!;
+            return false;
+        }
     }
 
     /// <summary>
@@ -146,6 +225,11 @@ public sealed class TransportService
     /// </summary>
     public int Drain(TransportConnectionId c, int maxItems, long maxBytes, Span<ValidatedEnvelopeBytes> destination)
     {
+        if (Volatile.Read(ref this.disposed) != 0)
+        {
+            return 0;
+        }
+
         if (!this.registry.TryGet(c, out var entry))
         {
             return 0;
@@ -175,6 +259,7 @@ public sealed class TransportService
 
             bytes += itemBytes;
             destination[taken++] = item;
+            entry.CommitIngressTake();
         }
 
         return taken;
@@ -182,12 +267,22 @@ public sealed class TransportService
 
     public EnqueueResult TryEnqueue(TransportConnectionId c, ConnectionEpoch e, in OutboundEnvelopeBytes envelope)
     {
+        if (Volatile.Read(ref this.disposed) != 0)
+        {
+            return new EnqueueResult(EnqueueStatus.Closed, "ContextClosing");
+        }
+
         if (!this.registry.TryGet(c, out var entry) || entry.Epoch != e)
         {
             return new EnqueueResult(EnqueueStatus.Closed, "StaleConnectionGeneration");
         }
 
-        var result = entry.Egress.TryEnqueue(in envelope);
+        if (entry.PendingCloseReason is not null)
+        {
+            return new EnqueueResult(EnqueueStatus.Closed, "ContextClosing");
+        }
+
+        var result = entry.TryEnqueueEgress(in envelope);
         return result.Status == EnqueueStatus.Full
             ? new EnqueueResult(EnqueueStatus.Full, "QueueFull")
             : result;
@@ -203,12 +298,84 @@ public sealed class TransportService
             return false;
         }
 
-        var entry = this.registry.Add(accept.ConnectionId, IngressBudget, EgressBudget);
-        entry.SetAuthenticationEvidence(accept.AuthenticationEvidence);
-        entry.NoteActivity(this.clock.Now);
-        this.ArmIdleTimer(entry);
+        // Authentication proof travels through an internal side channel keyed by
+        // the fresh transport generation; it is never attached to CarrierAccept.
+        PrincipalId authenticatedPrincipal = default;
+        var authenticatedProductId = string.Empty;
+        var authenticatedGameReleaseId = string.Empty;
+        var hasAuthenticationMetadata = this.carrier is ITransportAuthenticationMetadataSource source
+            && source.TryTakeAuthenticationMetadata(
+                accept.ConnectionId,
+                new ConnectionEpoch(0),
+                out authenticatedPrincipal,
+                out authenticatedProductId,
+                out authenticatedGameReleaseId);
 
-        this.Publish(new ConnectionEvent.Accepted(entry.Id, entry.Epoch));
+        var maxConnections = Math.Max(1, this.options.MaxConnections);
+        lock (this.lifecycleGate)
+        {
+            if (Volatile.Read(ref this.disposed) != 0)
+            {
+                this.TryCloseCarrier(accept.ConnectionId, ConnectionCloseReason.PolicyReject);
+                return false;
+            }
+
+            var requiredTerminalSlots = (long)(this.registry.Count + 1) * 2;
+            if (this.registry.TryGet(accept.ConnectionId, out _)
+                || this.registry.Count >= maxConnections
+                || this.reservedTerminalEvents + requiredTerminalSlots > this.terminalReserveCapacity)
+            {
+                this.TryCloseCarrier(accept.ConnectionId, ConnectionCloseReason.PolicyReject);
+                return false;
+            }
+
+            var entry = this.registry.Add(accept.ConnectionId, IngressBudget, EgressBudget);
+            if (hasAuthenticationMetadata)
+            {
+                entry.SetAuthenticationMetadata(
+                    authenticatedPrincipal,
+                    authenticatedProductId,
+                    authenticatedGameReleaseId);
+            }
+            entry.NoteActivity(this.clock.Now);
+            this.ArmIdleTimer(entry);
+
+            this.Publish(new ConnectionEvent.Accepted(entry.Id, entry.Epoch));
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Takes the witness associated with a just-published handshake event. The
+    /// generation key prevents a late event from consuming a newer connection's
+    /// authentication state.
+    /// </summary>
+    internal bool TryTakeAuthenticationMetadata(
+        TransportConnectionId connectionId,
+        ConnectionEpoch connectionEpoch,
+        out PrincipalId principalId,
+        out string productId,
+        out string gameReleaseId)
+    {
+        if (!this.registry.TryGet(connectionId, out var entry)
+            || entry.Epoch != connectionEpoch)
+        {
+            principalId = default;
+            productId = string.Empty;
+            gameReleaseId = string.Empty;
+            return false;
+        }
+
+        if (!entry.TryTakeAuthenticationMetadata(
+                out principalId,
+                out productId,
+                out gameReleaseId))
+        {
+            principalId = default;
+            productId = string.Empty;
+            gameReleaseId = string.Empty;
+            return false;
+        }
         return true;
     }
 
@@ -225,7 +392,10 @@ public sealed class TransportService
         }
 
         var buffer = new byte[TransportProvisionalLimits.ReceiveBufferBytes];
-        this.receiveBufferSizes.Add(buffer.Length);
+        if (this.receiveBufferSizes.Count < ReceiveBufferDiagnosticCapacity)
+        {
+            this.receiveBufferSizes.Add(buffer.Length);
+        }
 
         var received = this.carrier.ReceiveAsync(connection, buffer, System.Threading.CancellationToken.None)
             .AsTask().GetAwaiter().GetResult();
@@ -276,9 +446,14 @@ public sealed class TransportService
             return 0;
         }
 
+        if (this.TryForceExpiredPendingClose(entry))
+        {
+            return 0;
+        }
+
         var sent = 0;
 
-        while (sent < TransportProvisionalLimits.EgressBatchPerTick && entry.Egress.TryDequeue(out var outbound))
+        while (sent < TransportProvisionalLimits.EgressBatchPerTick && entry.TryTakeEgress(out var outbound))
         {
             var decision = this.faultPolicy.Decide(new TransportFaultContext(
                 Seed: 0, Sequence: (ulong)sent, IsIngress: false, MessageType: "Outbound"));
@@ -286,12 +461,18 @@ public sealed class TransportService
             switch (decision)
             {
                 case TransportFaultAction.Drop:
+                    entry.CommitEgressTake();
                     continue;
                 case TransportFaultAction.Disconnect:
                     this.CloseConnection(entry, ConnectionCloseReason.Fault, "QueueFull");
                     return sent;
                 case TransportFaultAction.Duplicate:
-                    this.carrier.TrySend(connection, outbound.Bytes);
+                    if (!this.carrier.TrySend(connection, outbound.Bytes))
+                    {
+                        entry.DeferEgress(in outbound);
+                        return sent;
+                    }
+
                     break;
                 default:
                     break;
@@ -299,12 +480,15 @@ public sealed class TransportService
 
             if (!this.carrier.TrySend(connection, outbound.Bytes))
             {
-                this.CloseConnection(entry, ConnectionCloseReason.Disconnect, stableErrorId: null);
+                entry.DeferEgress(in outbound);
                 return sent;
             }
 
+            entry.CommitEgressTake();
             sent++;
         }
+
+        this.TryCompletePendingClose(entry);
 
         return sent;
     }
@@ -326,6 +510,8 @@ public sealed class TransportService
 
     internal int IngressCountForTest(TransportConnectionId connection)
         => this.registry.TryGet(connection, out var entry) ? entry.IngressCount : 0;
+
+    internal int ConnectionCountForTest => this.registry.ConnectionIds.Count;
 
     internal void FillEventOutboxForTest()
     {
@@ -360,18 +546,42 @@ public sealed class TransportService
 
     public void Dispose()
     {
-        foreach (var id in new List<ulong>(this.registry.ConnectionIds))
+        Exception? failure = null;
+        lock (this.lifecycleGate)
         {
-            if (this.registry.TryGet(new TransportConnectionId(id), out var entry))
+            if (Interlocked.Exchange(ref this.disposed, 1) != 0)
             {
-                entry.Ingress.Close();
-                entry.ClearDeferredIngress();
-                entry.Egress.Close();
+                return;
             }
+
+            foreach (var id in new List<ulong>(this.registry.ConnectionIds))
+            {
+                if (this.registry.TryGet(new TransportConnectionId(id), out var entry))
+                {
+                    try
+                    {
+                        this.RetireConnection(
+                            entry,
+                            entry.PendingCloseReason ?? ConnectionCloseReason.OwnerRequest,
+                            entry.PendingCloseStableErrorId);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Reserve exhaustion is fail-stop, but every entry still
+                        // gets a resource/registry retirement attempt.
+                        failure ??= ex;
+                    }
+                }
+            }
+
+            this.commandInbox.Close();
+            this.eventOutbox.Close();
         }
 
-        this.commandInbox.Close();
-        this.eventOutbox.Close();
+        if (failure is not null)
+        {
+            throw failure;
+        }
     }
 
     /// <summary>
@@ -409,10 +619,7 @@ public sealed class TransportService
             this.Publish(new ConnectionEvent.HandshakeEnvelope(
                 entry.Id,
                 entry.Epoch,
-                new ValidatedEnvelopeBytes(message, header))
-            {
-                AuthenticationEvidence = entry.AuthenticationEvidence,
-            });
+                new ValidatedEnvelopeBytes(message, header)));
             return true;
         }
 
@@ -498,31 +705,237 @@ public sealed class TransportService
 
     private void CloseConnection(ConnectionEntry entry, ConnectionCloseReason reason, string? stableErrorId)
     {
-        if (entry.State == TransportConnectionState.Closed)
+        lock (this.lifecycleGate)
         {
-            return;
-        }
+            if (!this.registry.TryGet(entry.Id, out var current)
+                || !ReferenceEquals(current, entry)
+                || this.retiringConnections.Contains((entry.Id.Value, entry.Epoch.Value)))
+            {
+                return;
+            }
 
+            if (entry.State == TransportConnectionState.Closed)
+            {
+                return;
+            }
+
+            // The first close request owns the reason and deadline. A later
+            // request must not overwrite a pending maintenance/policy reason.
+            if (entry.PendingCloseReason is not null)
+            {
+                return;
+            }
+
+            if ((reason is ConnectionCloseReason.MaintenanceKick
+                    or ConnectionCloseReason.OwnerRequest
+                    or ConnectionCloseReason.PolicyReject)
+                && !this.FlushEgressBeforeClose(entry))
+            {
+                entry.SetPendingClose(
+                    reason,
+                    stableErrorId,
+                    new MonotonicInstant(checked(this.clock.Now.Ticks + TerminalCloseFlushTimeoutTicks)));
+                return;
+            }
+
+            this.RetireConnection(entry, reason, stableErrorId);
+        }
+    }
+
+    /// <summary>
+    /// Single terminal retirement path for explicit close, overflow fallback,
+    /// and service disposal. Resources are closed and the terminal event is
+    /// reserved/published before the registry entry is removed. The small
+    /// retiring set handles synchronous re-entry from a carrier/timer callback.
+    /// </summary>
+    private void RetireConnection(
+        ConnectionEntry entry,
+        ConnectionCloseReason reason,
+        string? stableErrorId)
+    {
+        lock (this.lifecycleGate)
+        {
+            if (!this.registry.TryGet(entry.Id, out var current)
+                || !ReferenceEquals(current, entry)
+                || !this.retiringConnections.Add((entry.Id.Value, entry.Epoch.Value)))
+            {
+                return;
+            }
+
+            try
+            {
+                entry.ClearPendingClose();
+                this.CloseResources(entry, reason);
+                try
+                {
+                    this.Publish(stableErrorId is null
+                        ? new ConnectionEvent.Closed(entry.Id, entry.Epoch, reason)
+                        : new ConnectionEvent.Faulted(entry.Id, entry.Epoch, stableErrorId));
+
+                    // Faulted is diagnostic; Closed is the serialized lifecycle
+                    // fact consumed by Session. Both are retained in order.
+                    if (stableErrorId is not null)
+                    {
+                        this.Publish(new ConnectionEvent.Closed(entry.Id, entry.Epoch, reason));
+                    }
+                }
+                finally
+                {
+                    // Reserve exhaustion is fail-stop, but resource retirement
+                    // and stale-generation fencing still complete first.
+                    this.registry.Remove(entry.Id);
+                }
+            }
+            finally
+            {
+                this.retiringConnections.Remove((entry.Id.Value, entry.Epoch.Value));
+            }
+        }
+    }
+
+    private void CloseResources(ConnectionEntry entry, ConnectionCloseReason reason)
+    {
         entry.TryTransitionTo(TransportConnectionState.Closed);
         entry.Ingress.Close();
         entry.ClearDeferredIngress();
         entry.Egress.Close();
-        this.carrier.Close(entry.Id, reason);
+        entry.ClearDeferredEgress();
+        entry.ClearAuthenticationMetadata();
+
+        try
+        {
+            _ = this.carrier.Close(entry.Id, reason);
+        }
+        catch (Exception ex)
+        {
+            this.observability.Diagnostics.Write(
+                "Diagnostic",
+                "Error",
+                $"carrier close failed during connection retirement: {ex.GetType().Name}");
+        }
 
         if (entry.IdleTimer is { } timer)
         {
-            this.timers.Cancel(timer);
+            try
+            {
+                this.timers.Cancel(timer);
+            }
+            catch (Exception ex)
+            {
+                this.observability.Diagnostics.Write(
+                    "Diagnostic",
+                    "Error",
+                    $"idle timer cancellation failed during connection retirement: {ex.GetType().Name}");
+            }
+
             entry.SetIdleTimer(null);
         }
+    }
 
-        this.Publish(stableErrorId is null
-            ? new ConnectionEvent.Closed(entry.Id, entry.Epoch, reason)
-            : new ConnectionEvent.Faulted(entry.Id, entry.Epoch, stableErrorId));
-
-        // Faulted 之后仍要让 session 看到连接终止；两者都是终态，都走保留槽。
-        if (stableErrorId is not null)
+    private void TryCloseCarrier(TransportConnectionId connection, ConnectionCloseReason reason)
+    {
+        try
         {
-            this.Publish(new ConnectionEvent.Closed(entry.Id, entry.Epoch, reason));
+            _ = this.carrier.Close(connection, reason);
+        }
+        catch (Exception ex)
+        {
+            this.observability.Diagnostics.Write(
+                "Diagnostic",
+                "Error",
+                $"carrier close failed for rejected connection: {ex.GetType().Name}");
+        }
+    }
+
+    private bool FlushEgressBeforeClose(ConnectionEntry entry)
+    {
+        var remaining = EgressBudget.MaxItems;
+        while (remaining-- > 0 && entry.TryTakeEgress(out var outbound))
+        {
+            var decision = this.faultPolicy.Decide(new TransportFaultContext(
+                Seed: 0,
+                Sequence: (ulong)(EgressBudget.MaxItems - remaining - 1),
+                IsIngress: false,
+                MessageType: "Outbound"));
+            switch (decision)
+            {
+                case TransportFaultAction.Drop:
+                    entry.CommitEgressTake();
+                    continue;
+                case TransportFaultAction.Disconnect:
+                    entry.DeferEgress(in outbound);
+                    return false;
+                case TransportFaultAction.Duplicate:
+                    if (!this.carrier.TrySend(entry.Id, outbound.Bytes))
+                    {
+                        entry.DeferEgress(in outbound);
+                        return false;
+                    }
+
+                    break;
+                default:
+                    break;
+            }
+
+            if (!this.carrier.TrySend(entry.Id, outbound.Bytes))
+            {
+                entry.DeferEgress(in outbound);
+                return false;
+            }
+
+            entry.CommitEgressTake();
+        }
+
+        return entry.EgressCount == 0;
+    }
+
+    private void RetryPendingCloses()
+    {
+        foreach (var id in this.registry.ConnectionIds.ToArray())
+        {
+            if (this.registry.TryGet(new TransportConnectionId(id), out var entry))
+            {
+                this.TryCompletePendingClose(entry);
+            }
+        }
+    }
+
+    private void TryCompletePendingClose(ConnectionEntry entry)
+    {
+        lock (this.lifecycleGate)
+        {
+            if (!this.registry.TryGet(entry.Id, out var current)
+                || !ReferenceEquals(current, entry)
+                || entry.PendingCloseReason is not { } reason)
+            {
+                return;
+            }
+
+            if (this.TryForceExpiredPendingClose(entry)
+                || !this.FlushEgressBeforeClose(entry))
+            {
+                return;
+            }
+
+            this.RetireConnection(entry, reason, entry.PendingCloseStableErrorId);
+        }
+    }
+
+    private bool TryForceExpiredPendingClose(ConnectionEntry entry)
+    {
+        lock (this.lifecycleGate)
+        {
+            if (!this.registry.TryGet(entry.Id, out var current)
+                || !ReferenceEquals(current, entry)
+                || entry.PendingCloseReason is not { } reason
+                || entry.PendingCloseDeadline is not { } deadline
+                || this.clock.Now.Ticks < deadline.Ticks)
+            {
+                return false;
+            }
+
+            this.RetireConnection(entry, reason, entry.PendingCloseStableErrorId);
+            return true;
         }
     }
 
@@ -532,7 +945,25 @@ public sealed class TransportService
     /// </summary>
     private void Publish(ConnectionEvent evt)
     {
+        lock (this.lifecycleGate)
+        {
+            this.PublishUnderLifecycleLock(evt);
+        }
+    }
+
+    private void PublishUnderLifecycleLock(ConnectionEvent evt)
+    {
         var terminal = evt is ConnectionEvent.Closed or ConnectionEvent.Faulted;
+
+        if (this.eventReserve.Count > 0)
+        {
+            if (!this.TryEnqueueEventReserve(evt))
+            {
+                this.HandleNonTerminalEventOverflow(evt);
+            }
+
+            return;
+        }
 
         var result = this.eventOutbox.TryEnqueue(in evt);
         if (result.Status == EnqueueStatus.Accepted)
@@ -542,10 +973,15 @@ public sealed class TransportService
 
         if (terminal)
         {
-            this.terminalReserve.Enqueue(evt);
+            _ = this.TryEnqueueEventReserve(evt);
             return;
         }
 
+        this.HandleNonTerminalEventOverflow(evt);
+    }
+
+    private void HandleNonTerminalEventOverflow(ConnectionEvent evt)
+    {
         this.observability.Diagnostics.Write(
             "Diagnostic",
             "Warn",
@@ -553,12 +989,49 @@ public sealed class TransportService
 
         if (this.registry.TryGet(ConnectionIdOf(evt), out var entry))
         {
-            entry.TryTransitionTo(TransportConnectionState.Closed);
-            entry.Ingress.Close();
-            entry.Egress.Close();
-            this.terminalReserve.Enqueue(new ConnectionEvent.Closed(
-                entry.Id, entry.Epoch, ConnectionCloseReason.Fault));
+            this.RetireConnection(entry, ConnectionCloseReason.Fault, stableErrorId: null);
         }
+    }
+
+    private bool TryEnqueueEventReserve(ConnectionEvent evt)
+    {
+        var terminal = evt is ConnectionEvent.Closed or ConnectionEvent.Faulted;
+        var remainingTerminalSlots = this.terminalReserveCapacity - this.reservedTerminalEvents;
+        if (!terminal
+            && this.eventReserve.Count >= this.eventReserveCapacity - remainingTerminalSlots)
+        {
+            this.observability.Diagnostics.Write(
+                "Diagnostic",
+                "Warn",
+                "transport non-terminal event tail is saturated");
+            return false;
+        }
+
+        if (this.eventReserve.Count >= this.eventReserveCapacity)
+        {
+            this.observability.Diagnostics.Write(
+                "Diagnostic",
+                "Error",
+                "transport event reserve exhausted");
+            throw new InvalidOperationException("transport event reserve exhausted");
+        }
+
+        if (terminal)
+        {
+            if (this.reservedTerminalEvents >= this.terminalReserveCapacity)
+            {
+                this.observability.Diagnostics.Write(
+                    "Diagnostic",
+                    "Error",
+                    "transport terminal event reserve exhausted");
+                throw new InvalidOperationException("transport terminal event reserve exhausted");
+            }
+
+            this.reservedTerminalEvents++;
+        }
+
+        this.eventReserve.Enqueue(evt);
+        return true;
     }
 
     private void ArmIdleTimer(ConnectionEntry entry)

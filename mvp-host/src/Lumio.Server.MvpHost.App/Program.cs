@@ -50,7 +50,16 @@ public static class Program
             composition = HostComposition.Create(options);
             await composition.StartAsync(shutdown.Token).ConfigureAwait(false);
             Console.WriteLine(new HostReadyLine(composition.BoundListenUri, composition.BoundTestControlUri));
-            var completed = await Task.WhenAny(stopped.Task, composition.FatalTask).ConfigureAwait(false);
+            var completed = await Task.WhenAny(
+                stopped.Task,
+                composition.FatalTask,
+                composition.CompletionTask).ConfigureAwait(false);
+            if (completed == stopped.Task)
+            {
+                return await QuiesceForSignalAsync(composition, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+
             return completed == composition.FatalTask || composition.HasFatalFault
                 ? HostExitCodes.Fatal
                 : HostExitCodes.Success;
@@ -74,6 +83,7 @@ public static class Program
             Console.CancelKeyPress -= OnCancel;
             sigint?.Dispose();
             sigterm?.Dispose();
+            shutdown.Cancel();
             if (composition is not null)
             {
                 try
@@ -90,15 +100,32 @@ public static class Program
         void OnCancel(object? sender, ConsoleCancelEventArgs eventArgs)
         {
             eventArgs.Cancel = true;
-            shutdown.Cancel();
             stopped.TrySetResult(null);
         }
 
         void Signal(PosixSignalContext context)
         {
             context.Cancel = true;
-            shutdown.Cancel();
             stopped.TrySetResult(null);
         }
+    }
+
+    internal static async Task<int> QuiesceForSignalAsync(
+        HostComposition composition,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(composition);
+        var requested = composition.BeginShutdown();
+        if (!requested.Accepted)
+        {
+            return HostExitCodes.Fatal;
+        }
+
+        var completed = await Task.WhenAny(composition.FatalTask, composition.CompletionTask)
+            .WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return completed == composition.FatalTask || composition.HasFatalFault
+            ? HostExitCodes.Fatal
+            : HostExitCodes.Success;
     }
 }

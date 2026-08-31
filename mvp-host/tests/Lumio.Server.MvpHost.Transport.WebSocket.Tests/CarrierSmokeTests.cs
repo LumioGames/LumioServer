@@ -92,6 +92,41 @@ public sealed class CarrierSmokeTests
     }
 
     [Fact]
+    public async Task PolicyCloseFlushesQueuedEnvelopeBeforeCloseFrame()
+    {
+        using var clock = new DummyClock();
+        using var timers = new DummyTimers();
+        var options = Options();
+        await using var carrier = WebSocketByteCarrier.Create(
+            in options,
+            new DummyVerifier(),
+            new DummyReplay(),
+            clock,
+            timers,
+            new DummyAudit());
+        using var client = new ClientWebSocket();
+        client.Options.AddSubProtocol(WebSocketCarrierConstants.Subprotocol);
+        client.Options.AddSubProtocol("dG9rZW4");
+        client.Options.AddSubProtocol("Zmx1c2g");
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await client.ConnectAsync(new Uri(carrier.BoundUri), cancellation.Token);
+        var accepted = await carrier.AcceptAsync(cancellation.Token);
+        var payload = Encoding.UTF8.GetBytes("terminal-envelope");
+
+        Assert.True(carrier.TrySend(accepted.ConnectionId, payload));
+        Assert.True(carrier.Close(accepted.ConnectionId, ConnectionCloseReason.PolicyReject));
+        Assert.Equal(0, carrier.ConnectionCount);
+
+        var buffer = new byte[64];
+        var envelope = await client.ReceiveAsync(buffer, cancellation.Token);
+        Assert.Equal(WebSocketMessageType.Text, envelope.MessageType);
+        Assert.Equal(payload, buffer.AsSpan(0, envelope.Count).ToArray());
+        var closed = await client.ReceiveAsync(buffer, cancellation.Token);
+        Assert.Equal(WebSocketMessageType.Close, closed.MessageType);
+        Assert.Equal((WebSocketCloseStatus)WebSocketCarrierConstants.CloseStatusPolicyViolation, closed.CloseStatus);
+    }
+
+    [Fact]
     public async Task RealSecretAndBase64UrlNonceReachTheAcceptedCarrierQueue()
     {
         using var clock = new DummyClock();
@@ -114,7 +149,59 @@ public sealed class CarrierSmokeTests
 
         var accepted = await carrier.AcceptAsync(cancellation.Token);
         Assert.True(accepted.Accepted);
-        Assert.NotNull(accepted.AuthenticationEvidence);
+        Assert.False(carrier.TryTakeAuthenticationMetadata(
+            accepted.ConnectionId,
+            new ConnectionEpoch(1),
+            out _,
+            out _,
+            out _));
+        Assert.True(carrier.TryTakeAuthenticationMetadata(
+            accepted.ConnectionId,
+            new ConnectionEpoch(0),
+            out var principal,
+            out var productId,
+            out var gameReleaseId));
+        Assert.Equal(new PrincipalId("p"), principal);
+        Assert.Equal("A", productId);
+        Assert.Equal("A-1.1.0", gameReleaseId);
+        Assert.False(carrier.TryTakeAuthenticationMetadata(
+            accepted.ConnectionId,
+            new ConnectionEpoch(0),
+            out _,
+            out _,
+            out _));
+    }
+
+    [Fact]
+    public async Task AuthenticationMetadataIsUnavailableAfterConnectionClose()
+    {
+        using var clock = new DummyClock();
+        using var timers = new DummyTimers();
+        var options = Options();
+        await using var carrier = WebSocketByteCarrier.Create(
+            in options,
+            new DummyVerifier(),
+            new DummyReplay(),
+            clock,
+            timers,
+            new DummyAudit());
+
+        using var client = new ClientWebSocket();
+        client.Options.AddSubProtocol(WebSocketCarrierConstants.Subprotocol);
+        client.Options.AddSubProtocol("dG9rZW4");
+        client.Options.AddSubProtocol("Y2xvc2U");
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await client.ConnectAsync(new Uri(carrier.BoundUri), cancellation.Token);
+        var accepted = await carrier.AcceptAsync(cancellation.Token);
+        Assert.True(accepted.Accepted);
+
+        Assert.True(carrier.Close(accepted.ConnectionId, ConnectionCloseReason.OwnerRequest));
+        Assert.False(carrier.TryTakeAuthenticationMetadata(
+            accepted.ConnectionId,
+            new ConnectionEpoch(0),
+            out _,
+            out _,
+            out _));
     }
 
     [Fact]

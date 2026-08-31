@@ -12,6 +12,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MVP_HOST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=eng/GateHelpers.sh
+source "$SCRIPT_DIR/GateHelpers.sh"
 cd "$MVP_HOST_DIR" || exit 1
 
 PROJECT_DIR=src/Lumio.Server.MvpHost.GeneratedContracts
@@ -71,17 +73,24 @@ EDITORCONFIG
 
 count=0
 hash_lines=""
+sources="$(git -C "$ARCH_ROOT" ls-tree -r --name-only "$ARCH_COMMIT" -- packages/csharp \
+  | awk '/[.]cs$/ { print }' | sort)"
+source_enumeration_status=$?
+if [ "$source_enumeration_status" -ne 0 ]; then
+  echo "MVP_HOST_GENERATE_FAIL 架构源 packages/csharp 枚举失败（exit $source_enumeration_status）" >&2
+  exit 1
+fi
 while IFS= read -r src; do
   [ -n "$src" ] || continue
   pkg="$(basename "$(dirname "$src")")"
   base="$(basename "$src")"
   mkdir -p "$GENERATED_DIR/$pkg"
   git -C "$ARCH_ROOT" show "$ARCH_COMMIT:$src" > "$GENERATED_DIR/$pkg/$base" || exit 1
-  digest="$(shasum -a 256 "$GENERATED_DIR/$pkg/$base" | cut -d' ' -f1)"
+  digest="$(gate_sha256_file "$GENERATED_DIR/$pkg/$base")" || exit 1
   hash_lines="${hash_lines}            \"${digest}  ${pkg}/${base}\",
 "
   count=$((count + 1))
-done < <(git -C "$ARCH_ROOT" ls-tree -r --name-only "$ARCH_COMMIT" -- packages/csharp | grep '\.cs$' | sort)
+done <<< "$sources"
 
 if [ "$count" -eq 0 ]; then
   echo 'MVP_HOST_GENERATE_FAIL 架构源 packages/csharp 下一个 .cs 都没有' >&2

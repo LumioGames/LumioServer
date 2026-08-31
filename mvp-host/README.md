@@ -58,7 +58,7 @@ cd mvp-host && bash eng/verify-generated-contracts.sh  # 生成物守护，漂�
 
 Windows 用同名 `.ps1`（`pwsh eng/verify-all.ps1`）。
 
-`verify-all` 的步骤顺序：`verify-isolation` → `verify-sdk` → **`verify-contract-mirror` →
+`verify-all` 的步骤顺序：`verify-isolation` → `verify-sdk` → `verify-gate-portability` → **`verify-contract-mirror` →
 `verify-generated-contracts`** → `dotnet restore build.proj --locked-mode`
 → 逐工程 `dotnet format --verify-no-changes --no-restore` → `dotnet build build.proj -c Release --no-restore`
 → 逐工程 `dotnet test -c Release --no-build`（**排除 `*.Integration.Tests`**——集成测试显式触发，

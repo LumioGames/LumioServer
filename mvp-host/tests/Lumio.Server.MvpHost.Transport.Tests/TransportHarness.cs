@@ -15,7 +15,11 @@ namespace Lumio.Server.MvpHost.Transport.Tests;
 /// </summary>
 internal sealed class TransportHarness : IDisposable
 {
-    internal TransportHarness(ITransportFaultPolicy? faultPolicy = null, int maxMessageBytes = 65536)
+    internal TransportHarness(
+        ITransportFaultPolicy? faultPolicy = null,
+        int maxMessageBytes = 65536,
+        int maxConnections = 8,
+        Func<InMemoryByteCarrier, IByteCarrier>? carrierDecorator = null)
     {
         this.Carrier = new InMemoryByteCarrier();
         this.Clock = new FakeMonotonicClock();
@@ -36,12 +40,17 @@ internal sealed class TransportHarness : IDisposable
             UriPrefix: "ws://127.0.0.1:0/",
             RequireTls: false,
             MaxMessageBytes: maxMessageBytes,
-            MaxConnections: 8,
+            MaxConnections: maxConnections,
             ProductId: "A",
             GameReleaseId: "A-1.1.0");
 
         this.Service = TransportService.Create(
-            this.Carrier, this.FaultPolicy, this.Clock, this.Timers, this.Observability, this.Options);
+            carrierDecorator?.Invoke(this.Carrier) ?? this.Carrier,
+            this.FaultPolicy,
+            this.Clock,
+            this.Timers,
+            this.Observability,
+            this.Options);
     }
 
     internal InMemoryByteCarrier Carrier { get; }
@@ -114,13 +123,19 @@ internal sealed class RecordingTimerService : ITimerService
 
     internal System.Collections.Generic.List<(MonotonicInstant DueAt, object Command)> Scheduled { get; } = new();
 
+    internal System.Collections.Generic.List<TimerId> Canceled { get; } = new();
+
     public TimerId Schedule<TCommand>(MonotonicInstant dueAt, IBoundedInbox<TCommand> target, in TCommand command)
     {
         this.Scheduled.Add((dueAt, command!));
         return this.inner.Schedule(dueAt, target, in command);
     }
 
-    public bool Cancel(TimerId id) => this.inner.Cancel(id);
+    public bool Cancel(TimerId id)
+    {
+        this.Canceled.Add(id);
+        return this.inner.Cancel(id);
+    }
 
     public void Dispose() => this.inner.Dispose();
 }

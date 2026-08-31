@@ -19,26 +19,7 @@ public readonly record struct BindEndpointResult(bool Bound, string BoundUri, st
 public readonly record struct CarrierAccept(
     bool Accepted,
     TransportConnectionId ConnectionId,
-    ImmutableArray<string> RequestedSubprotocols)
-{
-    /// <summary>
-    /// Principal evidence produced after channel authentication. This is
-    /// metadata only; credentials and nonce values are never carried onward.
-    /// </summary>
-    public TransportAuthenticationEvidence? AuthenticationEvidence { get; init; }
-}
-
-/// <summary>
-/// Non-secret witness that the transport channel passed credential and
-/// anti-replay checks during upgrade. Credential and nonce bytes are never
-/// represented by this type.
-/// </summary>
-public readonly record struct TransportAuthenticationEvidence(
-    PrincipalId PrincipalId,
-    TransportConnectionId TransportConnectionId,
-    ConnectionEpoch ConnectionEpoch,
-    string ProductId,
-    string GameReleaseId);
+    ImmutableArray<string> RequestedSubprotocols);
 
 public readonly record struct CarrierReceive(bool Received, int ByteCount, bool EndOfMessage, bool Closed);
 
@@ -111,18 +92,6 @@ public readonly record struct AllocateResult(
     bool Allocated,
     WorldSlotId SlotId,
     SlotEpoch Epoch,
-    string? StableErrorId);
-
-/// <summary>
-/// Result of a serialized WorldSlot admission reservation. The exact handle is
-/// returned by the same operation that records it; callers never infer it from
-/// an attempt id or mutable side channel.
-/// </summary>
-public readonly record struct AdmissionReservationResult(
-    bool Reserved,
-    SlotReservationId Reservation,
-    SlotEpoch Epoch,
-    WorldSlotId SlotId,
     string? StableErrorId);
 
 public readonly record struct QuotaView(int MaxSessions, int BoundSessions);

@@ -12,6 +12,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="lumio-mvp-host" />
     <InternalsVisibleTo Include="Lumio.Server.MvpHost.WorldSlot.Tests" />
   </ItemGroup>
 

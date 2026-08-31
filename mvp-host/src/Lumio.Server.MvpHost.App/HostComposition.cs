@@ -130,6 +130,19 @@ public sealed class HostComposition : IAsyncDisposable
         }
     }
 
+    internal Task CompletionTask
+    {
+        get
+        {
+            _ = Options;
+#if MVP_HOST_FULL_GRAPH
+            return fullGraph?.CompletionTask ?? NeverCompletingTask;
+#else
+            return NeverCompletingTask;
+#endif
+        }
+    }
+
     public static HostComposition Create(HostCommandLineOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -232,6 +245,23 @@ public sealed class HostComposition : IAsyncDisposable
                 Clock,
                 cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    internal AckResult BeginShutdown()
+    {
+        if (disposed)
+        {
+            return new AckResult(false, "ContextClosing");
+        }
+
+        var deadline = Clock.Now;
+#if MVP_HOST_FULL_GRAPH
+        if (fullGraph is not null)
+        {
+            return fullGraph.BeginShutdown(deadline);
+        }
+#endif
+        return ProtocolServer.BeginDrain(deadline);
     }
 
     public async ValueTask DisposeAsync()

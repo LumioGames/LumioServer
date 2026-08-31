@@ -4,6 +4,7 @@ using System.Collections.Immutable;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading;
 using Lumio.Server.MvpHost.HostContracts;
 using Lumio.Server.MvpHost.Observability;
 using Lumio.Server.MvpHost.Platform;
@@ -17,7 +18,10 @@ namespace Lumio.Server.MvpHost.Session;
 /// </summary>
 public sealed class SessionRegistry : IDisposable
 {
+    private const int ReservationReleaseRetryLimit = 3;
+    private const int UnbindRetryLimit = 3;
     private readonly IWorldSlotHost slot;
+    private readonly ISessionWorldSlotPort? admissionPort;
     private readonly IAuthorizationService auth;
     private readonly ITransportControlPort transportControl;
     private readonly IEgressWriter egress;
@@ -26,27 +30,50 @@ public sealed class SessionRegistry : IDisposable
     private readonly ITimerService timers;
     private readonly IBoundedInbox<SessionCommand> controlInbox;
     private readonly IBoundedOutbox<SessionEvent> eventOutbox;
+    private IBoundedInbox<SessionEvent>? eventInbox;
     private readonly ObservabilityServices observability;
     private readonly SessionHostConfiguration config;
+    // All public ingress paths share this gate. The owner pump remains the only
+    // path that applies queued commands, while transport/admin callers cannot
+    // mutate session maps concurrently with it.
+    private readonly object ownerGate = new();
     private readonly Dictionary<string, ServerConnectionSession> sessions = new(StringComparer.Ordinal);
     private readonly Dictionary<ulong, string> connectionSessions = new();
     private readonly Dictionary<string, int> attemptsByConnection = new(StringComparer.Ordinal);
     private readonly Dictionary<ulong, AdmissionAttemptState> admissions = new();
+    private readonly Dictionary<string, AuthenticatedConnection> authenticatedConnections = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DeferredReconnect> deferredReconnects = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, SlotReservationId> committedReservationsBySession = new(StringComparer.Ordinal);
+    private readonly Dictionary<ulong, PendingReservationRelease> pendingReservationReleases = new();
+    private readonly Queue<PendingReservationRelease> deadLetterReservationReleases = new();
+    private readonly HashSet<ulong> deadLetterReservationIds = new();
+    private readonly Dictionary<(ulong ConnectionId, ulong Epoch), PendingUnbind> pendingUnbinds = new();
+    private readonly Queue<PendingUnbind> deadLetterUnbinds = new();
     private readonly HashSet<ulong> compensatedAttempts = new();
+    private readonly Queue<ulong> compensatedAttemptOrder = new();
     private readonly HashSet<ulong> rejectedAttempts = new();
+    private readonly Queue<ulong> rejectedAttemptOrder = new();
     private readonly Queue<SessionEvent> terminalReserve = new();
+    private readonly Queue<OwnerIngress> ownerIngress = new();
+    private readonly Dictionary<(ulong ConnectionId, ulong Epoch), PendingTerminalClose> pendingTerminalCloses = new();
+    private readonly HashSet<string> retainedTerminalSessions = new(StringComparer.Ordinal);
+    private readonly Queue<string> terminalSessionOrder = new();
     private readonly ISessionAdminPort? admin;
 
     private ulong nextAttempt;
     private ulong nextContext;
     private ulong outboundSequence;
-    private ulong auditSequence;
+    private long auditSequence;
     private ulong authorityRevision;
+    private ulong nextReconnectTimerToken;
     private WorldSlotId worldSlotId;
     private SlotEpoch worldSlotEpoch;
     private bool worldSlotAllocated;
     private bool draining;
     private bool disposed;
+    private int ownerThreadId;
+    private int admissionSagaDepth;
+    private int ownerPumpDepth;
 
     private SessionRegistry(
         IWorldSlotHost slot,
@@ -62,6 +89,7 @@ public sealed class SessionRegistry : IDisposable
         in SessionHostConfiguration config)
     {
         this.slot = slot;
+        this.admissionPort = slot as ISessionWorldSlotPort;
         this.auth = auth;
         this.transportControl = transportControl;
         this.egress = egress;
@@ -122,7 +150,12 @@ public sealed class SessionRegistry : IDisposable
 
     /// <summary>Read-only session lookup used by composition and acceptance harnesses.</summary>
     public bool TryGet(ServerSessionId id, out ServerConnectionSession session)
-        => sessions.TryGetValue(id.Value, out session!);
+    {
+        lock (ownerGate)
+        {
+            return sessions.TryGetValue(id.Value, out session!);
+        }
+    }
 
     /// <summary>
     /// Processes the currently queued commands in FIFO order. A bounded pass
@@ -130,13 +163,44 @@ public sealed class SessionRegistry : IDisposable
     /// </summary>
     public void PumpOnce()
     {
-        ObjectDisposedException.ThrowIf(disposed, this);
-
-        var budget = Math.Max(1, controlInbox.Budget.MaxItems);
-        var processed = 0;
-        while (processed++ < budget && controlInbox.TryDequeue(out var command))
+        BindOwnerThread();
+        lock (ownerGate)
         {
-            Process(command);
+            ownerPumpDepth++;
+            try
+            {
+                ObjectDisposedException.ThrowIf(disposed, this);
+
+                var budget = Math.Max(1, controlInbox.Budget.MaxItems);
+                RetryPendingUnbinds(budget);
+                RetryPendingReservationReleases(budget);
+                RetryPendingTerminalCloses(budget);
+
+                var processed = 0;
+                while (processed++ < budget && ownerIngress.Count > 0)
+                {
+                    ProcessOwnerIngress(ownerIngress.Dequeue());
+                }
+
+                processed = 0;
+                while (processed++ < budget && controlInbox.TryDequeue(out var command))
+                {
+                    Process(command);
+                }
+
+                // Dependency callbacks can re-enter while an admission command
+                // is being reduced. Drain them only after that command reaches
+                // its safe boundary, never from inside the callback itself.
+                processed = 0;
+                while (processed++ < budget && ownerIngress.Count > 0)
+                {
+                    ProcessOwnerIngress(ownerIngress.Dequeue());
+                }
+            }
+            finally
+            {
+                ownerPumpDepth--;
+            }
         }
     }
 
@@ -146,39 +210,113 @@ public sealed class SessionRegistry : IDisposable
     /// </summary>
     public AckResult HandleConnectionEvent(in ConnectionEvent connectionEvent)
     {
-        ObjectDisposedException.ThrowIf(disposed, this);
-
-        switch (connectionEvent)
+        lock (ownerGate)
         {
-            case ConnectionEvent.HandshakeEnvelope handshake:
-                var admission = Enqueue(new SessionCommand.ConnectionCandidate(
-                    handshake.Id,
-                    handshake.Epoch,
-                    handshake.Envelope)
-                {
-                    AuthenticationEvidence = handshake.AuthenticationEvidence,
-                });
-                if (!admission.Accepted && admission.StableErrorId == "QueueFull")
-                {
-                    _ = transportControl.TrySend(new ConnectionCommand.Close(
-                        handshake.Id,
-                        handshake.Epoch,
-                        ConnectionCloseReason.PolicyReject));
-                }
+            ObjectDisposedException.ThrowIf(disposed, this);
 
-                return admission;
-            case ConnectionEvent.Closed closed:
-                return HandleDisconnected(closed.Id, closed.Epoch, closed.Reason);
-            case ConnectionEvent.Faulted faulted:
-                return HandleDisconnected(faulted.Id, faulted.Epoch, ConnectionCloseReason.Fault);
-            default:
-                return new AckResult(true, null);
+            switch (connectionEvent)
+            {
+                case ConnectionEvent.HandshakeEnvelope handshake:
+                    var ownedHandshake = CopyHandshake(handshake);
+                    var admission = Enqueue(new SessionCommand.ConnectionCandidate(
+                        ownedHandshake.Id,
+                        ownedHandshake.Epoch,
+                        ownedHandshake.Envelope));
+                    if (!admission.Accepted && admission.StableErrorId == "QueueFull")
+                    {
+                        _ = transportControl.TrySend(new ConnectionCommand.Close(
+                            handshake.Id,
+                            handshake.Epoch,
+                            ConnectionCloseReason.PolicyReject));
+                    }
+
+                    return admission;
+                case ConnectionEvent.Closed closed:
+                    if (!IsCurrentConnectionEventGeneration(closed.Id, closed.Epoch))
+                    {
+                        return new AckResult(false, "StaleConnectionGeneration");
+                    }
+
+                    return EnqueueOwnerIngress(new OwnerIngress.ConnectionClosed(closed));
+                case ConnectionEvent.Faulted faulted:
+                    if (!IsCurrentConnectionEventGeneration(faulted.Id, faulted.Epoch))
+                    {
+                        return new AckResult(false, "StaleConnectionGeneration");
+                    }
+
+                    return EnqueueOwnerIngress(new OwnerIngress.ConnectionFaulted(faulted));
+                default:
+                    return new AckResult(true, null);
+            }
+        }
+    }
+
+    internal AckResult HandleAuthenticatedConnectionEvent(
+        in ConnectionEvent.HandshakeEnvelope handshake,
+        PrincipalId principal,
+        string productId,
+        string gameReleaseId)
+    {
+        lock (ownerGate)
+        {
+            ObjectDisposedException.ThrowIf(disposed, this);
+            var ownedHandshake = CopyHandshake(handshake);
+            return EnqueueOwnerIngress(new OwnerIngress.AuthenticatedHandshake(
+                ownedHandshake,
+                principal,
+                productId,
+                gameReleaseId));
+        }
+    }
+
+    private AckResult HandleAuthenticatedConnectionEventOnOwner(
+        in ConnectionEvent.HandshakeEnvelope handshake,
+        PrincipalId principal,
+        string productId,
+        string gameReleaseId)
+    {
+        lock (ownerGate)
+        {
+            var key = AuthenticatedConnectionKey(handshake.Id, handshake.Epoch);
+            if (authenticatedConnections.ContainsKey(key))
+            {
+                return new AckResult(false, "SessionAntiReplay");
+            }
+
+            authenticatedConnections.Add(
+                key,
+                new AuthenticatedConnection(principal, productId, gameReleaseId));
+            var ownedHandshake = CopyHandshake(handshake);
+            var result = Enqueue(new SessionCommand.ConnectionCandidate(
+                ownedHandshake.Id,
+                ownedHandshake.Epoch,
+                ownedHandshake.Envelope));
+            if (!result.Accepted)
+            {
+                authenticatedConnections.Remove(key);
+            }
+
+            return result;
         }
     }
 
     /// <summary>Queues an already validated ingress frame for replication handling.</summary>
     public AckResult HandleInbound(in ValidatedEnvelopeBytes envelope)
-        => HandleInboundCore(null, null, in envelope);
+    {
+        lock (ownerGate)
+        {
+            if (!IsOwnerThread() || ownerPumpDepth > 0 || admissionSagaDepth > 0)
+            {
+                var copy = CopyEnvelope(in envelope);
+                return EnqueueOwnerIngress(new OwnerIngress.InboundEnvelope(
+                    null,
+                    null,
+                    copy));
+            }
+
+            return HandleInboundCore(null, null, in envelope);
+        }
+    }
 
     /// <summary>
     /// Handles an ingress frame when the transport adapter can provide its
@@ -190,13 +328,28 @@ public sealed class SessionRegistry : IDisposable
         TransportConnectionId connectionId,
         ConnectionEpoch connectionEpoch,
         in ValidatedEnvelopeBytes envelope)
-        => HandleInboundCore(connectionId, connectionEpoch, in envelope);
+    {
+        lock (ownerGate)
+        {
+            if (!IsOwnerThread() || ownerPumpDepth > 0 || admissionSagaDepth > 0)
+            {
+                var copy = CopyEnvelope(in envelope);
+                return EnqueueOwnerIngress(new OwnerIngress.InboundEnvelope(
+                    connectionId,
+                    connectionEpoch,
+                    copy));
+            }
+
+            return HandleInboundCore(connectionId, connectionEpoch, in envelope);
+        }
+    }
 
     private AckResult HandleInboundCore(
         TransportConnectionId? connectionId,
         ConnectionEpoch? connectionEpoch,
         in ValidatedEnvelopeBytes envelope)
     {
+        EnsureOwnerThread();
         ObjectDisposedException.ThrowIf(disposed, this);
 
         if (!sessions.TryGetValue(envelope.Header.SessionId, out var session))
@@ -219,6 +372,11 @@ public sealed class SessionRegistry : IDisposable
             || (connectionEpoch is { } suppliedEpoch && suppliedEpoch != binding.ConnectionEpoch))
         {
             return new AckResult(false, "StaleConnectionGeneration");
+        }
+
+        if (HasPendingTerminalClose(binding.ConnectionId, binding.ConnectionEpoch))
+        {
+            return new AckResult(false, "ContextClosing");
         }
 
         var validation = MvpEnvelopeReader.Validate(envelope.Bytes.Span);
@@ -271,7 +429,7 @@ public sealed class SessionRegistry : IDisposable
                 }
 
                 return authorityRevision > confirmedRevision
-                    ? SendDelta(session, binding, confirmedRevision)
+                    ? SendDeltaOrIsolateOnQueueFull(session, binding, confirmedRevision)
                     : new AckResult(true, null);
             case "ResyncRequest":
                 if (session.State != ServerConnectionSessionState.Active)
@@ -279,21 +437,26 @@ public sealed class SessionRegistry : IDisposable
                     return new AckResult(false, "SnapshotBaseMismatch");
                 }
 
-                return SendFullSnapshot(session, binding);
+                return SendFullSnapshotOrIsolateOnQueueFull(session, binding);
             case "DeltaAck":
                 if (session.State != ServerConnectionSessionState.Active)
                 {
                     return new AckResult(false, "SnapshotBaseMismatch");
                 }
 
-                if (!TryReadDeltaAck(envelope.Bytes, out var toRevision)
+                if (!TryReadDeltaAck(
+                        envelope.Bytes,
+                        out var confirmationSequence,
+                        out var toRevision)
                     || toRevision > authorityRevision
-                    || !session.TryAcknowledgeDelta(toRevision))
+                    || !session.TryAcknowledgeDelta(confirmationSequence, toRevision))
                 {
                     return new AckResult(false, "SnapshotBaseMismatch");
                 }
 
-                return new AckResult(true, null);
+                return authorityRevision > toRevision
+                    ? SendDeltaOrIsolateOnQueueFull(session, binding, toRevision)
+                    : new AckResult(true, null);
             default:
                 return new AckResult(false, "MessagePermissionDenied");
         }
@@ -305,33 +468,65 @@ public sealed class SessionRegistry : IDisposable
     /// </summary>
     public AckResult NotifyAuthorityRevision(ulong revision)
     {
-        ObjectDisposedException.ThrowIf(disposed, this);
-
-        if (revision < authorityRevision)
+        lock (ownerGate)
         {
-            return new AckResult(false, "RevisionConflict");
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (!IsOwnerThread() || ownerPumpDepth > 0 || admissionSagaDepth > 0)
+            {
+                return EnqueueOwnerIngress(new OwnerIngress.AuthorityRevision(revision));
+            }
+
+            return NotifyAuthorityRevisionOnOwner(revision);
         }
+    }
 
-        var previous = authorityRevision;
-        if (revision == previous)
+    private AckResult NotifyAuthorityRevisionOnOwner(ulong revision)
+    {
+        lock (ownerGate)
         {
+            ObjectDisposedException.ThrowIf(disposed, this);
+
+            if (revision < authorityRevision)
+            {
+                return new AckResult(false, "RevisionConflict");
+            }
+
+            var changed = revision != authorityRevision;
+            authorityRevision = revision;
+            ResumeDeferredReconnects();
+            foreach (var session in sessions.Values.ToArray())
+            {
+                if (changed)
+                {
+                    TraceState(session);
+                }
+
+                if (session.State == ServerConnectionSessionState.Active
+                    && session.BaselineAcknowledged
+                    && session.Binding is { } binding
+                    && authorityRevision > session.LastSnapshotRevision)
+                {
+                    var delta = SendDelta(session, binding, session.LastSnapshotRevision);
+                    if (!delta.Accepted)
+                    {
+                        if (delta.StableErrorId == "QueueFull")
+                        {
+                            var isolated = IsolateEgressBackpressure(session, binding);
+                            if (!isolated.Accepted)
+                            {
+                                return isolated;
+                            }
+
+                            continue;
+                        }
+
+                        return delta;
+                    }
+                }
+            }
+
             return new AckResult(true, null);
         }
-
-        authorityRevision = revision;
-        foreach (var session in sessions.Values.ToArray())
-        {
-            TraceState(session);
-            if (session.State == ServerConnectionSessionState.Active
-                && session.BaselineAcknowledged
-                && session.Binding is { } binding
-                && authorityRevision > session.LastSnapshotRevision)
-            {
-                _ = SendDelta(session, binding, session.LastSnapshotRevision);
-            }
-        }
-
-        return new AckResult(true, null);
     }
 
     /// <summary>Exposes the terminal reserve to an integration harness without a mutable registry view.</summary>
@@ -346,6 +541,34 @@ public sealed class SessionRegistry : IDisposable
         sessionEvent = terminalReserve.Dequeue();
         return true;
     }
+
+    /// <summary>Attaches the composition-root read lane for the unified FIFO view.</summary>
+    internal void AttachEventInbox(IBoundedInbox<SessionEvent> inbox)
+    {
+        ArgumentNullException.ThrowIfNull(inbox);
+        eventInbox = inbox;
+    }
+
+    /// <summary>
+    /// Dequeues the primary event prefix before the reserved tail. Once a terminal
+    /// event spills, later events are routed to the same tail by <see cref="Publish"/>.
+    /// </summary>
+    internal bool TryDequeueEvent(out SessionEvent sessionEvent)
+    {
+        if (eventInbox is not null && eventInbox.TryDequeue(out sessionEvent!))
+        {
+            return true;
+        }
+
+        return TryDequeueTerminal(out sessionEvent!);
+    }
+
+    /// <summary>
+    /// Once a terminal event spills into the reserve, later events must join the
+    /// same FIFO tail until the reserve drains. The application uses this bit to
+    /// drain the older primary lane before taking the reserved tail.
+    /// </summary>
+    internal bool HasPendingTerminalEvents => terminalReserve.Count > 0;
 
     internal int SessionCount => sessions.Count;
 
@@ -366,90 +589,266 @@ public sealed class SessionRegistry : IDisposable
         };
     }
 
+    /// <summary>
+    /// Records the local-fault contract gap without guessing an affected session.
+    /// The frozen FaultAdjudicated event carries no session identity.
+    /// </summary>
+    internal void RecordUnroutableSessionFault(SlotEpoch epoch, HostFaultClass faultClass)
+    {
+        lock (ownerGate)
+        {
+            observability.Diagnostics.Write(
+                "Diagnostic",
+                "Error",
+                $"session-local fault could not be isolated: affected-session identity is absent (fault={faultClass}, epoch={epoch.Value})");
+        }
+    }
+
     internal AckResult BeginDrain(MonotonicInstant graceDeadline)
     {
-        SessionCommand command = new SessionCommand.BeginDrain(graceDeadline);
-        var result = Enqueue(in command);
-        if (result.Accepted)
+        lock (ownerGate)
         {
-            PumpOnce();
+            SessionCommand command = new SessionCommand.BeginDrain(graceDeadline);
+            var result = Enqueue(in command);
+            return result;
         }
-
-        return result;
     }
 
     internal AckResult Kick(ServerSessionId sessionId, string reasonCode)
     {
-        SessionCommand command = new SessionCommand.Kick(sessionId, reasonCode);
-        var result = Enqueue(in command);
-        if (result.Accepted)
+        lock (ownerGate)
         {
-            PumpOnce();
+            SessionCommand command = new SessionCommand.Kick(sessionId, reasonCode);
+            var result = Enqueue(in command);
+            return result;
         }
-
-        return result;
     }
 
     internal AckResult InjectWorldMutation(ServerSessionId onBehalfOf, ReadOnlyMemory<byte> opaqueCommand)
     {
-        if (worldMutations is null)
+        lock (ownerGate)
         {
-            return new AckResult(false, "ContextClosing");
-        }
+            if (worldMutations is null)
+            {
+                return new AckResult(false, "ContextClosing");
+            }
 
-        var result = worldMutations.TryEnqueueOpaqueMutation(opaqueCommand);
-        return result.Status switch
-        {
-            EnqueueStatus.Accepted => new AckResult(true, null),
-            EnqueueStatus.Full => new AckResult(false, "QueueFull"),
-            _ => new AckResult(false, "ContextClosing"),
-        };
+            var result = worldMutations.TryEnqueueOpaqueMutation(opaqueCommand);
+            return result.Status switch
+            {
+                EnqueueStatus.Accepted => new AckResult(true, null),
+                EnqueueStatus.Full => new AckResult(false, "QueueFull"),
+                _ => new AckResult(false, "ContextClosing"),
+            };
+        }
     }
 
     public void Dispose()
     {
-        if (disposed)
+        lock (ownerGate)
         {
-            return;
-        }
-
-        disposed = true;
-        foreach (var session in sessions.Values.ToArray())
-        {
-            if (session.Binding is { } binding)
+            if (disposed)
             {
-                _ = transportControl.TrySend(new ConnectionCommand.Close(
-                    binding.ConnectionId,
-                    binding.ConnectionEpoch,
-                    ConnectionCloseReason.OwnerRequest));
+                return;
             }
+
+            disposed = true;
+
+            // Committed capacity belongs to this registry until the release is
+            // accepted or represented by the bounded pending/dead-letter queues.
+            foreach (var pair in committedReservationsBySession.ToArray())
+            {
+                var session = sessions.TryGetValue(pair.Key, out var active)
+                    ? active
+                    : null;
+                QueueReservationRelease(
+                    pair.Value,
+                    new ServerSessionId(pair.Key),
+                    session?.SlotEpoch ?? worldSlotEpoch,
+                    committed: true);
+            }
+
+            RetryPendingReservationReleases(ReservationReleaseRetryLimit);
+            foreach (var session in sessions.Values.ToArray())
+            {
+                if (session.Binding is { } binding)
+                {
+                    try
+                    {
+                        _ = transportControl.TrySend(new ConnectionCommand.Close(
+                            binding.ConnectionId,
+                            binding.ConnectionEpoch,
+                            ConnectionCloseReason.OwnerRequest));
+                    }
+                    catch (Exception ex)
+                    {
+                        observability.Diagnostics.Write(
+                            "Diagnostic",
+                            "Error",
+                            $"session disposal close failed: {ex.GetType().Name}");
+                    }
+                }
+            }
+
+            foreach (var deferred in deferredReconnects.Values)
+            {
+                try
+                {
+                    _ = transportControl.TrySend(new ConnectionCommand.Close(
+                        deferred.Candidate.ConnectionId,
+                        deferred.Candidate.ConnectionEpoch,
+                        ConnectionCloseReason.OwnerRequest));
+                }
+                catch (Exception ex)
+                {
+                    observability.Diagnostics.Write(
+                        "Diagnostic",
+                        "Error",
+                        $"deferred session disposal close failed: {ex.GetType().Name}");
+                }
+            }
+
+            controlInbox.Close();
+            authenticatedConnections.Clear();
+            pendingTerminalCloses.Clear();
+            ownerIngress.Clear();
+        }
+    }
+
+    private void BindOwnerThread()
+    {
+        var current = Environment.CurrentManagedThreadId;
+        var owner = Interlocked.CompareExchange(ref ownerThreadId, current, 0);
+        if (owner != 0 && owner != current)
+        {
+            throw new InvalidOperationException("Session owner operations must run on the bound owner thread");
+        }
+    }
+
+    private bool IsOwnerThread()
+        => Volatile.Read(ref ownerThreadId) == Environment.CurrentManagedThreadId;
+
+    private bool IsCurrentConnectionEventGeneration(
+        TransportConnectionId connection,
+        ConnectionEpoch epoch)
+    {
+        if (!connectionSessions.TryGetValue(connection.Value, out var sessionId)
+            || !sessions.TryGetValue(sessionId, out var session)
+            || session.Binding is not { } binding)
+        {
+            // An admission callback may arrive before the saga installs its
+            // mapping; queue it and let the post-saga drain validate again.
+            return true;
         }
 
-        controlInbox.Close();
+        return binding.ConnectionEpoch == epoch;
+    }
+
+    private void EnsureOwnerThread()
+    {
+        if (!IsOwnerThread())
+        {
+            throw new InvalidOperationException("Session owner operations must run on the bound owner thread");
+        }
+    }
+
+    private AckResult EnqueueOwnerIngress(OwnerIngress ingress)
+    {
+        if (ownerIngress.Count >= Math.Max(1, controlInbox.Budget.MaxItems))
+        {
+            return new AckResult(false, "QueueFull");
+        }
+
+        ownerIngress.Enqueue(ingress);
+        return new AckResult(true, null);
+    }
+
+    private void ProcessOwnerIngress(OwnerIngress ingress)
+    {
+        switch (ingress)
+        {
+            case OwnerIngress.ConnectionClosed closed:
+                _ = HandleDisconnected(
+                    closed.Event.Id,
+                    closed.Event.Epoch,
+                    closed.Event.Reason);
+                break;
+            case OwnerIngress.ConnectionFaulted faulted:
+                _ = HandleDisconnected(
+                    faulted.Event.Id,
+                    faulted.Event.Epoch,
+                    ConnectionCloseReason.Fault);
+                break;
+            case OwnerIngress.AuthenticatedHandshake authenticated:
+                var handshake = authenticated.Event;
+                _ = HandleAuthenticatedConnectionEventOnOwner(
+                    in handshake,
+                    authenticated.Principal,
+                    authenticated.ProductId,
+                    authenticated.GameReleaseId);
+                break;
+            case OwnerIngress.InboundEnvelope inbound:
+                var envelope = inbound.Envelope;
+                _ = inbound.ConnectionId is { } connectionId
+                    && inbound.ConnectionEpoch is { } connectionEpoch
+                    ? HandleInboundCore(connectionId, connectionEpoch, in envelope)
+                    : HandleInboundCore(null, null, in envelope);
+                break;
+            case OwnerIngress.AuthorityRevision revision:
+                var revisionResult = NotifyAuthorityRevisionOnOwner(revision.Revision);
+                if (!revisionResult.Accepted)
+                {
+                    var errorId = revisionResult.StableErrorId ?? "RevisionConflict";
+                    observability.Diagnostics.Write(
+                        "Diagnostic",
+                        "Error",
+                        $"authority revision synchronization rejected: {errorId}");
+                    throw new InvalidOperationException(
+                        $"Authority revision synchronization rejected: {errorId}");
+                }
+
+                break;
+        }
     }
 
     private void Process(SessionCommand command)
     {
-        switch (command)
+        var admission = command is SessionCommand.ConnectionCandidate;
+        if (admission)
         {
-            case SessionCommand.ConnectionCandidate candidate:
-                Admit(candidate);
-                break;
-            case SessionCommand.DependencyResult dependency:
-                ProcessDependencyResult(dependency);
-                break;
-            case SessionCommand.BeginDrain drain:
-                ExecuteBeginDrain(drain);
-                break;
-            case SessionCommand.Kick kick:
-                ExecuteKick(kick);
-                break;
-            case SessionCommand.TimerFired timer:
-                ExecuteTimer(timer);
-                break;
-            case SessionCommand.SlotFaulted fault:
-                ExecuteSlotFault(fault);
-                break;
+            admissionSagaDepth++;
+        }
+
+        try
+        {
+            switch (command)
+            {
+                case SessionCommand.ConnectionCandidate candidate:
+                    Admit(candidate);
+                    break;
+                case SessionCommand.DependencyResult dependency:
+                    ProcessDependencyResult(dependency);
+                    break;
+                case SessionCommand.BeginDrain drain:
+                    ExecuteBeginDrain(drain);
+                    break;
+                case SessionCommand.Kick kick:
+                    ExecuteKick(kick);
+                    break;
+                case SessionCommand.TimerFired timer:
+                    ExecuteTimer(timer);
+                    break;
+                case SessionCommand.SlotFaulted fault:
+                    ExecuteSlotFault(fault);
+                    break;
+            }
+        }
+        finally
+        {
+            if (admission)
+            {
+                admissionSagaDepth--;
+            }
         }
     }
 
@@ -462,6 +861,7 @@ public sealed class SessionRegistry : IDisposable
             ? $"session-{candidate.ConnectionId.Value}"
             : header.SessionId;
         var sessionId = new ServerSessionId(sessionIdText);
+        admissions[attempt.Value].SessionId = sessionId;
 
         if (!RecordAttempt(candidate.ConnectionId, attempt))
         {
@@ -484,7 +884,8 @@ public sealed class SessionRegistry : IDisposable
             }
             else
             {
-                Reject(attempt, candidate, "SessionMismatch", close: true, traceCompensation: false);
+                SendErrorAndClose(candidate, "SessionMismatch");
+                Reject(attempt, candidate, "SessionMismatch", close: false, traceCompensation: false);
             }
 
             return;
@@ -561,8 +962,8 @@ public sealed class SessionRegistry : IDisposable
         admissions[attempt.Value].Reservation = reservation;
         admissions[attempt.Value].SlotEpoch = slotEpoch;
         TraceAck(AdmissionEffectKind.CommitSlot, attempt, slotEpoch, candidate.ConnectionEpoch);
-        var commit = slot is IWorldSlotAdmissionPort admissionPort
-            ? admissionPort.BindSession(reservation, sessionId, slotEpoch)
+        var commit = this.admissionPort is { } admission
+            ? admission.BindSession(reservation, sessionId, slotEpoch)
             : new AckResult(false, "InvalidArgument");
         if (!commit.Accepted)
         {
@@ -571,6 +972,7 @@ public sealed class SessionRegistry : IDisposable
         }
 
         admissions[attempt.Value].SlotCommitted = true;
+        admissions[attempt.Value].ReleaseCommittedOnCompensation = true;
 
         TraceAck(AdmissionEffectKind.CreateSession, attempt, slotEpoch, candidate.ConnectionEpoch);
         if (sessions.ContainsKey(sessionId.Value))
@@ -584,10 +986,15 @@ public sealed class SessionRegistry : IDisposable
             new SessionEpoch(0),
             config.ProductId,
             config.GameReleaseId);
+        var grant = auth.Authorize(
+            authentication.Principal,
+            new SessionScope(sessionId, config.ProductId, config.GameReleaseId, "Client"));
+        session.SetPrincipal(authentication.Principal);
         session.Associate(worldSlotId, slotEpoch);
         var context = new ReplicationContextHandle(++nextContext);
-        var grantRef = GrantReference(authentication.Grant!, attempt);
+        var grantRef = GrantReference(grant, attempt);
         sessions.Add(sessionId.Value, session);
+        committedReservationsBySession[sessionId.Value] = reservation;
         admissions[attempt.Value].Session = session;
         admissions[attempt.Value].Reservation = reservation;
         admissions[attempt.Value].SlotEpoch = slotEpoch;
@@ -623,8 +1030,14 @@ public sealed class SessionRegistry : IDisposable
         var snapshot = SendFullSnapshot(session, activeBinding);
         if (!snapshot.Accepted)
         {
-            Compensate(attempt, candidate, session, boundEpoch);
-            Reject(attempt, candidate, NormalizeStableError(snapshot.StableErrorId, "QueueFull"), close: true, traceCompensation: false);
+            var closeEpoch = Compensate(attempt, candidate, session, boundEpoch);
+            Reject(
+                attempt,
+                candidate,
+                NormalizeStableError(snapshot.StableErrorId, "QueueFull"),
+                close: true,
+                traceCompensation: false,
+                closeEpoch: closeEpoch);
             return;
         }
 
@@ -637,10 +1050,22 @@ public sealed class SessionRegistry : IDisposable
 
     private void Reconnect(ServerConnectionSession session, SessionCommand.ConnectionCandidate candidate, AdmissionAttemptId attempt)
     {
+        if (deferredReconnects.ContainsKey(session.SessionId.Value))
+        {
+            Reject(attempt, candidate, "SessionMismatch", close: true, traceCompensation: false);
+            return;
+        }
+
         if (candidate.Handshake.Header.MessageType != "Handshake"
             || !IsHandshakeClient(candidate.Handshake))
         {
             Reject(attempt, candidate, "RoleMismatch", close: true, traceCompensation: false);
+            return;
+        }
+
+        if (session.Binding is not null)
+        {
+            Reject(attempt, candidate, "SessionMismatch", close: true, traceCompensation: false);
             return;
         }
 
@@ -652,6 +1077,13 @@ public sealed class SessionRegistry : IDisposable
             return;
         }
 
+        if (session.Principal is not { } expectedPrincipal
+            || authentication.Principal != expectedPrincipal)
+        {
+            Reject(attempt, candidate, "SessionMismatch", close: true, traceCompensation: false);
+            return;
+        }
+
         TraceAck(AdmissionEffectKind.MatchExactRelease, attempt, session.SlotEpoch, candidate.ConnectionEpoch);
         if (!ExactRelease(candidate.Handshake.Header))
         {
@@ -660,18 +1092,35 @@ public sealed class SessionRegistry : IDisposable
             return;
         }
 
-        if (session.Binding is not null)
+        if (session.LastSentDeltaRevision is { } lastDeltaRevision
+            && authorityRevision <= lastDeltaRevision)
         {
-            Reject(attempt, candidate, "SessionMismatch", close: true, traceCompensation: false);
+            admissions.Remove(attempt.Value);
+            deferredReconnects.Add(
+                session.SessionId.Value,
+                new DeferredReconnect(attempt, candidate));
             return;
         }
+
+        var grant = auth.Authorize(
+            authentication.Principal,
+            new SessionScope(session.SessionId, config.ProductId, config.GameReleaseId, "Client"));
+        CompleteReconnect(session, candidate, attempt, grant);
+    }
+
+    private void CompleteReconnect(
+        ServerConnectionSession session,
+        SessionCommand.ConnectionCandidate candidate,
+        AdmissionAttemptId attempt,
+        PermissionGrant grant)
+    {
 
         TraceAck(AdmissionEffectKind.ReserveSlot, attempt, session.SlotEpoch, candidate.ConnectionEpoch);
         TraceAck(AdmissionEffectKind.CommitSlot, attempt, session.SlotEpoch, candidate.ConnectionEpoch);
         TraceAck(AdmissionEffectKind.CreateSession, attempt, session.SlotEpoch, candidate.ConnectionEpoch);
         TraceAck(AdmissionEffectKind.BindConnection, attempt, session.SlotEpoch, candidate.ConnectionEpoch);
 
-        var grantRef = GrantReference(authentication.Grant!, attempt);
+        var grantRef = GrantReference(grant, attempt);
         var bind = transportControl.TrySend(new ConnectionCommand.Bind(
             candidate.ConnectionId,
             candidate.ConnectionEpoch,
@@ -685,10 +1134,12 @@ public sealed class SessionRegistry : IDisposable
 
         admissions[attempt.Value] = new AdmissionAttemptState(attempt, candidate)
         {
+            SessionId = session.SessionId,
             Session = session,
             SlotEpoch = session.SlotEpoch,
             Grant = grantRef,
             SlotCommitted = true,
+            ReleaseCommittedOnCompensation = false,
             TransportBound = true,
             BoundEpoch = new ConnectionEpoch(candidate.ConnectionEpoch.Value + 1),
         };
@@ -697,6 +1148,7 @@ public sealed class SessionRegistry : IDisposable
         {
             _ = timers.Cancel(timer);
             session.PendingTimer = null;
+            session.PendingTimerToken = null;
         }
 
         session.AdvanceSessionEpoch();
@@ -709,16 +1161,23 @@ public sealed class SessionRegistry : IDisposable
         session.Bind(
             activeBinding,
             session.ReplicationContext ?? new ReplicationContextHandle(++nextContext));
+        admissions[attempt.Value].ReleaseCommittedOnCompensation = true;
         connectionSessions[candidate.ConnectionId.Value] = session.SessionId.Value;
         TraceAck(AdmissionEffectKind.StartReplication, attempt, session.SlotEpoch, activeBinding.ConnectionEpoch);
         SetState(session, ServerConnectionSessionState.Syncing);
         var snapshot = SendFullSnapshot(session, activeBinding);
         if (!snapshot.Accepted)
         {
-            Compensate(attempt, candidate, session, activeBinding.ConnectionEpoch);
+            var closeEpoch = Compensate(attempt, candidate, session, activeBinding.ConnectionEpoch);
             session.ClearConnectionBinding();
             SetState(session, ServerConnectionSessionState.Closed);
-            Reject(attempt, candidate, NormalizeStableError(snapshot.StableErrorId, "QueueFull"), close: true, traceCompensation: false);
+            Reject(
+                attempt,
+                candidate,
+                NormalizeStableError(snapshot.StableErrorId, "QueueFull"),
+                close: true,
+                traceCompensation: false,
+                closeEpoch: closeEpoch);
             return;
         }
 
@@ -728,32 +1187,29 @@ public sealed class SessionRegistry : IDisposable
 
     private AuthenticateResult Authenticate(SessionCommand.ConnectionCandidate candidate, ServerSessionId sessionId)
     {
-        if (candidate.AuthenticationEvidence is { } evidence)
+        var authenticatedKey = AuthenticatedConnectionKey(
+            candidate.ConnectionId,
+            candidate.ConnectionEpoch);
+        if (authenticatedConnections.Remove(authenticatedKey, out var authenticated))
         {
-            if (evidence.TransportConnectionId != candidate.ConnectionId
-                || evidence.ConnectionEpoch != candidate.ConnectionEpoch)
+            if (string.IsNullOrWhiteSpace(authenticated.Principal.Value))
             {
-                return new AuthenticateResult(false, "StaleConnectionGeneration", null);
+                return new AuthenticateResult(false, "RoleMismatch", default);
             }
 
-            if (string.IsNullOrWhiteSpace(evidence.PrincipalId.Value)
-                || !string.Equals(
-                    evidence.ProductId,
-                    candidate.Handshake.Header.ProductId,
+            if (!string.Equals(
+                    authenticated.ProductId,
+                    config.ProductId,
                     StringComparison.Ordinal)
                 || !string.Equals(
-                    evidence.GameReleaseId,
-                    candidate.Handshake.Header.GameReleaseId,
-                    StringComparison.Ordinal)
-                || !ExactRelease(candidate.Handshake.Header))
+                    authenticated.GameReleaseId,
+                    config.GameReleaseId,
+                    StringComparison.Ordinal))
             {
-                return new AuthenticateResult(false, "ReleaseMismatch", null);
+                return new AuthenticateResult(false, "ReleaseMismatch", default);
             }
 
-            var evidenceGrant = auth.Authorize(
-                evidence.PrincipalId,
-                new SessionScope(sessionId, config.ProductId, config.GameReleaseId, "Client"));
-            return new AuthenticateResult(true, null, evidenceGrant);
+            return new AuthenticateResult(true, null, authenticated.Principal);
         }
 
         using var credential = new OpaqueCredentialInput(
@@ -775,13 +1231,10 @@ public sealed class SessionRegistry : IDisposable
             var reason = outcome.AntiReplay != AntiReplayVerdict.Ok
                 ? "SessionAntiReplay"
                 : outcome.StableErrorId;
-            return new AuthenticateResult(false, reason, null);
+            return new AuthenticateResult(false, reason, default);
         }
 
-        var grant = auth.Authorize(
-            outcome.Principal,
-            new SessionScope(sessionId, config.ProductId, config.GameReleaseId, "Client"));
-        return new AuthenticateResult(true, null, grant);
+        return new AuthenticateResult(true, null, outcome.Principal);
     }
 
     private AuthenticateResult Authenticate(SessionCommand.ConnectionCandidate candidate, ServerConnectionSession session)
@@ -797,13 +1250,18 @@ public sealed class SessionRegistry : IDisposable
                 // compensation guard makes the first terminal result authoritative.
                 if (!compensatedAttempts.Contains(dependency.Attempt.Value))
                 {
-                    Compensate(dependency.Attempt, candidate: null, session: null, boundEpoch: null);
+                    var closeEpoch = Compensate(
+                        dependency.Attempt,
+                        candidate: null,
+                        session: null,
+                        boundEpoch: null);
                     Reject(
                         dependency.Attempt,
                         admission.Candidate,
                         NormalizeStableError(dependency.StableErrorId, "QueueFull"),
                         close: true,
-                        traceCompensation: false);
+                        traceCompensation: false,
+                        closeEpoch: closeEpoch);
                 }
             }
 
@@ -822,7 +1280,15 @@ public sealed class SessionRegistry : IDisposable
         var epoch = worldSlotAllocated
             ? worldSlotEpoch
             : sessions.Values.Select(s => s.SlotEpoch).FirstOrDefault();
-        _ = slot.Quiesce("MaintenanceDrain", epoch);
+        var quiesce = slot.Quiesce("MaintenanceDrain", epoch);
+        if (!quiesce.Accepted)
+        {
+            observability.Diagnostics.Write(
+                "Diagnostic",
+                "Error",
+                $"world-slot quiesce rejected: {NormalizeStableError(quiesce.StableErrorId, "InternalInvariant")}");
+            throw new InvalidOperationException("World-slot quiesce was rejected");
+        }
 
         foreach (var session in sessions.Values.ToArray())
         {
@@ -837,18 +1303,30 @@ public sealed class SessionRegistry : IDisposable
             {
                 _ = timers.Cancel(timer);
                 session.PendingTimer = null;
+                session.PendingTimerToken = null;
             }
+
+            CancelDeferredReconnect(session, "ContextClosing");
 
             if (session.Binding is { } binding)
             {
-                _ = transportControl.TrySend(new ConnectionCommand.SetDrain(binding.ConnectionId, binding.ConnectionEpoch, true));
-                _ = transportControl.TrySend(new ConnectionCommand.Close(
-                    binding.ConnectionId,
-                    binding.ConnectionEpoch,
-                    ConnectionCloseReason.OwnerRequest));
+                if (!HasPendingTerminalClose(binding.ConnectionId, binding.ConnectionEpoch))
+                {
+                    _ = transportControl.TrySend(new ConnectionCommand.SetDrain(
+                        binding.ConnectionId,
+                        binding.ConnectionEpoch,
+                        true));
+                    _ = transportControl.TrySend(new ConnectionCommand.Close(
+                        binding.ConnectionId,
+                        binding.ConnectionEpoch,
+                        ConnectionCloseReason.OwnerRequest));
+                }
+
                 connectionSessions.Remove(binding.ConnectionId.Value);
                 session.ClearConnectionBinding();
             }
+
+            ReleaseCommittedReservation(session);
 
             SetState(session, ServerConnectionSessionState.Closed);
             Publish(new SessionEvent.Drained(session.SessionId, session.SessionEpoch));
@@ -869,17 +1347,30 @@ public sealed class SessionRegistry : IDisposable
             return;
         }
 
+        CancelDeferredReconnect(session, "SessionMismatch");
+
         if (session.Binding is { } binding)
         {
             var envelope = BuildMaintenanceKick(session, command.RegisteredReasonCode);
-            _ = egress.TryEnqueue(binding.ConnectionId, binding.ConnectionEpoch, new OutboundEnvelopeBytes(envelope));
-            _ = transportControl.TrySend(new ConnectionCommand.Close(
+            EnqueueTerminalEnvelopeThenClose(
                 binding.ConnectionId,
                 binding.ConnectionEpoch,
-                ConnectionCloseReason.MaintenanceKick));
-            connectionSessions.Remove(binding.ConnectionId.Value);
-            session.ClearConnectionBinding();
+                new OutboundEnvelopeBytes(envelope),
+                ConnectionCloseReason.MaintenanceKick);
+            // The transport Closed event is the serialized fact that moves a
+            // live session into its reconnect window. Keep the binding and slot
+            // reservation until that event arrives.
+            return;
         }
+
+        if (session.PendingTimer is { } pendingTimer)
+        {
+            _ = timers.Cancel(pendingTimer);
+            session.PendingTimer = null;
+            session.PendingTimerToken = null;
+        }
+
+        ReleaseCommittedReservation(session);
 
         SetState(session, ServerConnectionSessionState.Kicked);
         Publish(new SessionEvent.Kicked(session.SessionId, session.SessionEpoch, command.RegisteredReasonCode));
@@ -889,15 +1380,18 @@ public sealed class SessionRegistry : IDisposable
     {
         if (!sessions.TryGetValue(command.SessionId.Value, out var session)
             || session.State != ServerConnectionSessionState.ReconnectWindow
-            || session.PendingTimer is not { } pending
-            || (command.Timer.Value != 0 && pending != command.Timer))
+            || session.PendingTimer is null
+            || session.PendingTimerToken != command.Timer)
         {
             return;
         }
 
         session.PendingTimer = null;
+        session.PendingTimerToken = null;
+        CancelDeferredReconnect(session, "SessionMismatch");
         SetState(session, ServerConnectionSessionState.Expired);
         session.ClearReplicationContext();
+        ReleaseCommittedReservation(session);
         foreach (var connection in connectionSessions
             .Where(pair => pair.Value == session.SessionId.Value)
             .Select(pair => pair.Key)
@@ -907,18 +1401,29 @@ public sealed class SessionRegistry : IDisposable
         }
     }
 
-    private static void ExecuteSlotFault(SessionCommand.SlotFaulted command)
+    private void ExecuteSlotFault(SessionCommand.SlotFaulted command)
     {
-        // Faulted is intentionally modeled in the shared state enum but is
-        // unreachable in the MVP session track (ABS-SESSION-FAULTED-UNREACHABLE).
-        // Fault adjudication belongs to WorldSlot; a session never infers a
-        // fault domain or mutates itself from this notification.
+        // The published FaultAdjudicated event carries slot/epoch only, not an
+        // affected session identity. Never infer one (or take unrelated sessions
+        // down); leave a stable diagnostic for the upstream contract blocker.
+        RecordUnroutableSessionFault(command.Epoch, command.FaultClass);
     }
 
     private AckResult HandleDisconnected(TransportConnectionId connection, ConnectionEpoch epoch, ConnectionCloseReason reason)
     {
+        authenticatedConnections.Remove(AuthenticatedConnectionKey(connection, epoch));
+        attemptsByConnection.Remove(ConnectionKey(connection));
         if (!connectionSessions.TryGetValue(connection.Value, out var id))
         {
+            var deferred = deferredReconnects.FirstOrDefault(pair =>
+                pair.Value.Candidate.ConnectionId == connection
+                && pair.Value.Candidate.ConnectionEpoch == epoch);
+            if (deferred.Value is not null)
+            {
+                deferredReconnects.Remove(deferred.Key);
+                admissions.Remove(deferred.Value.Attempt.Value);
+            }
+
             // A transport close for a connection that never reached admission
             // is already terminal and therefore idempotently acknowledged.
             return new AckResult(true, null);
@@ -927,7 +1432,10 @@ public sealed class SessionRegistry : IDisposable
         if (!sessions.TryGetValue(id, out var session)
             || session.Binding is not { } binding)
         {
-            connectionSessions.Remove(connection.Value);
+            if (!HasPendingUnbind(connection, epoch))
+            {
+                connectionSessions.Remove(connection.Value);
+            }
             return new AckResult(true, null);
         }
 
@@ -948,21 +1456,81 @@ public sealed class SessionRegistry : IDisposable
         SetState(session, ServerConnectionSessionState.ReconnectWindow);
         var due = new MonotonicInstant(
             clock.Now.Ticks + TimeSpan.FromSeconds(config.ReconnectWindowSeconds).Ticks);
-        var timerCommand = new SessionCommand.TimerFired(default, session.SessionId);
+        var timerToken = new TimerId(++nextReconnectTimerToken);
+        var timerCommand = new SessionCommand.TimerFired(timerToken, session.SessionId);
         var timer = timers.Schedule(due, controlInbox, timerCommand);
         session.PendingTimer = timer;
+        session.PendingTimerToken = timerToken;
         Publish(new SessionEvent.Disconnected(session.SessionId, session.SessionEpoch));
         return new AckResult(true, null);
     }
 
+    private void ResumeDeferredReconnects()
+    {
+        foreach (var pair in deferredReconnects.ToArray())
+        {
+            if (!sessions.TryGetValue(pair.Key, out var session)
+                || session.State != ServerConnectionSessionState.ReconnectWindow)
+            {
+                deferredReconnects.Remove(pair.Key);
+                admissions.Remove(pair.Value.Attempt.Value);
+                continue;
+            }
+
+            if (session.LastSentDeltaRevision is { } lastDeltaRevision
+                && authorityRevision <= lastDeltaRevision)
+            {
+                continue;
+            }
+
+            deferredReconnects.Remove(pair.Key);
+            if (session.Principal is not { } principal)
+            {
+                Reject(
+                    pair.Value.Attempt,
+                    pair.Value.Candidate,
+                    "SessionMismatch",
+                    close: true,
+                    traceCompensation: false);
+                continue;
+            }
+
+            var grant = auth.Authorize(
+                principal,
+                new SessionScope(session.SessionId, config.ProductId, config.GameReleaseId, "Client"));
+            CompleteReconnect(session, pair.Value.Candidate, pair.Value.Attempt, grant);
+        }
+    }
+
+    private void CancelDeferredReconnect(ServerConnectionSession session, string reason)
+    {
+        if (!deferredReconnects.Remove(session.SessionId.Value, out var deferred))
+        {
+            return;
+        }
+
+        SendErrorAndClose(deferred.Candidate, reason);
+        admissions.Remove(deferred.Attempt.Value);
+    }
+
     private bool RecordAttempt(TransportConnectionId connection, AdmissionAttemptId attempt)
     {
-        var key = connection.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var key = ConnectionKey(connection);
         attemptsByConnection.TryGetValue(key, out var count);
         count++;
         attemptsByConnection[key] = count;
         return count <= config.AdmissionAttemptBudget;
     }
+
+    private static string ConnectionKey(TransportConnectionId connection)
+        => connection.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    private static string AuthenticatedConnectionKey(
+        TransportConnectionId connection,
+        ConnectionEpoch epoch)
+        => string.Create(
+            System.Globalization.CultureInfo.InvariantCulture,
+            $"{connection.Value}:{epoch.Value}");
 
     private AllocateResult ReserveSlot()
     {
@@ -985,20 +1553,20 @@ public sealed class SessionRegistry : IDisposable
         return allocation;
     }
 
-    private AdmissionReservationResult ReserveAdmission(
+    private SessionReservationResult ReserveAdmission(
         AdmissionAttemptId attempt,
         ServerSessionId session,
         in AllocateResult allocation)
     {
-        if (slot is IWorldSlotAdmissionPort admissionPort)
+        if (this.admissionPort is { } admission)
         {
-            return admissionPort.ReserveAdmission(attempt, session);
+            return admission.ReserveAdmission(attempt, session);
         }
 
         // A reservation must come from the serialized WorldSlot admission
         // operation.  Never derive one from the attempt id or another local
         // value when an adapter does not expose that capability.
-        return new AdmissionReservationResult(false, default, allocation.Epoch, allocation.SlotId, "InvalidArgument");
+        return new SessionReservationResult(false, default, allocation.Epoch, allocation.SlotId, "InvalidArgument");
     }
 
     private bool ExactRelease(in EnvelopeHeaderView header)
@@ -1067,17 +1635,18 @@ public sealed class SessionRegistry : IDisposable
 
     private static bool TryReadDeltaAck(
         ReadOnlyMemory<byte> bytes,
+        out ulong confirmationSequence,
         out ulong toRevision)
     {
+        confirmationSequence = 0;
         toRevision = 0;
 
         try
         {
             using var document = JsonDocument.Parse(bytes);
-            toRevision = document.RootElement
-                .GetProperty("body")
-                .GetProperty("toRevision")
-                .GetUInt64();
+            var body = document.RootElement.GetProperty("body");
+            confirmationSequence = body.GetProperty("confirmationSequence").GetUInt64();
+            toRevision = body.GetProperty("toRevision").GetUInt64();
             return true;
         }
         catch (JsonException)
@@ -1099,6 +1668,42 @@ public sealed class SessionRegistry : IDisposable
             ? "QueueFull"
             : string.IsNullOrWhiteSpace(error) ? fallback : error;
 
+    private static ValidatedEnvelopeBytes CopyEnvelope(in ValidatedEnvelopeBytes envelope)
+    {
+        var bytes = envelope.Bytes.ToArray();
+        var header = envelope.Header;
+        if (MvpEnvelopeReader.TryReadHeader(bytes, out var parsed).Status == EnvelopeParseStatus.Ok)
+        {
+            header = parsed;
+        }
+
+        return new ValidatedEnvelopeBytes(bytes, header);
+    }
+
+    private static ConnectionEvent.HandshakeEnvelope CopyHandshake(
+        in ConnectionEvent.HandshakeEnvelope handshake)
+    {
+        var source = handshake.Envelope;
+        var envelope = CopyEnvelope(in source);
+        return new ConnectionEvent.HandshakeEnvelope(handshake.Id, handshake.Epoch, envelope);
+    }
+
+    private static bool RememberAttempt(HashSet<ulong> retained, Queue<ulong> order, ulong attempt)
+    {
+        if (!retained.Add(attempt))
+        {
+            return false;
+        }
+
+        order.Enqueue(attempt);
+        while (order.Count > SessionProvisionalDefaults.ControlInboxMaxItems)
+        {
+            retained.Remove(order.Dequeue());
+        }
+
+        return true;
+    }
+
     private static PermissionGrantRef GrantReference(PermissionGrant grant, AdmissionAttemptId attempt)
         => new(grant.Epoch.Value == 0 ? attempt.Value : grant.Epoch.Value);
 
@@ -1107,9 +1712,13 @@ public sealed class SessionRegistry : IDisposable
         SessionCommand.ConnectionCandidate candidate,
         string reason,
         bool close,
-        bool traceCompensation)
+        bool traceCompensation,
+        ConnectionEpoch? closeEpoch = null)
     {
-        if (!rejectedAttempts.Add(attempt.Value))
+        authenticatedConnections.Remove(AuthenticatedConnectionKey(
+            candidate.ConnectionId,
+            candidate.ConnectionEpoch));
+        if (!RememberAttempt(rejectedAttempts, rejectedAttemptOrder, attempt.Value))
         {
             return;
         }
@@ -1118,7 +1727,8 @@ public sealed class SessionRegistry : IDisposable
 
         if (traceCompensation)
         {
-            Compensate(attempt, candidate, session: null, boundEpoch: null);
+            closeEpoch = Compensate(attempt, candidate, session: null, boundEpoch: null)
+                ?? closeEpoch;
         }
 
         Publish(new SessionEvent.Rejected(attempt, candidate.ConnectionId, reason));
@@ -1126,10 +1736,11 @@ public sealed class SessionRegistry : IDisposable
         {
             _ = transportControl.TrySend(new ConnectionCommand.Close(
                 candidate.ConnectionId,
-                candidate.ConnectionEpoch,
+                closeEpoch ?? candidate.ConnectionEpoch,
                 ConnectionCloseReason.PolicyReject));
         }
 
+        attemptsByConnection.Remove(ConnectionKey(candidate.ConnectionId));
         admissions.Remove(attempt.Value);
     }
 
@@ -1150,12 +1761,144 @@ public sealed class SessionRegistry : IDisposable
             MvpWireConstants.AuthBinding,
             MvpWireConstants.TransportErrorClass);
         var bytes = MvpEnvelopeWriter.WriteError(context, "Rejectable", reason);
-        _ = egress.TryEnqueue(candidate.ConnectionId, candidate.ConnectionEpoch, new OutboundEnvelopeBytes(bytes));
-        _ = transportControl.TrySend(new ConnectionCommand.Close(
+        EnqueueTerminalEnvelopeThenClose(
             candidate.ConnectionId,
             candidate.ConnectionEpoch,
-            ConnectionCloseReason.PolicyReject));
+            new OutboundEnvelopeBytes(bytes),
+            ConnectionCloseReason.PolicyReject);
     }
+
+    private void EnqueueTerminalEnvelopeThenClose(
+        TransportConnectionId connection,
+        ConnectionEpoch epoch,
+        OutboundEnvelopeBytes envelope,
+        ConnectionCloseReason reason)
+    {
+        if (HasPendingTerminalClose(connection, epoch))
+        {
+            return;
+        }
+
+        var pending = new PendingTerminalClose(connection, epoch, envelope, reason);
+        var result = egress.TryEnqueue(connection, epoch, in envelope);
+        if (result.Status == EnqueueStatus.Accepted)
+        {
+            pending.EnvelopeQueued = true;
+            if (!TryFinishTerminalClose(pending))
+            {
+                RetainPendingTerminalClose(pending);
+            }
+
+            return;
+        }
+
+        if (result.Status != EnqueueStatus.Full)
+        {
+            observability.Diagnostics.Write(
+                "Diagnostic",
+                "Warn",
+                "terminal envelope converged after the connection became unavailable");
+            _ = HandleDisconnected(connection, epoch, reason);
+            return;
+        }
+
+        RetainPendingTerminalClose(pending);
+    }
+
+    private void RetryPendingTerminalCloses(int budget)
+    {
+        foreach (var pending in pendingTerminalCloses.Values.ToArray())
+        {
+            if (budget-- <= 0)
+            {
+                break;
+            }
+
+            if (!pending.EnvelopeQueued)
+            {
+                var envelope = pending.Envelope;
+                var result = egress.TryEnqueue(pending.Connection, pending.Epoch, in envelope);
+                if (result.Status == EnqueueStatus.Full)
+                {
+                    continue;
+                }
+
+                if (result.Status != EnqueueStatus.Accepted)
+                {
+                    observability.Diagnostics.Write(
+                        "Diagnostic",
+                        "Warn",
+                        "terminal envelope retry converged after the connection closed");
+                    RemovePendingTerminalClose(pending);
+                    continue;
+                }
+
+                pending.EnvelopeQueued = true;
+            }
+
+            _ = TryFinishTerminalClose(pending);
+        }
+    }
+
+    private void RetainPendingTerminalClose(PendingTerminalClose pending)
+    {
+        var key = TerminalCloseKey(pending.Connection, pending.Epoch);
+        if (pendingTerminalCloses.ContainsKey(key))
+        {
+            return;
+        }
+
+        if (pendingTerminalCloses.Count >= SessionProvisionalDefaults.EventOutboxMaxItems)
+        {
+            observability.Diagnostics.Write("Diagnostic", "Error", "pending terminal close reserve exhausted");
+            throw new InvalidOperationException("Pending terminal close reserve exhausted");
+        }
+
+        pendingTerminalCloses[key] = pending;
+    }
+
+    private bool TryFinishTerminalClose(PendingTerminalClose pending)
+    {
+        var result = transportControl.TrySend(new ConnectionCommand.Close(
+            pending.Connection,
+            pending.Epoch,
+            pending.Reason));
+        if (result.Status == EnqueueStatus.Accepted
+            || result.Status == EnqueueStatus.Closed
+            || result.StableErrorId == "StaleConnectionGeneration")
+        {
+            if (result.Status != EnqueueStatus.Accepted)
+            {
+                observability.Diagnostics.Write(
+                    "Diagnostic",
+                    "Warn",
+                    "terminal close converged after the connection became unavailable");
+            }
+
+            RemovePendingTerminalClose(pending);
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool HasPendingTerminalClose(TransportConnectionId connection, ConnectionEpoch epoch)
+        => pendingTerminalCloses.ContainsKey(TerminalCloseKey(connection, epoch));
+
+    private void RemovePendingTerminalClose(PendingTerminalClose pending)
+    {
+        var key = TerminalCloseKey(pending.Connection, pending.Epoch);
+        if (pendingTerminalCloses.TryGetValue(key, out var retained)
+            && ReferenceEquals(retained, pending))
+        {
+            pendingTerminalCloses.Remove(key);
+        }
+    }
+
+    private static (ulong ConnectionId, ulong Epoch) TerminalCloseKey(
+        TransportConnectionId connection,
+        ConnectionEpoch epoch)
+        => (connection.Value, epoch.Value);
 
     private AckResult SendFullSnapshot(ServerConnectionSession session, in SessionBinding binding)
     {
@@ -1193,6 +1936,16 @@ public sealed class SessionRegistry : IDisposable
         };
     }
 
+    private AckResult SendFullSnapshotOrIsolateOnQueueFull(
+        ServerConnectionSession session,
+        in SessionBinding binding)
+    {
+        var snapshot = SendFullSnapshot(session, binding);
+        return !snapshot.Accepted && snapshot.StableErrorId == "QueueFull"
+            ? IsolateEgressBackpressure(session, binding)
+            : snapshot;
+    }
+
     private AckResult SendDelta(ServerConnectionSession session, in SessionBinding binding, ulong fromRevision)
     {
         var context = new EnvelopeWriteContext(
@@ -1213,6 +1966,11 @@ public sealed class SessionRegistry : IDisposable
             return new AckResult(false, "SnapshotBaseMismatch");
         }
 
+        if (session.PendingDeltaConfirmationSequence is not null)
+        {
+            return new AckResult(true, null);
+        }
+
         if (authorityRevision <= fromRevision)
         {
             return new AckResult(true, null);
@@ -1225,12 +1983,72 @@ public sealed class SessionRegistry : IDisposable
             authorityRevision,
             outboundSequence);
         var result = egress.TryEnqueue(binding.ConnectionId, binding.ConnectionEpoch, new OutboundEnvelopeBytes(bytes));
+        if (result.Status == EnqueueStatus.Accepted)
+        {
+            session.RecordDelta(
+                outboundSequence,
+                fromRevision,
+                authorityRevision,
+                baseSnapshotId);
+        }
+
         return result.Status switch
         {
             EnqueueStatus.Accepted => new AckResult(true, null),
             EnqueueStatus.Full => new AckResult(false, "QueueFull"),
             _ => new AckResult(false, NormalizeStableError(result.StableErrorId, "StaleConnectionGeneration")),
         };
+    }
+
+    private AckResult SendDeltaOrIsolateOnQueueFull(
+        ServerConnectionSession session,
+        in SessionBinding binding,
+        ulong fromRevision)
+    {
+        var delta = SendDelta(session, binding, fromRevision);
+        return !delta.Accepted && delta.StableErrorId == "QueueFull"
+            ? IsolateEgressBackpressure(session, binding)
+            : delta;
+    }
+
+    private AckResult IsolateEgressBackpressure(
+        ServerConnectionSession session,
+        in SessionBinding binding)
+    {
+        var close = transportControl.TrySend(new ConnectionCommand.Close(
+            binding.ConnectionId,
+            binding.ConnectionEpoch,
+            ConnectionCloseReason.Fault));
+        if (close.Status == EnqueueStatus.Full
+            && !HasPendingTerminalClose(binding.ConnectionId, binding.ConnectionEpoch))
+        {
+            var pending = new PendingTerminalClose(
+                binding.ConnectionId,
+                binding.ConnectionEpoch,
+                default,
+                ConnectionCloseReason.Fault)
+            {
+                EnvelopeQueued = true,
+            };
+            RetainPendingTerminalClose(pending);
+        }
+        else if (close.Status != EnqueueStatus.Accepted
+            && close.StableErrorId != "StaleConnectionGeneration")
+        {
+            observability.Diagnostics.Write(
+                "Diagnostic",
+                "Warn",
+                $"session {session.SessionId.Value} detached after transport close became unavailable");
+        }
+
+        observability.Diagnostics.Write(
+            "Diagnostic",
+            "Warn",
+            $"session {session.SessionId.Value} isolated after reliable egress backpressure");
+        return HandleDisconnected(
+            binding.ConnectionId,
+            binding.ConnectionEpoch,
+            ConnectionCloseReason.Fault);
     }
 
     private ReadOnlyMemory<byte> BuildMaintenanceKick(ServerConnectionSession session, string reasonCode)
@@ -1250,15 +2068,15 @@ public sealed class SessionRegistry : IDisposable
         return MvpEnvelopeWriter.WriteMaintenanceKick(context, reasonCode);
     }
 
-    private void Compensate(
+    private ConnectionEpoch? Compensate(
         AdmissionAttemptId attempt,
         SessionCommand.ConnectionCandidate? candidate,
         ServerConnectionSession? session,
         ConnectionEpoch? boundEpoch)
     {
-        if (!compensatedAttempts.Add(attempt.Value))
+        if (!RememberAttempt(compensatedAttempts, compensatedAttemptOrder, attempt.Value))
         {
-            return;
+            return null;
         }
 
         var tracked = admissions.TryGetValue(attempt.Value, out var admission)
@@ -1270,32 +2088,289 @@ public sealed class SessionRegistry : IDisposable
             ?? (tracked?.TransportBound is true ? tracked.BoundEpoch : null);
         var slotEpoch = trackedSession?.SlotEpoch
             ?? tracked?.SlotEpoch;
+        var unbindConverged = false;
 
         TraceAck(AdmissionEffectKind.Compensate, attempt, slotEpoch, epoch);
         if (tracked?.TransportBound is true && connection is { } boundConnection && epoch is { } boundConnectionEpoch)
         {
-            _ = transportControl.TrySend(new ConnectionCommand.Unbind(boundConnection, boundConnectionEpoch));
-            connectionSessions.Remove(boundConnection.Value);
+            var unbind = EnqueueUnbindIntent(
+                boundConnection,
+                boundConnectionEpoch,
+                trackedSession?.SessionId ?? tracked?.SessionId ?? default);
+            if (unbind.Accepted)
+            {
+                epoch = new ConnectionEpoch(boundConnectionEpoch.Value + 1);
+                unbindConverged = true;
+            }
+            else if (unbind.StableErrorId == "StaleConnectionGeneration")
+            {
+                unbindConverged = true;
+            }
         }
 
         if (trackedSession is not null)
         {
             sessions.Remove(trackedSession.SessionId.Value);
-            if (connection is { } sessionConnection)
+            if (unbindConverged && connection is { } sessionConnection)
             {
                 connectionSessions.Remove(sessionConnection.Value);
             }
         }
 
-        if (tracked is not null
-            && !tracked.SlotCommitted
-            && tracked.Reservation.Value != 0
-            && slot is IWorldSlotAdmissionPort admissionPort)
+        if (tracked is not null && tracked.Reservation.Value != 0)
         {
-            _ = admissionPort.AbortAdmission(tracked.Reservation, tracked.SlotEpoch);
+            if (tracked.SlotCommitted)
+            {
+                if (tracked.ReleaseCommittedOnCompensation
+                    && this.admissionPort is not null)
+                {
+                    QueueReservationRelease(
+                        tracked.Reservation,
+                        trackedSession?.SessionId ?? tracked.SessionId,
+                        tracked.SlotEpoch,
+                        committed: true);
+                }
+            }
+            else if (this.admissionPort is not null)
+            {
+                QueueReservationRelease(
+                    tracked.Reservation,
+                    trackedSession?.SessionId ?? tracked.SessionId,
+                    tracked.SlotEpoch,
+                    committed: false);
+            }
         }
 
         admissions.Remove(attempt.Value);
+        return epoch ?? candidate?.ConnectionEpoch;
+    }
+
+    private void ReleaseCommittedReservation(ServerConnectionSession session)
+    {
+        if (!committedReservationsBySession.TryGetValue(session.SessionId.Value, out var reservation)
+            || this.admissionPort is null)
+        {
+            return;
+        }
+
+        QueueReservationRelease(
+            reservation,
+            session.SessionId,
+            session.SlotEpoch,
+            committed: true);
+    }
+
+    private void QueueReservationRelease(
+        SlotReservationId reservation,
+        ServerSessionId session,
+        SlotEpoch epoch,
+        bool committed)
+    {
+        if (pendingReservationReleases.ContainsKey(reservation.Value)
+            || deadLetterReservationIds.Contains(reservation.Value))
+        {
+            return;
+        }
+
+        var pending = new PendingReservationRelease(reservation, session, epoch, committed);
+        pendingReservationReleases.Add(reservation.Value, pending);
+        TryReleaseReservation(pending, reportRetry: true);
+    }
+
+    private void RetryPendingReservationReleases(int budget)
+    {
+        foreach (var pending in pendingReservationReleases.Values.Take(budget).ToArray())
+        {
+            TryReleaseReservation(pending, reportRetry: false);
+        }
+    }
+
+    private AckResult EnqueueUnbindIntent(
+        TransportConnectionId connection,
+        ConnectionEpoch epoch,
+        ServerSessionId session)
+    {
+        var key = (connection.Value, epoch.Value);
+        if (pendingUnbinds.TryGetValue(key, out var existing))
+        {
+            return existing.LastResult;
+        }
+
+        var pending = new PendingUnbind(connection, epoch, session);
+        pendingUnbinds.Add(key, pending);
+        return TryUnbind(pending);
+    }
+
+    private void RetryPendingUnbinds(int budget)
+    {
+        foreach (var pending in pendingUnbinds.Values.ToArray())
+        {
+            if (budget-- <= 0)
+            {
+                break;
+            }
+
+            TryUnbind(pending);
+        }
+    }
+
+    private AckResult TryUnbind(PendingUnbind pending)
+    {
+        if (!pendingUnbinds.ContainsKey((pending.Connection.Value, pending.Epoch.Value)))
+        {
+            return pending.LastResult;
+        }
+
+        pending.Attempts++;
+        EnqueueResult result;
+        try
+        {
+            result = transportControl.TrySend(new ConnectionCommand.Unbind(
+                pending.Connection,
+                pending.Epoch));
+        }
+        catch (Exception ex)
+        {
+            result = new EnqueueResult(EnqueueStatus.Full, ex.GetType().Name);
+        }
+
+        if (result.Status == EnqueueStatus.Accepted)
+        {
+            pending.LastResult = new AckResult(true, null);
+            pendingUnbinds.Remove((pending.Connection.Value, pending.Epoch.Value));
+            RemoveConnectionSessionIfCurrent(pending);
+            return pending.LastResult;
+        }
+
+        if (result.StableErrorId == "StaleConnectionGeneration")
+        {
+            pending.LastResult = new AckResult(false, "StaleConnectionGeneration");
+            pendingUnbinds.Remove((pending.Connection.Value, pending.Epoch.Value));
+            RemoveConnectionSessionIfCurrent(pending);
+            return pending.LastResult;
+        }
+
+        pending.LastResult = new AckResult(false, result.StableErrorId ?? "QueueFull");
+        if (pending.Attempts >= UnbindRetryLimit)
+        {
+            pendingUnbinds.Remove((pending.Connection.Value, pending.Epoch.Value));
+            if (deadLetterUnbinds.Count >= SessionProvisionalDefaults.EventOutboxMaxItems)
+            {
+                observability.Diagnostics.Write(
+                    "Diagnostic",
+                    "Error",
+                    "unbind dead-letter capacity exhausted");
+                throw new InvalidOperationException("Unbind dead-letter capacity exhausted");
+            }
+
+            pending.LastError = pending.LastResult.StableErrorId;
+            deadLetterUnbinds.Enqueue(pending);
+            observability.Diagnostics.Write(
+                "Diagnostic",
+                "Error",
+                "unbind retry exhausted; ownership retained in dead-letter");
+        }
+
+        return pending.LastResult;
+    }
+
+    private void RemoveConnectionSessionIfCurrent(PendingUnbind pending)
+    {
+        if (!connectionSessions.TryGetValue(pending.Connection.Value, out var sessionId))
+        {
+            return;
+        }
+
+        if (sessions.TryGetValue(sessionId, out var session)
+            && session.Binding is { } binding
+            && binding.ConnectionEpoch != pending.Epoch)
+        {
+            // A replacement binding reused the connection id while the old
+            // Unbind was pending; never erase the newer generation's mapping.
+            return;
+        }
+
+        connectionSessions.Remove(pending.Connection.Value);
+    }
+
+    private bool HasPendingUnbind(TransportConnectionId connection, ConnectionEpoch epoch)
+        => pendingUnbinds.ContainsKey((connection.Value, epoch.Value));
+
+    private void TryReleaseReservation(PendingReservationRelease pending, bool reportRetry)
+    {
+        if (pending.DeadLettered)
+        {
+            return;
+        }
+
+        pending.Attempts++;
+        AckResult result;
+        try
+        {
+            result = pending.Committed
+                ? this.admissionPort is { } releasePort
+                    ? releasePort.ReleaseCommittedReservation(
+                        pending.Reservation,
+                        pending.Session,
+                        pending.Epoch)
+                    : new AckResult(false, "InternalInvariant")
+                : this.admissionPort is { } admission
+                    ? admission.AbortAdmission(pending.Reservation, pending.Epoch)
+                    : new AckResult(false, "InternalInvariant");
+        }
+        catch (Exception ex)
+        {
+            pending.LastError = ex.GetType().Name;
+            result = new AckResult(false, "InternalInvariant");
+            observability.Diagnostics.Write(
+                "Diagnostic",
+                "Error",
+                $"reservation release threw; retaining bounded ownership evidence: {ex.GetType().Name}");
+        }
+        if (result.Accepted)
+        {
+            pendingReservationReleases.Remove(pending.Reservation.Value);
+            if (committedReservationsBySession.TryGetValue(pending.Session.Value, out var committed)
+                && committed == pending.Reservation)
+            {
+                committedReservationsBySession.Remove(pending.Session.Value);
+            }
+
+            return;
+        }
+
+        if (result.StableErrorId is "QueueFull" or "TimedOut"
+            && pending.Attempts < ReservationReleaseRetryLimit)
+        {
+            if (reportRetry)
+            {
+                observability.Diagnostics.Write(
+                    "Diagnostic",
+                    "Warn",
+                    "reservation release deferred for owner-lane retry");
+            }
+
+            return;
+        }
+
+        observability.Diagnostics.Write(
+            "Diagnostic",
+            "Error",
+            $"reservation release moved to dead-letter: {result.StableErrorId ?? "InternalInvariant"}");
+        pendingReservationReleases.Remove(pending.Reservation.Value);
+        if (deadLetterReservationReleases.Count >= SessionProvisionalDefaults.EventOutboxMaxItems)
+        {
+            observability.Diagnostics.Write(
+                "Diagnostic",
+                "Error",
+                "reservation release dead-letter capacity exhausted");
+            throw new InvalidOperationException("Reservation release dead-letter capacity exhausted");
+        }
+
+        pending.DeadLettered = true;
+        pending.LastError = result.StableErrorId ?? "InternalInvariant";
+        deadLetterReservationIds.Add(pending.Reservation.Value);
+        deadLetterReservationReleases.Enqueue(pending);
     }
 
     private void SetState(ServerConnectionSession session, ServerConnectionSessionState state)
@@ -1303,6 +2378,37 @@ public sealed class SessionRegistry : IDisposable
         if (session.TryTransition(state))
         {
             TraceState(session);
+            if (state is ServerConnectionSessionState.Expired
+                or ServerConnectionSessionState.Closed
+                or ServerConnectionSessionState.Kicked
+                or ServerConnectionSessionState.Faulted)
+            {
+                RetainTerminalSession(session);
+            }
+        }
+    }
+
+    private void RetainTerminalSession(ServerConnectionSession session)
+    {
+        if (!sessions.ContainsKey(session.SessionId.Value)
+            || !retainedTerminalSessions.Add(session.SessionId.Value))
+        {
+            return;
+        }
+
+        terminalSessionOrder.Enqueue(session.SessionId.Value);
+        while (terminalSessionOrder.Count > SessionProvisionalDefaults.EventOutboxMaxItems)
+        {
+            var expired = terminalSessionOrder.Dequeue();
+            retainedTerminalSessions.Remove(expired);
+            if (sessions.TryGetValue(expired, out var retained)
+                && retained.State is ServerConnectionSessionState.Expired
+                    or ServerConnectionSessionState.Closed
+                    or ServerConnectionSessionState.Kicked
+                    or ServerConnectionSessionState.Faulted)
+            {
+                sessions.Remove(expired);
+            }
         }
     }
 
@@ -1327,6 +2433,15 @@ public sealed class SessionRegistry : IDisposable
 
     private void Publish(in SessionEvent sessionEvent)
     {
+        // A reserve item is older than every event published after it. Keep all
+        // later events in that bounded tail so a newly freed primary slot cannot
+        // let them bypass the reserved event.
+        if (terminalReserve.Count > 0)
+        {
+            EnqueueTerminalReserve(in sessionEvent);
+            return;
+        }
+
         var result = eventOutbox.TryPublish(in sessionEvent);
         if (result.Status == EnqueueStatus.Accepted)
         {
@@ -1340,14 +2455,49 @@ public sealed class SessionRegistry : IDisposable
             or SessionEvent.Kicked
             or SessionEvent.Faulted)
         {
-            terminalReserve.Enqueue(sessionEvent);
+            EnqueueTerminalReserve(in sessionEvent);
             return;
         }
 
         observability.Diagnostics.Write("Diagnostic", "Warn", "session event outbox full");
     }
 
-    private sealed record AuthenticateResult(bool Accepted, string? ReasonCode, PermissionGrant? Grant);
+    private void EnqueueTerminalReserve(in SessionEvent sessionEvent)
+    {
+        if (terminalReserve.Count >= SessionProvisionalDefaults.EventOutboxMaxItems)
+        {
+            observability.Diagnostics.Write("Diagnostic", "Error", "session terminal reserve exhausted");
+            throw new InvalidOperationException("Session terminal reserve exhausted");
+        }
+
+        terminalReserve.Enqueue(sessionEvent);
+    }
+
+    private abstract record OwnerIngress
+    {
+        private OwnerIngress()
+        {
+        }
+
+        internal sealed record ConnectionClosed(ConnectionEvent.Closed Event) : OwnerIngress;
+
+        internal sealed record ConnectionFaulted(ConnectionEvent.Faulted Event) : OwnerIngress;
+
+        internal sealed record AuthenticatedHandshake(
+            ConnectionEvent.HandshakeEnvelope Event,
+            PrincipalId Principal,
+            string ProductId,
+            string GameReleaseId) : OwnerIngress;
+
+        internal sealed record InboundEnvelope(
+            TransportConnectionId? ConnectionId,
+            ConnectionEpoch? ConnectionEpoch,
+            ValidatedEnvelopeBytes Envelope) : OwnerIngress;
+
+        internal sealed record AuthorityRevision(ulong Revision) : OwnerIngress;
+    }
+
+    private sealed record AuthenticateResult(bool Accepted, string? ReasonCode, PrincipalId Principal);
 
     private sealed class AdmissionAttemptState
     {
@@ -1363,6 +2513,8 @@ public sealed class SessionRegistry : IDisposable
 
         internal SessionCommand.ConnectionCandidate Candidate { get; }
 
+        internal ServerSessionId SessionId { get; set; }
+
         internal ServerConnectionSession? Session { get; set; }
 
         internal SlotReservationId Reservation { get; set; }
@@ -1375,7 +2527,74 @@ public sealed class SessionRegistry : IDisposable
 
         internal bool SlotCommitted { get; set; }
 
+        internal bool ReleaseCommittedOnCompensation { get; set; }
+
         internal bool TransportBound { get; set; }
+    }
+
+    private sealed class PendingReservationRelease(
+        SlotReservationId reservation,
+        ServerSessionId session,
+        SlotEpoch epoch,
+        bool committed)
+    {
+        internal SlotReservationId Reservation { get; } = reservation;
+
+        internal ServerSessionId Session { get; } = session;
+
+        internal SlotEpoch Epoch { get; } = epoch;
+
+        internal bool Committed { get; } = committed;
+
+        internal int Attempts { get; set; }
+
+        internal string? LastError { get; set; }
+
+        internal bool DeadLettered { get; set; }
+    }
+
+    private sealed class PendingUnbind(
+        TransportConnectionId connection,
+        ConnectionEpoch epoch,
+        ServerSessionId session)
+    {
+        internal TransportConnectionId Connection { get; } = connection;
+
+        internal ConnectionEpoch Epoch { get; } = epoch;
+
+        internal ServerSessionId Session { get; } = session;
+
+        internal int Attempts { get; set; }
+
+        internal string? LastError { get; set; }
+
+        internal AckResult LastResult { get; set; } = new(false, "QueueFull");
+    }
+
+    private sealed record DeferredReconnect(
+        AdmissionAttemptId Attempt,
+        SessionCommand.ConnectionCandidate Candidate);
+
+    private readonly record struct AuthenticatedConnection(
+        PrincipalId Principal,
+        string ProductId,
+        string GameReleaseId);
+
+    private sealed class PendingTerminalClose(
+        TransportConnectionId connection,
+        ConnectionEpoch epoch,
+        OutboundEnvelopeBytes envelope,
+        ConnectionCloseReason reason)
+    {
+        internal TransportConnectionId Connection { get; } = connection;
+
+        internal ConnectionEpoch Epoch { get; } = epoch;
+
+        internal OutboundEnvelopeBytes Envelope { get; } = envelope;
+
+        internal ConnectionCloseReason Reason { get; } = reason;
+
+        internal bool EnvelopeQueued { get; set; }
     }
 
     private sealed class SessionAdminPort : ISessionAdminPort
@@ -1386,38 +2605,44 @@ public sealed class SessionRegistry : IDisposable
 
         public AckResult BeginDrain(MonotonicInstant graceDeadline)
         {
-            owner.WriteAdminAudit("BeginDrain");
-            return owner.BeginDrain(graceDeadline);
+            lock (owner.ownerGate)
+            {
+                owner.WriteAdminAudit("BeginDrain");
+                return owner.BeginDrain(graceDeadline);
+            }
         }
 
         public AckResult Kick(ServerSessionId sessionId, string registeredReasonCode)
         {
-            owner.WriteAdminAudit($"Kick:{registeredReasonCode}");
-            return owner.Kick(sessionId, registeredReasonCode);
+            lock (owner.ownerGate)
+            {
+                owner.WriteAdminAudit($"Kick:{registeredReasonCode}");
+                return owner.Kick(sessionId, registeredReasonCode);
+            }
         }
 
         public AckResult InjectWorldMutation(ServerSessionId onBehalfOf, ReadOnlyMemory<byte> opaqueCommand)
         {
-            owner.WriteAdminAudit("InjectWorldMutation");
-            return owner.InjectWorldMutation(onBehalfOf, opaqueCommand);
+            lock (owner.ownerGate)
+            {
+                owner.WriteAdminAudit("InjectWorldMutation");
+                return owner.InjectWorldMutation(onBehalfOf, opaqueCommand);
+            }
         }
     }
 
     private void WriteAdminAudit(string message)
     {
+        var sequence = unchecked((ulong)Interlocked.Increment(ref auditSequence) - 1UL);
         var id = new ServerSessionId("admin-session");
         _ = observability.Audit.WriteSessionScoped(
             id,
             config.ProductId,
             config.GameReleaseId,
-            $"trace-session-admin-{auditSequence}",
+            $"trace-session-admin-{sequence}",
             "mvp-session",
-            auditSequence++,
+            sequence,
             message);
     }
 
-    private sealed class ServerSessionTimerState
-    {
-        internal TimerId? PendingTimer { get; set; }
-    }
 }

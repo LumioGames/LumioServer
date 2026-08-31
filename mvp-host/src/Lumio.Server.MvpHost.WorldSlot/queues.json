@@ -27,7 +27,7 @@
       "consumer": "session / process",
       "ordering": "FIFO",
       "budget": "256 items (provisional)",
-      "onFull": "retain terminal events in a reserved lane",
+      "onFull": "retain the FIFO terminal tail; stop admitting non-terminal tail items before two fail-stop slots, then fail-stop if terminal delivery cannot be retained",
       "onClose": "terminal events remain deliverable"
     }
   ],

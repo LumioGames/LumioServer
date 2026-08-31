@@ -26,6 +26,20 @@ public sealed class ProcessAndExitCodeTests
     }
 
     [Fact]
+    public void SmokeClientCredentialBuffersAreClearedOnScenarioExit()
+    {
+        var sourcePath = Path.GetFullPath(Path.Combine(
+            Path.GetDirectoryName(typeof(SmokeClient.SmokeClientRunner).Assembly.Location)!,
+            "..", "..", "..", "..", "..", "src",
+            "Lumio.Server.MvpHost.SmokeClient",
+            "SmokeClientRunner.cs"));
+        var source = File.ReadAllText(sourcePath);
+
+        Assert.Contains("Array.Clear(token)", source, StringComparison.Ordinal);
+        Assert.Contains("Array.Clear(supplied)", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void SmokeClientInvalidArgumentsRunInARealChildProcess()
     {
         var assembly = typeof(SmokeClient.Program).Assembly.Location;
@@ -49,6 +63,50 @@ public sealed class ProcessAndExitCodeTests
         Assert.True(process.WaitForExit(10_000));
         Assert.Equal(SmokeClient.SmokeClientExitCodes.InvalidArguments, process.ExitCode);
         Assert.True(process.HasExited, "child process must be reaped before the test exits");
+    }
+
+    [Fact]
+    public async Task StaleGenerationScenarioCannotReportSuccessWithoutWireEvidence()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"lumio-stale-scenario-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var token = Path.Combine(root, "token.bin");
+        var tracePath = Path.Combine(root, "trace.jsonl");
+        File.WriteAllBytes(token, Encoding.UTF8.GetBytes("test-secret"));
+
+        try
+        {
+            var options = new SmokeClient.SmokeClientCommandLineOptions(
+                "ws://127.0.0.1:1",
+                token,
+                "stale-proof",
+                SmokeClient.SmokeClientCommandLineOptions.DefaultProductId,
+                SmokeClient.SmokeClientCommandLineOptions.DefaultGameReleaseId,
+                "stale-generation",
+                tracePath);
+            int exitCode;
+            using (var trace = new SmokeClient.SmokeTraceWriter(tracePath))
+            {
+                exitCode = await SmokeClient.SmokeClientRunner.RunAsync(
+                    options,
+                    trace,
+                    TestContext.Current.CancellationToken);
+            }
+
+            Assert.Equal(SmokeClient.SmokeClientExitCodes.AssertionFailed, exitCode);
+            var lines = File.ReadAllLines(tracePath);
+            Assert.NotEmpty(lines);
+            using var last = JsonDocument.Parse(lines[^1]);
+            Assert.False(last.RootElement.GetProperty("passed").GetBoolean());
+            Assert.Contains(
+                "connection generation",
+                last.RootElement.GetProperty("detail").GetString(),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
     }
 
     [Fact]

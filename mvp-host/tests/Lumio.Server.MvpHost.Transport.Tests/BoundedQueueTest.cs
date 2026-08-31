@@ -2,8 +2,11 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Text.Json.Nodes;
+using System.Threading;
+using System.Threading.Tasks;
 using Lumio.Server.MvpHost.HostContracts;
 using Lumio.Server.MvpHost.Platform;
+using Lumio.Server.MvpHost.TestKit;
 using Xunit;
 
 namespace Lumio.Server.MvpHost.Transport.Tests;
@@ -39,6 +42,116 @@ public sealed class BoundedQueueTest
     }
 
     [Fact]
+    public void ClosedConnectionEntryIsRetiredAfterTerminalEventPublication()
+    {
+        using var harness = new TransportHarness();
+        var id = ConnectionLifecycleTest.AcceptOne(harness);
+        Assert.Equal(1, harness.Service.ConnectionCountForTest);
+
+        harness.Service.RaiseClosedForTest(id, ConnectionCloseReason.OwnerRequest);
+
+        Assert.Equal(0, harness.Service.ConnectionCountForTest);
+        Assert.Equal(TransportConnectionState.Closed, harness.Service.StateOf(id));
+    }
+
+    [Fact]
+    public void DisposeClosesCarrierAndCancelsIdleTimerBeforeRetiringEntry()
+    {
+        using var harness = new TransportHarness();
+        var id = ConnectionLifecycleTest.AcceptOne(harness);
+
+        harness.Service.Dispose();
+
+        Assert.Equal(0, harness.Service.ConnectionCountForTest);
+        Assert.Contains(
+            harness.Carrier.CloseCalls,
+            call => call.Connection == id && call.Reason == ConnectionCloseReason.OwnerRequest);
+        Assert.NotEmpty(harness.Timers.Canceled);
+    }
+
+    [Fact]
+    public void DisposePublishesOneTerminalEventBeforeRetiringEachConnection()
+    {
+        using var harness = new TransportHarness();
+        var id = ConnectionLifecycleTest.AcceptOne(harness);
+        _ = ConnectionLifecycleTest.DrainEvents(harness);
+
+        harness.Service.Dispose();
+
+        var events = ConnectionLifecycleTest.DrainEvents(harness);
+        var terminal = events
+            .Where(evt => evt is ConnectionEvent.Closed or ConnectionEvent.Faulted)
+            .Where(evt => evt switch
+            {
+                ConnectionEvent.Closed closed => closed.Id == id,
+                ConnectionEvent.Faulted faulted => faulted.Id == id,
+                _ => false,
+            })
+            .ToArray();
+
+        var closed = Assert.Single(terminal);
+        var closedEvent = Assert.IsType<ConnectionEvent.Closed>(closed);
+        Assert.Equal(ConnectionCloseReason.OwnerRequest, closedEvent.Reason);
+        Assert.Equal(0, harness.Service.ConnectionCountForTest);
+        Assert.Equal(EnqueueStatus.Closed, harness.Service.TrySend(
+            new ConnectionCommand.SetDrain(id, new ConnectionEpoch(0), true)).Status);
+    }
+
+    [Fact]
+    public void ConcurrentDisposeConvergesToOneTerminalEventAndOneCarrierClose()
+    {
+        using var harness = new TransportHarness();
+        var id = ConnectionLifecycleTest.AcceptOne(harness);
+        _ = ConnectionLifecycleTest.DrainEvents(harness);
+
+        Parallel.Invoke(harness.Service.Dispose, harness.Service.Dispose, harness.Service.Dispose);
+
+        var terminals = ConnectionLifecycleTest.DrainEvents(harness)
+            .Where(evt => evt is ConnectionEvent.Closed or ConnectionEvent.Faulted)
+            .Where(evt => evt switch
+            {
+                ConnectionEvent.Closed closed => closed.Id == id,
+                ConnectionEvent.Faulted faulted => faulted.Id == id,
+                _ => false,
+            })
+            .ToArray();
+        Assert.Single(terminals);
+        Assert.Single(harness.Carrier.CloseCalls, call => call.Connection == id);
+    }
+
+    [Fact]
+    public void DisposedTransportRejectsLaterAcceptsAndClosesTheCarrier()
+    {
+        using var harness = new TransportHarness();
+        var first = ConnectionLifecycleTest.AcceptOne(harness);
+        harness.Service.Dispose();
+
+        var second = new TransportConnectionId(2);
+        harness.Carrier.QueueAccept(second, "lumio.mvp.v0");
+
+        Assert.False(harness.Service.TryAcceptOne());
+        Assert.Contains(
+            harness.Carrier.CloseCalls,
+            call => call.Connection == second && call.Reason == ConnectionCloseReason.PolicyReject);
+        Assert.Equal(TransportConnectionState.Closed, harness.Service.StateOf(first));
+    }
+
+    [Fact]
+    public void DisposeStillCancelsTimersWhenCarrierCloseThrows()
+    {
+        using var harness = new TransportHarness(
+            carrierDecorator: inner => new ThrowingCloseCarrier(inner));
+        var id = ConnectionLifecycleTest.AcceptOne(harness);
+
+        var error = Record.Exception(harness.Service.Dispose);
+
+        Assert.Null(error);
+        Assert.Equal(0, harness.Service.ConnectionCountForTest);
+        Assert.NotEmpty(harness.Timers.Canceled);
+        Assert.Equal(TransportConnectionState.Closed, harness.Service.StateOf(id));
+    }
+
+    [Fact]
     public void 不可靠消息在队列满时丢弃并计数且连接存活()
     {
         using var harness = new TransportHarness();
@@ -52,6 +165,185 @@ public sealed class BoundedQueueTest
 
         Assert.Equal(before + 1, harness.Service.UnreliableDropCountOf(id));
         Assert.NotEqual(TransportConnectionState.Closed, harness.Service.StateOf(id));
+    }
+
+    [Fact]
+    public void IngressRejectsByteBudgetBeforeItemBudgetAndReleasesBytesOnTake()
+    {
+        var entry = CreateEntry(ingressMaxBytes: 5, egressMaxBytes: 32);
+        var first = IngressBytes(3);
+        var second = IngressBytes(3);
+
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueIngress(in first).Status);
+
+        var rejected = entry.TryEnqueueIngress(in second);
+        Assert.Equal(EnqueueStatus.Full, rejected.Status);
+        Assert.Equal("QueueFull", rejected.StableErrorId);
+
+        Assert.True(entry.TryTakeIngress(out _));
+        entry.CommitIngressTake();
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueIngress(in second).Status);
+    }
+
+    [Fact]
+    public void DeferredIngressCountsItsBytesExactlyOnceAndRemainsFirst()
+    {
+        var entry = CreateEntry(ingressMaxBytes: 6, egressMaxBytes: 32);
+        var first = IngressBytes(3, sequence: 1);
+        var second = IngressBytes(3, sequence: 2);
+        var overflow = IngressBytes(1, sequence: 3);
+
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueIngress(in first).Status);
+        Assert.True(entry.TryTakeIngress(out var taken));
+        entry.DeferIngress(in taken);
+
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueIngress(in second).Status);
+        Assert.Equal(EnqueueStatus.Full, entry.TryEnqueueIngress(in overflow).Status);
+        Assert.True(entry.TryTakeIngress(out var deferred));
+        Assert.Equal((ulong)1, deferred.Header.Sequence);
+        entry.CommitIngressTake();
+        Assert.True(entry.TryTakeIngress(out var queued));
+        Assert.Equal((ulong)2, queued.Header.Sequence);
+        entry.CommitIngressTake();
+    }
+
+    [Fact]
+    public void InFlightIngressKeepsItsBudgetUntilCommittedOrDeferred()
+    {
+        var entry = CreateEntry(ingressMaxBytes: 3, egressMaxBytes: 32);
+        var fullBudget = IngressBytes(3);
+        var extra = IngressBytes(1);
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueIngress(in fullBudget).Status);
+        Assert.True(entry.TryTakeIngress(out var taken));
+
+        Assert.Equal(EnqueueStatus.Full, entry.TryEnqueueIngress(in extra).Status);
+        entry.DeferIngress(in taken);
+        Assert.Equal(EnqueueStatus.Full, entry.TryEnqueueIngress(in extra).Status);
+    }
+
+    [Fact]
+    public void EgressRejectsByteBudgetBeforeItemBudgetAndReleasesBytesOnTake()
+    {
+        var entry = CreateEntry(ingressMaxBytes: 32, egressMaxBytes: 5);
+        var first = EgressBytes(3);
+        var second = EgressBytes(3);
+
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueEgress(in first).Status);
+
+        var rejected = entry.TryEnqueueEgress(in second);
+        Assert.Equal(EnqueueStatus.Full, rejected.Status);
+        Assert.Equal("QueueFull", rejected.StableErrorId);
+
+        Assert.True(entry.TryTakeEgress(out _));
+        entry.CommitEgressTake();
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueEgress(in second).Status);
+    }
+
+    [Fact]
+    public void RateLimitRefillsAtSteadyRateAfterBurstIsExhausted()
+    {
+        var entry = CreateEntry(ingressMaxBytes: 32, egressMaxBytes: 32);
+        var now = new MonotonicInstant(0);
+
+        for (var i = 0; i < TransportProvisionalLimits.InboundBurst; i++)
+        {
+            Assert.True(entry.TryAdmitInbound(now));
+        }
+
+        Assert.False(entry.TryAdmitInbound(now));
+        now = new MonotonicInstant(TimeSpan.TicksPerSecond);
+        for (var i = 0; i < TransportProvisionalLimits.InboundMessagesPerSecond; i++)
+        {
+            Assert.True(entry.TryAdmitInbound(now));
+        }
+
+        Assert.False(entry.TryAdmitInbound(now));
+    }
+
+    [Fact]
+    public void DeferredEgressCountsItsBytesExactlyOnceAndRemainsFirst()
+    {
+        var entry = CreateEntry(ingressMaxBytes: 32, egressMaxBytes: 6);
+        var first = EgressBytes(3, marker: 1);
+        var second = EgressBytes(3, marker: 2);
+        var overflow = EgressBytes(1, marker: 3);
+
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueEgress(in first).Status);
+        Assert.True(entry.TryTakeEgress(out var taken));
+        entry.DeferEgress(in taken);
+
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueEgress(in second).Status);
+        Assert.Equal(EnqueueStatus.Full, entry.TryEnqueueEgress(in overflow).Status);
+        Assert.True(entry.TryTakeEgress(out var deferred));
+        Assert.Equal(1, deferred.Bytes.Span[0]);
+        entry.CommitEgressTake();
+        Assert.True(entry.TryTakeEgress(out var queued));
+        Assert.Equal(2, queued.Bytes.Span[0]);
+        entry.CommitEgressTake();
+    }
+
+    [Fact]
+    public void InFlightEgressKeepsItsBudgetUntilCommittedOrDeferred()
+    {
+        var entry = CreateEntry(ingressMaxBytes: 32, egressMaxBytes: 3);
+        var fullBudget = EgressBytes(3);
+        var extra = EgressBytes(1);
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueEgress(in fullBudget).Status);
+        Assert.True(entry.TryTakeEgress(out var taken));
+
+        Assert.Equal(EnqueueStatus.Full, entry.TryEnqueueEgress(in extra).Status);
+        entry.DeferEgress(in taken);
+        Assert.Equal(EnqueueStatus.Full, entry.TryEnqueueEgress(in extra).Status);
+    }
+
+    [Fact]
+    public void ClosingCleanupDrainsQueuedAndDeferredIngressAndEgress()
+    {
+        var entry = CreateEntry(ingressMaxBytes: 32, egressMaxBytes: 32);
+        var ingress = IngressBytes(3, sequence: 1);
+        var egress = EgressBytes(3, marker: 1);
+
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueIngress(in ingress).Status);
+        Assert.True(entry.TryTakeIngress(out var takenIngress));
+        entry.DeferIngress(in takenIngress);
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueIngress(in ingress).Status);
+
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueEgress(in egress).Status);
+        Assert.True(entry.TryTakeEgress(out var takenEgress));
+        entry.DeferEgress(in takenEgress);
+        Assert.Equal(EnqueueStatus.Accepted, entry.TryEnqueueEgress(in egress).Status);
+
+        entry.ClearDeferredIngress();
+        entry.ClearDeferredEgress();
+
+        Assert.Equal(0, entry.IngressCount);
+        Assert.Equal(0, entry.EgressCount);
+    }
+
+    [Fact]
+    public void AuthenticationMetadataConsumptionIsAtomicAndOneShot()
+    {
+        for (var iteration = 0; iteration < 2_000; iteration++)
+        {
+            var entry = CreateEntry(ingressMaxBytes: 32, egressMaxBytes: 32);
+            entry.SetAuthenticationMetadata(
+                new PrincipalId("principal"),
+                "A",
+                "A-1.1.0");
+            var results = new bool[2];
+
+            Parallel.Invoke(
+                () => results[0] = entry.TryTakeAuthenticationMetadata(
+                    out _,
+                    out _,
+                    out _),
+                () => results[1] = entry.TryTakeAuthenticationMetadata(
+                    out _,
+                    out _,
+                    out _));
+
+            Assert.Equal(1, results.Count(value => value));
+        }
     }
 
     /// <summary>
@@ -73,6 +365,61 @@ public sealed class BoundedQueueTest
     }
 
     [Fact]
+    public void FullEventOutboxRetainsFaultAndCloseForEveryLiveConnection()
+    {
+        using var harness = new TransportHarness();
+        var first = new TransportConnectionId(1);
+        var second = new TransportConnectionId(2);
+        harness.Carrier.QueueAccept(first, "lumio.mvp.v0");
+        harness.Carrier.QueueAccept(second, "lumio.mvp.v0");
+        Assert.True(harness.Service.TryAcceptOne());
+        Assert.True(harness.Service.TryAcceptOne());
+        _ = ConnectionLifecycleTest.DrainEvents(harness);
+        harness.Service.FillEventOutboxForTest();
+
+        harness.Carrier.QueueInbound(first, TransportHarness.MalformedEnvelope());
+        harness.Carrier.QueueInbound(second, TransportHarness.MalformedEnvelope());
+        Assert.True(harness.Service.PumpReceiveOnce(first));
+        Assert.True(harness.Service.PumpReceiveOnce(second));
+
+        Assert.Equal(0, harness.Service.ConnectionCountForTest);
+        var events = ConnectionLifecycleTest.DrainEvents(harness);
+        Assert.Equal(2, events.OfType<ConnectionEvent.Faulted>().Count());
+        Assert.Equal(2, events.OfType<ConnectionEvent.Closed>().Count());
+    }
+
+    [Fact]
+    public void TerminalBacklogRejectsChurnUntilReservedEventsAreConsumed()
+    {
+        using var harness = new TransportHarness(maxConnections: 2);
+        var first = new TransportConnectionId(1);
+        var second = new TransportConnectionId(2);
+        harness.Carrier.QueueAccept(first, "lumio.mvp.v0");
+        harness.Carrier.QueueAccept(second, "lumio.mvp.v0");
+        Assert.True(harness.Service.TryAcceptOne());
+        Assert.True(harness.Service.TryAcceptOne());
+        _ = ConnectionLifecycleTest.DrainEvents(harness);
+        harness.Service.FillEventOutboxForTest();
+        harness.Carrier.QueueInbound(first, TransportHarness.MalformedEnvelope());
+        harness.Carrier.QueueInbound(second, TransportHarness.MalformedEnvelope());
+        Assert.True(harness.Service.PumpReceiveOnce(first));
+        Assert.True(harness.Service.PumpReceiveOnce(second));
+
+        var rejected = new TransportConnectionId(3);
+        harness.Carrier.QueueAccept(rejected, "lumio.mvp.v0");
+        Assert.False(harness.Service.TryAcceptOne());
+        Assert.Contains(
+            harness.Carrier.CloseCalls,
+            call => call.Connection == rejected && call.Reason == ConnectionCloseReason.PolicyReject);
+
+        _ = ConnectionLifecycleTest.DrainEvents(harness);
+        var accepted = new TransportConnectionId(4);
+        harness.Carrier.QueueAccept(accepted, "lumio.mvp.v0");
+        Assert.True(harness.Service.TryAcceptOne());
+        Assert.Equal(1, harness.Service.ConnectionCountForTest);
+    }
+
+    [Fact]
     public void 非终态事件在事件队列满时关闭连接并写诊断()
     {
         using var harness = new TransportHarness();
@@ -82,7 +429,15 @@ public sealed class BoundedQueueTest
         harness.Service.RaiseBackpressuredForTest(id);
 
         Assert.Equal(TransportConnectionState.Closed, harness.Service.StateOf(id));
+        Assert.Equal(0, harness.Service.ConnectionCountForTest);
+        Assert.Contains(
+            harness.Carrier.CloseCalls,
+            call => call.Connection == id && call.Reason == ConnectionCloseReason.Fault);
+        Assert.NotEmpty(harness.Timers.Canceled);
         Assert.True(harness.DiagnosticInbox.TryDequeue(out _), "非终态事件被丢弃时必须留下一条 diagnostic");
+
+        var events = ConnectionLifecycleTest.DrainEvents(harness);
+        Assert.Contains(events, e => e is ConnectionEvent.Closed);
     }
 
     /// <summary>
@@ -236,6 +591,45 @@ public sealed class BoundedQueueTest
         }
 
         Assert.Fail("1024 条之内没能填满 ingress 队列——预算配置或计数有问题");
+    }
+
+    private static ConnectionEntry CreateEntry(long ingressMaxBytes, long egressMaxBytes)
+        => new(
+            new TransportConnectionId(1),
+            new QueueBudget(4, ingressMaxBytes),
+            new QueueBudget(4, egressMaxBytes));
+
+    private static ValidatedEnvelopeBytes IngressBytes(int length, ulong sequence = 0)
+        => new(
+            new byte[length],
+            default(Lumio.Server.MvpHost.Wire.EnvelopeHeaderView) with { Sequence = sequence });
+
+    private static OutboundEnvelopeBytes EgressBytes(int length, byte marker = 0)
+    {
+        var bytes = new byte[length];
+        if (length > 0)
+        {
+            bytes[0] = marker;
+        }
+
+        return new OutboundEnvelopeBytes(bytes);
+    }
+
+    private sealed class ThrowingCloseCarrier(InMemoryByteCarrier inner) : IByteCarrier
+    {
+        public ValueTask<CarrierAccept> AcceptAsync(CancellationToken ct) => inner.AcceptAsync(ct);
+
+        public ValueTask<CarrierReceive> ReceiveAsync(
+            TransportConnectionId c,
+            Memory<byte> buffer,
+            CancellationToken ct)
+            => inner.ReceiveAsync(c, buffer, ct);
+
+        public bool TrySend(TransportConnectionId c, ReadOnlyMemory<byte> bytes)
+            => inner.TrySend(c, bytes);
+
+        public bool Close(TransportConnectionId c, ConnectionCloseReason reason)
+            => throw new InvalidOperationException("close probe");
     }
 }
 

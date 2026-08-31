@@ -204,7 +204,7 @@ public sealed class CarrierBudgetAndFaultTests
     }
 
     [Fact]
-    public async Task IdleDeadlineDetectedTest()
+    public async Task IdleTimerProducerOnlyEnqueuesUntilCarrierOwnerPumpRuns()
     {
         var clock = new FakeMonotonicClock();
         using var timers = new RecordingTimers();
@@ -214,12 +214,66 @@ public sealed class CarrierBudgetAndFaultTests
 
         Assert.Contains(timers.Commands, command => command is ConnectionCommand.Close close && close.Id == accepted.ConnectionId);
         clock.Advance(TimeSpan.FromSeconds(15).Ticks);
-        timers.FireAll();
 
         var output = new byte[32];
-        var result = await client.ReceiveAsync(output, new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+        var receive = client.ReceiveAsync(output, CancellationToken.None);
+        var producer = new Thread(timers.FireAll)
+        {
+            IsBackground = true,
+            Name = "websocket-timer-producer-test",
+        };
+        producer.Start();
+        Assert.True(producer.Join(TimeSpan.FromSeconds(5)), "timer producer did not finish");
+
+        await Assert.ThrowsAsync<TimeoutException>(async () =>
+            await receive.WaitAsync(
+                TimeSpan.FromMilliseconds(200),
+                TestContext.Current.CancellationToken));
+        Assert.False(receive.IsCompleted, "timer producer applied the close before the carrier owner pump");
+
+        var ownerThreadId = Environment.CurrentManagedThreadId;
+        Assert.NotEqual(ownerThreadId, timers.LastDeliveryThreadId);
+        Assert.Equal(1, carrier.ProcessPendingTimerCommands());
+        Assert.Equal(ownerThreadId, Environment.CurrentManagedThreadId);
+
+        var result = await receive.WaitAsync(
+            TimeSpan.FromSeconds(5),
+            TestContext.Current.CancellationToken);
         Assert.Equal(WebSocketMessageType.Close, result.MessageType);
         Assert.Equal(WebSocketCloseStatus.NormalClosure, result.CloseStatus);
+    }
+
+    [Fact]
+    public async Task DeliveredOldIdleTimerCannotCloseConnectionAfterActivityRearmsDeadline()
+    {
+        var clock = new FakeMonotonicClock();
+        using var timers = new RecordingTimers();
+        using var carrier = CreateCarrier(
+            DefaultOptions(4096),
+            clock,
+            timers,
+            new AcceptingVerifier(),
+            new AcceptingReplay(),
+            new RecordingAudit());
+        using var client = await ConnectAsync(carrier);
+        var accepted = await carrier.AcceptAsync(CancellationToken.None);
+        var output = new byte[32];
+        var receive = carrier.ReceiveAsync(accepted.ConnectionId, output, CancellationToken.None).AsTask();
+
+        timers.FireAll();
+        await client.SendAsync(
+            Encoding.UTF8.GetBytes("activity"),
+            WebSocketMessageType.Text,
+            true,
+            TestContext.Current.CancellationToken);
+        var received = await receive.WaitAsync(
+            TimeSpan.FromSeconds(5),
+            TestContext.Current.CancellationToken);
+        Assert.True(received.Received);
+
+        Assert.Equal(1, carrier.ProcessPendingTimerCommands());
+        Assert.True(carrier.TrySend(accepted.ConnectionId, Encoding.UTF8.GetBytes("still-open")));
+        Assert.Equal(1, carrier.ConnectionCount);
     }
 
     [Fact]
@@ -241,6 +295,25 @@ public sealed class CarrierBudgetAndFaultTests
             .Where(line => line.Contains("MvpEnvelope" + "Writer", StringComparison.Ordinal))
             .ToList();
         Assert.Empty(writerCalls);
+
+        var carrierSource = File.ReadAllText(Path.Combine(sourceRoot, "WebSocketByteCarrier.cs"));
+        var handlerStart = carrierSource.IndexOf(
+            "private async Task HandleRequestAsync",
+            StringComparison.Ordinal);
+        var handlerTry = carrierSource.IndexOf("\n        try\n", handlerStart, StringComparison.Ordinal);
+        var reservation = carrierSource.IndexOf("TryReserveConnection", handlerStart, StringComparison.Ordinal);
+        var handlerFinally = carrierSource.IndexOf("\n        finally\n", handlerTry, StringComparison.Ordinal);
+        var credentialClear = carrierSource.IndexOf(
+            "Array.Clear(tokenBytes)",
+            handlerFinally,
+            StringComparison.Ordinal);
+        Assert.True(
+            handlerStart >= 0
+            && handlerTry > handlerStart
+            && reservation > handlerTry
+            && handlerFinally > reservation
+            && credentialClear > handlerFinally,
+            "connection reservation must stay inside the credential-clearing try/finally");
     }
 
     [Fact]
@@ -312,6 +385,221 @@ public sealed class CarrierBudgetAndFaultTests
         Assert.Equal(WebSocketMessageType.Text, first.MessageType);
         Assert.Equal(payload, buffer.AsSpan(0, first.Count).ToArray());
         Assert.Equal(WebSocketMessageType.Close, second.MessageType);
+    }
+
+    [Fact]
+    public async Task FlushCloseCancelsAnAlreadyInFlightSendWithinItsBudget()
+    {
+        var clock = new FakeMonotonicClock();
+        using var timers = new RecordingTimers();
+        using var carrier = CreateCarrier(
+            DefaultOptions(4096),
+            clock,
+            timers,
+            new AcceptingVerifier(),
+            new AcceptingReplay(),
+            new RecordingAudit());
+        using var socket = new BlockingSendWebSocket();
+        using var state = new WebSocketByteCarrier.ConnectionState(
+            new TransportConnectionId(99),
+            new ConnectionEpoch(0),
+            socket);
+        state.SendLoop = carrier.RunSendLoopAsync(state);
+        Assert.True(state.Egress.Writer.TryWrite(
+            new WebSocketByteCarrier.EgressItem(Encoding.UTF8.GetBytes("blocked"))));
+        await socket.SendStarted.Task.WaitAsync(
+            TimeSpan.FromSeconds(2),
+            TestContext.Current.CancellationToken);
+
+        try
+        {
+            Assert.True(carrier.RequestClose(
+                state,
+                ConnectionCloseReason.MaintenanceKick,
+                flush: true));
+            await state.Completion.Task.WaitAsync(
+                TimeSpan.FromSeconds(3),
+                TestContext.Current.CancellationToken);
+            Assert.True(socket.SendWasCanceled);
+        }
+        finally
+        {
+            try
+            {
+                state.SendCancellation.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Close retirement may have already disposed the connection CTS.
+            }
+            await state.Completion.Task.WaitAsync(
+                TimeSpan.FromSeconds(2),
+                TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public void ImmediateCloseDisposesConnectionSynchronizationResources()
+    {
+        var clock = new FakeMonotonicClock();
+        using var timers = new RecordingTimers();
+        using var carrier = CreateCarrier(
+            DefaultOptions(4096),
+            clock,
+            timers,
+            new AcceptingVerifier(),
+            new AcceptingReplay(),
+            new RecordingAudit());
+        using var socket = new BlockingSendWebSocket();
+        var state = new WebSocketByteCarrier.ConnectionState(
+            new TransportConnectionId(98),
+            new ConnectionEpoch(0),
+            socket);
+
+        Assert.True(carrier.RequestClose(
+            state,
+            ConnectionCloseReason.Fault,
+            flush: false));
+
+        Assert.Throws<ObjectDisposedException>(() => state.SendCancellation.Cancel());
+        Assert.Throws<ObjectDisposedException>(() => state.ReceiveGate.Wait(0, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public void ImmediateCloseDisposesResourcesWhenIdleTimerCancellationThrows()
+    {
+        var clock = new FakeMonotonicClock();
+        using var timers = new ThrowingCancelTimers();
+        using var carrier = CreateCarrier(
+            DefaultOptions(4096),
+            clock,
+            timers,
+            new AcceptingVerifier(),
+            new AcceptingReplay(),
+            new RecordingAudit());
+        using var socket = new BlockingSendWebSocket();
+        using var state = new WebSocketByteCarrier.ConnectionState(
+            new TransportConnectionId(97),
+            new ConnectionEpoch(0),
+            socket)
+        {
+            IdleTimer = new TimerId(1),
+        };
+
+        var error = Record.Exception(() => carrier.RequestClose(
+            state,
+            ConnectionCloseReason.Fault,
+            flush: false));
+
+        Assert.Null(error);
+        Assert.Throws<ObjectDisposedException>(() => state.SendCancellation.Cancel());
+        Assert.Throws<ObjectDisposedException>(() => state.ReceiveGate.Wait(0, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task DisposeForceRetiresAStateWhoseCloseWasAlreadyRequested()
+    {
+        var clock = new FakeMonotonicClock();
+        using var timers = new RecordingTimers();
+        var carrier = CreateCarrier(
+            DefaultOptions(4096),
+            clock,
+            timers,
+            new AcceptingVerifier(),
+            new AcceptingReplay(),
+            new RecordingAudit());
+        using var socket = new BlockingSendWebSocket();
+        var state = new WebSocketByteCarrier.ConnectionState(
+            new TransportConnectionId(96),
+            new ConnectionEpoch(0),
+            socket)
+        {
+            CloseRequested = true,
+            CloseReason = ConnectionCloseReason.Disconnect,
+        };
+        var connections = (IDictionary<ulong, WebSocketByteCarrier.ConnectionState>)typeof(WebSocketByteCarrier)
+            .GetField("connections", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(carrier)!;
+        connections.Add(state.Id.Value, state);
+
+        await carrier.DisposeAsync();
+
+        Assert.True(state.IsClosed);
+        Assert.True(state.Completion.Task.IsCompletedSuccessfully);
+        Assert.Equal(0, carrier.ConnectionCount);
+        Assert.Equal(WebSocketState.Closed, socket.State);
+        Assert.Throws<ObjectDisposedException>(() => state.SendCancellation.Cancel());
+    }
+
+    [Fact]
+    public async Task DisposeJoinsAnActiveReceiveBeforeForcingResourceRetirement()
+    {
+        var clock = new FakeMonotonicClock();
+        using var timers = new RecordingTimers();
+        var carrier = CreateCarrier(
+            DefaultOptions(4096),
+            clock,
+            timers,
+            new AcceptingVerifier(),
+            new AcceptingReplay(),
+            new RecordingAudit());
+        using var socket = new BlockingReceiveWebSocket();
+        var state = new WebSocketByteCarrier.ConnectionState(
+            new TransportConnectionId(95),
+            new ConnectionEpoch(0),
+            socket);
+        var connections = (IDictionary<ulong, WebSocketByteCarrier.ConnectionState>)typeof(WebSocketByteCarrier)
+            .GetField("connections", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(carrier)!;
+        connections.Add(state.Id.Value, state);
+
+        var receiveTask = carrier.ReceiveAsync(
+            state.Id,
+            new byte[64],
+            TestContext.Current.CancellationToken).AsTask();
+        await socket.ReceiveStarted.Task.WaitAsync(
+            TimeSpan.FromSeconds(2),
+            TestContext.Current.CancellationToken);
+
+        await carrier.DisposeAsync();
+
+        var receive = await receiveTask.WaitAsync(
+            TimeSpan.FromSeconds(2),
+            TestContext.Current.CancellationToken);
+        Assert.True(receive.Closed);
+        Assert.Equal(0, carrier.ConnectionCount);
+        Assert.Equal(1, socket.DisposeCalls);
+        Assert.True(receiveTask.IsCompletedSuccessfully);
+    }
+
+    [Fact]
+    public async Task TouchTimerCancelFailureFailsClosedWithoutEscapingReceive()
+    {
+        var clock = new FakeMonotonicClock();
+        using var timers = new ThrowingCancelTimers();
+        using var carrier = CreateCarrier(
+            DefaultOptions(4096),
+            clock,
+            timers,
+            new AcceptingVerifier(),
+            new AcceptingReplay(),
+            new RecordingAudit());
+        using var client = await ConnectAsync(carrier);
+        var accepted = await carrier.AcceptAsync(CancellationToken.None);
+        await client.SendAsync(
+            Encoding.UTF8.GetBytes("activity"),
+            WebSocketMessageType.Text,
+            true,
+            TestContext.Current.CancellationToken);
+
+        var receive = await carrier.ReceiveAsync(
+            accepted.ConnectionId,
+            new byte[64],
+            TestContext.Current.CancellationToken);
+
+        Assert.False(receive.Received);
+        Assert.True(receive.Closed);
+        Assert.Equal(0, carrier.ConnectionCount);
     }
 
     [Fact]
@@ -503,6 +791,8 @@ public sealed class CarrierBudgetAndFaultTests
 
         public IReadOnlyList<ConnectionCommand> Commands => this.scheduled.Select(item => item.Command).ToList();
 
+        public int LastDeliveryThreadId { get; private set; }
+
         public TimerId Schedule<T>(MonotonicInstant dueAt, IBoundedInbox<T> target, in T command)
         {
             if (typeof(T) == typeof(ConnectionCommand))
@@ -517,6 +807,7 @@ public sealed class CarrierBudgetAndFaultTests
 
         public void FireAll()
         {
+            this.LastDeliveryThreadId = Environment.CurrentManagedThreadId;
             foreach (var item in this.scheduled.ToArray())
             {
                 item.Target.TryEnqueue(item.Command);
@@ -524,5 +815,144 @@ public sealed class CarrierBudgetAndFaultTests
         }
 
         public void Dispose() { }
+    }
+
+    private sealed class ThrowingCancelTimers : ITimerService
+    {
+        public TimerId Schedule<T>(
+            MonotonicInstant dueAt,
+            IBoundedInbox<T> target,
+            in T command)
+            => new(1);
+
+        public bool Cancel(TimerId id)
+            => throw new InvalidOperationException("timer cancellation probe");
+
+        public void Dispose() { }
+    }
+
+    private sealed class BlockingSendWebSocket : System.Net.WebSockets.WebSocket
+    {
+        private int sendWasCanceled;
+        private WebSocketState state = WebSocketState.Open;
+
+        internal TaskCompletionSource<bool> SendStarted { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal bool SendWasCanceled => Volatile.Read(ref this.sendWasCanceled) != 0;
+
+        public override WebSocketCloseStatus? CloseStatus => null;
+
+        public override string? CloseStatusDescription => null;
+
+        public override WebSocketState State => this.state;
+
+        public override string? SubProtocol => null;
+
+        public override void Abort() => this.state = WebSocketState.Aborted;
+
+        public override Task CloseAsync(
+            WebSocketCloseStatus closeStatus,
+            string? statusDescription,
+            CancellationToken cancellationToken)
+        {
+            this.state = WebSocketState.Closed;
+            return Task.CompletedTask;
+        }
+
+        public override Task CloseOutputAsync(
+            WebSocketCloseStatus closeStatus,
+            string? statusDescription,
+            CancellationToken cancellationToken)
+        {
+            this.state = WebSocketState.CloseSent;
+            return Task.CompletedTask;
+        }
+
+        public override void Dispose() => this.state = WebSocketState.Closed;
+
+        public override Task<WebSocketReceiveResult> ReceiveAsync(
+            ArraySegment<byte> buffer,
+            CancellationToken cancellationToken)
+            => throw new NotSupportedException();
+
+        public override async Task SendAsync(
+            ArraySegment<byte> buffer,
+            WebSocketMessageType messageType,
+            bool endOfMessage,
+            CancellationToken cancellationToken)
+        {
+            this.SendStarted.TrySetResult(true);
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                Interlocked.Exchange(ref this.sendWasCanceled, 1);
+                throw;
+            }
+        }
+    }
+
+    private sealed class BlockingReceiveWebSocket : System.Net.WebSockets.WebSocket
+    {
+        private WebSocketState state = WebSocketState.Open;
+        private int disposeCalls;
+
+        internal TaskCompletionSource<bool> ReceiveStarted { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal int DisposeCalls => Volatile.Read(ref this.disposeCalls);
+
+        public override WebSocketCloseStatus? CloseStatus => null;
+
+        public override string? CloseStatusDescription => null;
+
+        public override WebSocketState State => this.state;
+
+        public override string? SubProtocol => null;
+
+        public override void Abort() => this.state = WebSocketState.Aborted;
+
+        public override Task CloseAsync(
+            WebSocketCloseStatus closeStatus,
+            string? statusDescription,
+            CancellationToken cancellationToken)
+        {
+            this.state = WebSocketState.Closed;
+            return Task.CompletedTask;
+        }
+
+        public override Task CloseOutputAsync(
+            WebSocketCloseStatus closeStatus,
+            string? statusDescription,
+            CancellationToken cancellationToken)
+        {
+            this.state = WebSocketState.CloseSent;
+            return Task.CompletedTask;
+        }
+
+        public override void Dispose()
+        {
+            Interlocked.Increment(ref this.disposeCalls);
+            this.state = WebSocketState.Closed;
+        }
+
+        public override async Task<WebSocketReceiveResult> ReceiveAsync(
+            ArraySegment<byte> buffer,
+            CancellationToken cancellationToken)
+        {
+            this.ReceiveStarted.TrySetResult(true);
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException("receive cancellation did not interrupt");
+        }
+
+        public override Task SendAsync(
+            ArraySegment<byte> buffer,
+            WebSocketMessageType messageType,
+            bool endOfMessage,
+            CancellationToken cancellationToken)
+            => Task.CompletedTask;
     }
 }

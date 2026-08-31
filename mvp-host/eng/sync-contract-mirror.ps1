@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # eng/sync-contract-mirror.sh 的 Windows 对应物。行为、输出前缀与退出码逐条对齐；
 # 设计理由（为什么清单的路径列是真值、源路径怎么推导）见 .sh 与 contract-mirror/MIRROR.md。
 Set-StrictMode -Version Latest
@@ -34,7 +34,7 @@ function Get-SourcePath([string]$mirroredPath) {
     return $rel
 }
 
-$paths = @(Get-Content $manifest |
+$paths = @(Get-Content $manifest -Encoding UTF8 |
     Where-Object { $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*$' } |
     ForEach-Object { ($_ -split '\s+', 2)[1].Trim() })
 
@@ -44,6 +44,18 @@ $lines.Add('# 只能经 bash eng/sync-contract-mirror.sh 更新，并与镜像�
 $lines.Add("# 来源：$archRef @ $archCommit（$(Split-Path -Leaf $archRoot)）")
 
 foreach ($path in $paths) {
+    if (-not $path.StartsWith('contract-mirror/', [System.StringComparison]::Ordinal)) {
+        Say "MVP_HOST_MIRROR_SYNC_FAIL 非法镜像路径：$path"
+        exit 1
+    }
+    try {
+        $targetPath = Resolve-ContainedPathPortable -BasePath $mvpHostDir -RelativePath $path
+    }
+    catch {
+        Say "MVP_HOST_MIRROR_SYNC_FAIL 非法镜像路径：$path"
+        exit 1
+    }
+
     $src = Get-SourcePath $path
     try {
         $bytes = Get-GitBlobBytes -RepoRoot $archRoot -ObjectSpec "${archCommit}:${src}"
@@ -56,7 +68,7 @@ foreach ($path in $paths) {
     $dir = Split-Path -Parent $path
     if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 
-    [System.IO.File]::WriteAllBytes((Join-Path $mvpHostDir $path), $bytes)
+    [System.IO.File]::WriteAllBytes($targetPath, $bytes)
     $lines.Add("$(Get-Sha256Hex -Bytes $bytes)  $path")
 }
 

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -15,10 +16,39 @@ using Xunit;
 
 namespace Lumio.Server.MvpHost.Integration.Tests;
 
-public sealed class HostSmokeClientAcceptanceTests
+public sealed class HostSmokeClientAcceptanceTests : IAsyncLifetime
 {
-    private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(15);
-    private static readonly TimeSpan ScenarioTimeout = TimeSpan.FromSeconds(45);
+    // Cold process startup can contend with antivirus and parallel test-host IO
+    // on Windows. The protocol assertions retain their own bounded waits.
+    private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ScenarioTimeout = TimeSpan.FromSeconds(90);
+    private static readonly HashSet<string> ClientTraceKeys = new(StringComparer.Ordinal)
+    {
+        "step", "direction", "messageType", "assertion", "passed", "detail",
+    };
+    private static readonly HashSet<string> AllowedClientUplink = new(StringComparer.Ordinal)
+    {
+        "Handshake", "BaselineAck", "DeltaAck", "ResyncRequest",
+    };
+    private static readonly string[] AdmissionEffects =
+    {
+        "ReadGate", "Authenticate", "MatchExactRelease", "ReserveSlot",
+        "CommitSlot", "CreateSession", "BindConnection", "StartReplication",
+    };
+    private static readonly ConcurrentDictionary<int, Process> LiveChildProcesses = new();
+
+    public ValueTask InitializeAsync() => ValueTask.CompletedTask;
+
+    public ValueTask DisposeAsync()
+    {
+        var live = LiveChildProcesses.Values
+            .Where(process => !ChildProcess.HasExited(process))
+            .Select(process => process.Id)
+            .OrderBy(id => id)
+            .ToArray();
+        Assert.True(live.Length == 0, $"integration child processes are still alive: {string.Join(",", live)}");
+        return ValueTask.CompletedTask;
+    }
 
     [Fact]
     public async Task TwoIndependentClientsCompleteMutationAcceptanceAtProcessBoundary()
@@ -49,9 +79,7 @@ public sealed class HostSmokeClientAcceptanceTests
             first.WaitForExitAsync(timeout.Token),
             second.WaitForExitAsync(timeout.Token));
 
-        // Stop the host before taking the final snapshot so the append-only
-        // trace is flushed and no writer is between JSON lines on Windows.
-        await host.StopAsync(timeout.Token);
+        await QuiesceHostAsync(host, timeout.Token);
 
         Assert.Equal(SmokeClientExitCodes.Success, first.ExitCode);
         Assert.Equal(SmokeClientExitCodes.Success, second.ExitCode);
@@ -90,6 +118,332 @@ public sealed class HostSmokeClientAcceptanceTests
         Assert.Equal("http", host.ControlUri.Scheme);
         Assert.True(host.ControlUri.IsLoopback);
         Assert.NotEqual(0, host.ControlUri.Port);
+        await QuiesceHostAsync(host, timeout.Token);
+    }
+
+    [Fact]
+    public async Task ProcessesAreRealSubprocessesTest()
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        timeout.CancelAfter(ScenarioTimeout);
+
+        await using var host = await MvpHostProcess.StartAsync(timeout.Token);
+        await using var client = host.StartSmokeClient("pid-bad-token-a", "bad-token");
+
+        Assert.NotEqual(Environment.ProcessId, host.ProcessId);
+        Assert.NotEqual(Environment.ProcessId, client.ProcessId);
+        Assert.NotEqual(host.ProcessId, client.ProcessId);
+        await client.WaitForExitAsync(timeout.Token);
+        Assert.Equal(SmokeClientExitCodes.Success, client.ExitCode);
+        await QuiesceHostAsync(host, timeout.Token);
+    }
+
+    [Fact]
+    public async Task InvalidCredentialAndReplayAreRejectedWithServerAuditEvidence()
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        timeout.CancelAfter(ScenarioTimeout);
+
+        await using var host = await MvpHostProcess.StartAsync(timeout.Token);
+        await using var badToken = host.StartSmokeClient("audit-bad-token", "bad-token");
+        await badToken.WaitForExitAsync(timeout.Token);
+        await using var replay = host.StartSmokeClient("audit-replay", "replay-nonce");
+        await replay.WaitForExitAsync(timeout.Token);
+        await QuiesceHostAsync(host, timeout.Token);
+
+        Assert.Equal(SmokeClientExitCodes.Success, badToken.ExitCode);
+        Assert.Equal(SmokeClientExitCodes.Success, replay.ExitCode);
+        AssertClientTraceShape(badToken.TracePath);
+        AssertClientTraceShape(replay.TracePath);
+        AssertAuthenticationAuditTrace(host.ServerTracePath);
+    }
+
+    [Fact]
+    public async Task SameConnectionGapRequestsFullResyncWithoutRehandshake()
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        timeout.CancelAfter(ScenarioTimeout);
+
+        await using var host = await MvpHostProcess.StartAsync(timeout.Token);
+        await using var client = host.StartSmokeClient("gap-resync-a", "gap-resync");
+        await WaitForTraceMessageAsync(client.TracePath, "BaselineAck", timeout.Token);
+        var mutation = await host.InjectWorldMutationAsync(
+            SessionIdForNonce(client.Nonce),
+            new byte[] { 7, 8 },
+            timeout.Token);
+        Assert.True(mutation.Accepted, mutation.StableErrorId ?? "mutation was rejected");
+        await client.WaitForExitAsync(timeout.Token);
+        await QuiesceHostAsync(host, timeout.Token);
+
+        Assert.Equal(SmokeClientExitCodes.Success, client.ExitCode);
+        Assert.True(TryReadTrace(client.TracePath, out var records));
+        Assert.Contains(records, record => record.Direction == "out" && record.MessageType == "ResyncRequest");
+        Assert.DoesNotContain(records, record => record.Direction == "in" && record.MessageType == "ResyncRequest");
+        Assert.True(
+            records.Count(record => record.Direction == "in" && record.Assertion == "server sends the first handshake") == 1,
+            "same-connection resync must not repeat the handshake");
+        Assert.True(
+            records.Count(record => record.Direction == "in" && record.Assertion == "admission or resync starts with a full snapshot") >= 2,
+            "gap resync must receive a fresh full snapshot");
+        AssertNoGameplayUplink(records);
+    }
+
+    [Fact]
+    public async Task ReleaseAndSizeRejectionScenariosRunAtProcessBoundary()
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        timeout.CancelAfter(ScenarioTimeout);
+
+        await using var host = await MvpHostProcess.StartAsync(timeout.Token);
+        await using var release = host.StartSmokeClient("reject-release", "release-mismatch");
+        await using var oversize = host.StartSmokeClient("reject-oversize", "oversize-message");
+        await Task.WhenAll(
+            release.WaitForExitAsync(timeout.Token),
+            oversize.WaitForExitAsync(timeout.Token));
+        await QuiesceHostAsync(host, timeout.Token);
+
+        Assert.True(
+            release.ExitCode == SmokeClientExitCodes.Success,
+            DescribeClientTrace(release.TracePath));
+        Assert.True(
+            oversize.ExitCode == SmokeClientExitCodes.Success,
+            DescribeClientTrace(oversize.TracePath));
+        Assert.True(TryReadTrace(release.TracePath, out var releaseRecords));
+        Assert.Contains(releaseRecords, record =>
+            record.MessageType == "Error"
+            && record.Assertion == "error envelope carries the expected registered rejection");
+        Assert.True(TryReadTrace(oversize.TracePath, out var oversizeRecords));
+        Assert.Contains(oversizeRecords, record =>
+            record.Assertion == "oversize message is rejected before application dispatch"
+            && record.Passed);
+    }
+
+    [Fact]
+    public async Task ReconnectScenarioCompletesAfterAnOutOfBandMutation()
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(90));
+
+        await using var host = await MvpHostProcess.StartAsync(timeout.Token);
+        await using var client = host.StartSmokeClient("reconnect-aa", "reconnect");
+
+        await WaitForTraceMessageAsync(client.TracePath, "BaselineAck", timeout.Token);
+        var mutation = await host.InjectWorldMutationAsync(
+            SessionIdForNonce(client.Nonce),
+            new byte[] { 3, 4 },
+            timeout.Token);
+        Assert.True(mutation.Accepted, mutation.StableErrorId ?? "mutation was rejected");
+        await WaitForTraceMessageAsync(client.TracePath, "DeltaAck", timeout.Token);
+        var kick = await host.KickAsync(
+            SessionIdForNonce(client.Nonce),
+            "MaintenanceKick",
+            timeout.Token);
+        Assert.True(kick.Accepted, kick.StableErrorId ?? "maintenance kick was rejected");
+        await WaitForSessionStateAsync(
+            host.ServerTracePath,
+            "ReconnectWindow",
+            timeout.Token);
+        var reconnectMutation = await host.InjectWorldMutationAsync(
+            SessionIdForNonce(client.Nonce),
+            new byte[] { 5, 6 },
+            timeout.Token);
+        Assert.True(
+            reconnectMutation.Accepted,
+            reconnectMutation.StableErrorId ?? "reconnect mutation was rejected");
+        await WaitForAuthorityRevisionAsync(host.ServerTracePath, 2, timeout.Token);
+        await client.WaitForExitAsync(timeout.Token);
+        await QuiesceHostAsync(host, timeout.Token);
+
+        Assert.Equal(SmokeClientExitCodes.Success, client.ExitCode);
+        AssertClientTrace(
+            client.TracePath,
+            "integration-reconnect",
+            "Handshake",
+            "FullSnapshot",
+            "BaselineAck",
+            "Delta",
+            "DeltaAck");
+        AssertReconnectClientTrace(client.TracePath);
+        AssertReconnectServerTrace(host.ServerTracePath);
+    }
+
+    [Fact]
+    public async Task ReconnectWindowExpiryRejectsALosingReconnectWithStableError()
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        timeout.CancelAfter(ScenarioTimeout);
+
+        await using var host = await MvpHostProcess.StartAsync(
+            timeout.Token,
+            reconnectWindowSeconds: 1);
+        await using var client = host.StartSmokeClient("expiry-win-expired", "a1-alpha");
+        await WaitForTraceMessageAsync(client.TracePath, "BaselineAck", timeout.Token);
+        var mutation = await host.InjectWorldMutationAsync(
+            SessionIdForNonce(client.Nonce),
+            new byte[] { 9, 10 },
+            timeout.Token);
+        Assert.True(mutation.Accepted, mutation.StableErrorId ?? "mutation was rejected");
+        await client.WaitForExitAsync(timeout.Token);
+        await WaitForSessionStateAsync(host.ServerTracePath, "Expired", timeout.Token);
+        await using var losingReconnect = host.StartSmokeClient(
+            client.Nonce + "-reconnect",
+            "a1-alpha");
+        await losingReconnect.WaitForExitAsync(timeout.Token);
+        await QuiesceHostAsync(host, timeout.Token);
+
+        Assert.Equal(SmokeClientExitCodes.Success, client.ExitCode);
+        Assert.Equal(SmokeClientExitCodes.Success, losingReconnect.ExitCode);
+        AssertClientTraceShape(losingReconnect.TracePath);
+        Assert.True(TryReadTrace(losingReconnect.TracePath, out var losingTrace));
+        Assert.Contains(losingTrace, record =>
+            record.MessageType == "Error"
+            && record.Assertion == "error envelope carries the expected registered rejection"
+            && record.Passed);
+        AssertFinalSessionState(host.ServerTracePath, SessionIdForNonce(client.Nonce), "Expired");
+    }
+
+    [Fact]
+    public async Task BeginDrainQuiescesInOrderAndExitsHostNormally()
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+
+        await using var host = await MvpHostProcess.StartAsync(timeout.Token);
+        var result = await host.BeginDrainAsync(0, timeout.Token);
+        Assert.True(result.Accepted, result.StableErrorId ?? "begin drain was rejected");
+
+        await host.WaitForExitAsync(timeout.Token);
+
+        Assert.Equal(0, host.ExitCode);
+        AssertQuiesceTrace(host.ServerTracePath);
+    }
+
+    [Theory]
+    [InlineData("TERM")]
+    [InlineData("INT")]
+    public async Task PosixSignalRoutesAChildProcessThroughOrderedQuiesce(string signal)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Skip("POSIX signal delivery is not exposed by the Windows test host");
+        }
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+            TestContext.Current.CancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(30));
+
+        await using var host = await MvpHostProcess.StartAsync(timeout.Token);
+        using var sender = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = "kill",
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            },
+        };
+        sender.StartInfo.ArgumentList.Add($"-{signal}");
+        sender.StartInfo.ArgumentList.Add(host.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+
+        Assert.True(sender.Start());
+        await sender.WaitForExitAsync(timeout.Token);
+        Assert.Equal(0, sender.ExitCode);
+
+        await host.WaitForExitAsync(timeout.Token);
+        Assert.Equal(0, host.ExitCode);
+        AssertQuiesceTrace(host.ServerTracePath);
+    }
+
+    private static async Task QuiesceHostAsync(
+        MvpHostProcess host,
+        CancellationToken cancellationToken)
+    {
+        var result = await host.BeginDrainAsync(0, cancellationToken).ConfigureAwait(false);
+        Assert.True(result.Accepted, result.StableErrorId ?? "begin drain was rejected");
+        await host.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+        Assert.Equal(0, host.ExitCode);
+        AssertQuiesceTrace(host.ServerTracePath);
+    }
+
+    private static void AssertClientTraceShape(string path)
+    {
+        var expectedStep = 1;
+        foreach (var line in ReadSharedLines(path))
+        {
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            var keys = root.EnumerateObject()
+                .Select(property => property.Name)
+                .ToHashSet(StringComparer.Ordinal);
+            Assert.Equal(ClientTraceKeys, keys);
+            Assert.Equal(expectedStep++, root.GetProperty("step").GetInt32());
+            Assert.True(root.GetProperty("direction").GetString() is "in" or "out");
+            Assert.True(
+                root.GetProperty("passed").GetBoolean(),
+                root.GetProperty("assertion").GetString());
+        }
+
+        Assert.True(expectedStep > 1, $"client trace is empty: {path}");
+    }
+
+    private static string DescribeClientTrace(string path)
+        => TryReadTrace(path, out var records)
+            ? string.Join(
+                " | ",
+                records.Select(record =>
+                    $"{record.Step}:{record.Assertion}:{record.Passed}:{record.Detail}"))
+            : $"client trace is missing or invalid: {path}";
+
+    private static void AssertNoGameplayUplink(IEnumerable<ClientTraceRecord> records)
+    {
+        Assert.DoesNotContain(records, record =>
+            record.Direction == "out"
+            && record.MessageType is not null
+            && !AllowedClientUplink.Contains(record.MessageType));
+    }
+
+    private static void AssertAuthenticationAuditTrace(string path)
+    {
+        var audits = new List<JsonElement>();
+        foreach (var line in ReadSharedLines(path))
+        {
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            if (root.GetProperty("kind").GetString() == "audit")
+            {
+                audits.Add(root.Clone());
+            }
+        }
+
+        Assert.NotEmpty(audits);
+        Assert.Contains(audits, audit =>
+            audit.GetProperty("category").GetString() == "Audit"
+            && audit.GetProperty("severity").GetString() == "Warn"
+            && audit.GetProperty("scope").GetString() == "Release"
+            && audit.GetProperty("releasePoolId").ValueKind == JsonValueKind.String
+            && !string.IsNullOrWhiteSpace(audit.GetProperty("releasePoolId").GetString())
+            && audit.GetProperty("sessionId").ValueKind == JsonValueKind.Null
+            && audit.GetProperty("eventId").ValueKind == JsonValueKind.String
+            && System.Text.RegularExpressions.Regex.IsMatch(
+                audit.GetProperty("eventId").GetString()!,
+                "^[A-Za-z][A-Za-z0-9._:-]{0,127}$",
+                System.Text.RegularExpressions.RegexOptions.CultureInvariant)
+            && audit.GetProperty("timestamp").ValueKind == JsonValueKind.String
+            && System.Text.RegularExpressions.Regex.IsMatch(
+                audit.GetProperty("timestamp").GetString()!,
+                "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$",
+                System.Text.RegularExpressions.RegexOptions.CultureInvariant));
+        Assert.Contains(audits, audit =>
+            audit.GetProperty("reasonCode").ValueKind == JsonValueKind.String
+            && audit.GetProperty("reasonCode").GetString() == "SessionAntiReplay");
     }
 
     private static async Task WaitForTraceMessageAsync(
@@ -97,28 +451,135 @@ public sealed class HostSmokeClientAcceptanceTests
         string messageType,
         CancellationToken cancellationToken)
     {
-        var deadline = Stopwatch.GetTimestamp()
-            + (long)(Stopwatch.Frequency * ScenarioTimeout.TotalSeconds);
-        while (Stopwatch.GetTimestamp() < deadline)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (TryReadTrace(path, out var records)
-                && records.Any(record =>
-                    record.MessageType is not null
-                    && record.MessageType.Equals(messageType, StringComparison.Ordinal)
-                    && record.Passed))
-            {
-                return;
-            }
+        await WaitForTraceConditionAsync(
+            path,
+            () => TraceContainsPassedMessageOrThrows(path, messageType),
+            cancellationToken).ConfigureAwait(false);
 
-            await Task.Delay(TimeSpan.FromMilliseconds(25), cancellationToken);
+    }
+
+    private static bool TraceContainsPassedMessageOrThrows(string path, string messageType)
+    {
+        if (!TryReadTrace(path, out var records))
+        {
+            return false;
         }
 
-        var current = TryReadTrace(path, out var finalRecords)
-            ? string.Join(", ", finalRecords.Select(record => record.MessageType ?? record.Assertion))
-            : "<trace file missing or incomplete>";
-        throw new Xunit.Sdk.XunitException(
-            $"Timed out waiting for {messageType} in {path}; observed: {current}");
+        var failed = records
+            .Where(record => !record.Passed)
+            .Select(record => (ClientTraceRecord?)record)
+            .FirstOrDefault();
+        if (failed is { } failure)
+        {
+            throw new Xunit.Sdk.XunitException(
+                $"SmokeClient assertion failed before {messageType}: {failure.Assertion}");
+        }
+
+        return records.Any(record =>
+            record.MessageType is not null
+            && record.MessageType.Equals(messageType, StringComparison.Ordinal)
+            && record.Passed);
+    }
+
+    private static async Task WaitForAuthorityRevisionAsync(
+        string path,
+        ulong revision,
+        CancellationToken cancellationToken)
+    {
+        await WaitForTraceConditionAsync(
+            path,
+            () => TraceHasAuthorityRevision(path, revision),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task WaitForSessionStateAsync(
+        string path,
+        string state,
+        CancellationToken cancellationToken)
+    {
+        await WaitForTraceConditionAsync(
+            path,
+            () => TraceHasSessionState(path, state),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task WaitForTraceConditionAsync(
+        string path,
+        Func<bool> condition,
+        CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(25));
+        while (!condition())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            {
+                throw new Xunit.Sdk.XunitException($"Trace timer stopped while waiting for {path}");
+            }
+        }
+    }
+
+    private static bool TraceHasAuthorityRevision(string path, ulong revision)
+    {
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            foreach (var line in ReadSharedLines(path))
+            {
+                using var document = JsonDocument.Parse(line);
+                var value = document.RootElement.GetProperty("authorityRevision");
+                if (value.ValueKind == JsonValueKind.Number && value.GetUInt64() >= revision)
+                {
+                    return true;
+                }
+            }
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static bool TraceHasSessionState(string path, string state)
+    {
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            foreach (var line in ReadSharedLines(path))
+            {
+                using var document = JsonDocument.Parse(line);
+                var value = document.RootElement.GetProperty("sessionState");
+                if (value.ValueKind == JsonValueKind.String
+                    && value.GetString()!.Equals(state, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+
+        return false;
     }
 
     private static void AssertClientTrace(
@@ -174,6 +635,7 @@ public sealed class HostSmokeClientAcceptanceTests
             "sessionState", "authorityRevision", "slotEpoch", "connectionEpoch", "grantEpoch",
         };
         var effects = new HashSet<string>(StringComparer.Ordinal);
+        var admissionEffects = new Dictionary<ulong, List<string>>();
         var activeStates = 0;
         ulong previousSequence = 0;
         var first = true;
@@ -197,7 +659,19 @@ public sealed class HostSmokeClientAcceptanceTests
 
             if (root.GetProperty("effect").ValueKind == JsonValueKind.String)
             {
-                effects.Add(root.GetProperty("effect").GetString()!);
+                var effect = root.GetProperty("effect").GetString()!;
+                effects.Add(effect);
+                if (root.GetProperty("admissionAttemptId").ValueKind == JsonValueKind.Number)
+                {
+                    var attempt = root.GetProperty("admissionAttemptId").GetUInt64();
+                    if (!admissionEffects.TryGetValue(attempt, out var ordered))
+                    {
+                        ordered = new List<string>();
+                        admissionEffects.Add(attempt, ordered);
+                    }
+
+                    ordered.Add(effect);
+                }
             }
 
             if (root.GetProperty("sessionState").GetString() == "Active")
@@ -216,10 +690,142 @@ public sealed class HostSmokeClientAcceptanceTests
         Assert.True(hasRevisionOne, "mutation must advance the authority revision to one");
         Assert.Contains("ReadGate", effects);
         Assert.Contains("Authenticate", effects);
+        Assert.Contains("MatchExactRelease", effects);
+        Assert.Contains("ReserveSlot", effects);
         Assert.Contains("CommitSlot", effects);
         Assert.Contains("CreateSession", effects);
         Assert.Contains("BindConnection", effects);
         Assert.Contains("StartReplication", effects);
+        Assert.DoesNotContain("TransportAccepted", effects);
+        Assert.DoesNotContain("ServerHandshakeQueued", effects);
+        Assert.DoesNotContain("ClientHandshakeReceived", effects);
+        Assert.DoesNotContain("IngressReady", effects);
+        Assert.DoesNotContain("TransportClosed", effects);
+        Assert.DoesNotContain("TransportFaulted", effects);
+        Assert.NotEmpty(admissionEffects);
+        Assert.All(admissionEffects.Values, ordered => Assert.Equal(AdmissionEffects, ordered));
+    }
+
+    private static void AssertReconnectClientTrace(string path)
+    {
+        Assert.True(TryReadTrace(path, out var records));
+        Assert.True(
+            records.Count(record => record.MessageType == "Handshake") >= 2,
+            "reconnect must perform a second full handshake");
+        Assert.True(
+            records.Count(record => record.MessageType == "FullSnapshot") >= 2,
+            "reconnect must receive a new full snapshot");
+        Assert.True(
+            records.Count(record => record.MessageType == "BaselineAck") >= 2,
+            "reconnect must acknowledge the new baseline");
+        Assert.Contains(records, record =>
+            record.MessageType == "FullSnapshot"
+            && record.Assertion == "reconnect full snapshot is strictly newer than the last delta"
+            && record.Passed);
+        var kickIndex = records.FindIndex(record =>
+            record.MessageType == "MaintenanceKick"
+            && record.Assertion == "maintenance kick envelope precedes close");
+        var reconnectUpgradeIndex = records.FindIndex(
+            kickIndex + 1,
+            record => record.Assertion == "websocket upgrade returned HTTP 101");
+        Assert.True(kickIndex >= 0 && reconnectUpgradeIndex > kickIndex);
+        AssertNoGameplayUplink(records);
+    }
+
+    private static void AssertReconnectServerTrace(string path)
+    {
+        var lines = ReadSharedLines(path);
+        var syncingRevisions = new List<ulong>();
+        var grantEpochs = new List<ulong>();
+        var activeStates = 0;
+        var highestMutationRevision = 0UL;
+
+        foreach (var line in lines)
+        {
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            if (root.GetProperty("authorityRevision").ValueKind == JsonValueKind.Number)
+            {
+                highestMutationRevision = Math.Max(
+                    highestMutationRevision,
+                    root.GetProperty("authorityRevision").GetUInt64());
+            }
+
+            if (root.GetProperty("kind").GetString() == "state"
+                && root.GetProperty("sessionState").GetString() == "Syncing"
+                && root.GetProperty("authorityRevision").ValueKind == JsonValueKind.Number)
+            {
+                syncingRevisions.Add(root.GetProperty("authorityRevision").GetUInt64());
+            }
+
+            if (root.GetProperty("kind").GetString() == "state"
+                && root.GetProperty("grantEpoch").ValueKind == JsonValueKind.Number)
+            {
+                grantEpochs.Add(root.GetProperty("grantEpoch").GetUInt64());
+            }
+
+            if (root.GetProperty("kind").GetString() == "state"
+                && root.GetProperty("sessionState").GetString() == "Active")
+            {
+                activeStates++;
+            }
+        }
+
+        Assert.True(highestMutationRevision >= 2, "both real mutations must advance authority revision");
+        Assert.True(syncingRevisions.Count >= 2, "server must trace both initial and reconnect sync states");
+        Assert.True(
+            syncingRevisions[^1] > 1,
+            "reconnect FullSnapshot must be strictly newer than the last Delta");
+        var distinctGrantEpochs = grantEpochs.Distinct().ToArray();
+        Assert.True(distinctGrantEpochs.Length >= 2, "reconnect must derive a new grant epoch");
+        Assert.True(distinctGrantEpochs[^1] > distinctGrantEpochs[0]);
+        Assert.True(activeStates >= 2, "initial and reconnected sessions must both reach Active");
+    }
+
+    private static void AssertFinalSessionState(string path, string sessionId, string expected)
+    {
+        string? final = null;
+        foreach (var line in ReadSharedLines(path))
+        {
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            if (root.GetProperty("kind").GetString() == "state"
+                && root.GetProperty("sessionId").ValueKind == JsonValueKind.String
+                && root.GetProperty("sessionId").GetString() == sessionId
+                && root.GetProperty("sessionState").ValueKind == JsonValueKind.String)
+            {
+                final = root.GetProperty("sessionState").GetString();
+            }
+        }
+
+        Assert.Equal(expected, final);
+    }
+
+    private static void AssertQuiesceTrace(string path)
+    {
+        var required = new[] { "AdmissionClosed", "Drained", "SnapshotCut", "Stopped" };
+        var observed = new List<string>();
+        foreach (var line in ReadSharedLines(path))
+        {
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            if (root.GetProperty("kind").GetString() != "ack"
+                || root.GetProperty("effect").ValueKind != JsonValueKind.String)
+            {
+                continue;
+            }
+
+            var effect = root.GetProperty("effect").GetString()!;
+            if (!required.Contains(effect, StringComparer.Ordinal))
+            {
+                continue;
+            }
+
+            Assert.Equal(JsonValueKind.Number, root.GetProperty("slotEpoch").ValueKind);
+            observed.Add(effect);
+        }
+
+        Assert.Equal(required, observed);
     }
 
     private static bool TryReadTrace(string path, out List<ClientTraceRecord> records)
@@ -238,11 +844,15 @@ public sealed class HostSmokeClientAcceptanceTests
                 var root = document.RootElement;
                 records.Add(new ClientTraceRecord(
                     root.GetProperty("step").GetInt32(),
+                    root.GetProperty("direction").GetString() ?? string.Empty,
                     root.GetProperty("messageType").ValueKind == JsonValueKind.Null
                         ? null
                         : root.GetProperty("messageType").GetString(),
                     root.GetProperty("assertion").GetString() ?? string.Empty,
-                    root.GetProperty("passed").GetBoolean()));
+                    root.GetProperty("passed").GetBoolean(),
+                    root.GetProperty("detail").ValueKind == JsonValueKind.Null
+                        ? null
+                        : root.GetProperty("detail").GetString()));
             }
 
             return true;
@@ -287,9 +897,11 @@ public sealed class HostSmokeClientAcceptanceTests
 
     private readonly record struct ClientTraceRecord(
         int Step,
+        string Direction,
         string? MessageType,
         string Assertion,
-        bool Passed);
+        bool Passed,
+        string? Detail);
 
     private sealed class MvpHostProcess : IAsyncDisposable
     {
@@ -319,7 +931,13 @@ public sealed class HostSmokeClientAcceptanceTests
 
         internal int ListenPort => new Uri(Ready.ListenUri).Port;
 
-        internal static async Task<MvpHostProcess> StartAsync(CancellationToken cancellationToken)
+        internal int ExitCode => process.ExitCode;
+
+        internal int ProcessId => process.ProcessId;
+
+        internal static async Task<MvpHostProcess> StartAsync(
+            CancellationToken cancellationToken,
+            int reconnectWindowSeconds = 10)
         {
             var root = Path.Combine(
                 Path.GetTempPath(),
@@ -337,6 +955,7 @@ public sealed class HostSmokeClientAcceptanceTests
                     "--listen", "ws://127.0.0.1:0",
                     "--allow-insecure-loopback",
                     "--shared-secret-file", secretPath,
+                    "--reconnect-window-seconds", reconnectWindowSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     "--enable-test-control",
                     "--test-control-listen", "http://127.0.0.1:0",
                     "--audit-trace-file", serverTracePath);
@@ -411,8 +1030,54 @@ public sealed class HostSmokeClientAcceptanceTests
             return new MutationResult(accepted, stableErrorId);
         }
 
+        internal Task<MutationResult> KickAsync(
+            string sessionId,
+            string reasonCode,
+            CancellationToken cancellationToken)
+            => PostControlAsync(
+                "test-control/kick",
+                new { sessionId, reasonCode },
+                cancellationToken);
+
+        internal Task<MutationResult> BeginDrainAsync(
+            int graceSeconds,
+            CancellationToken cancellationToken)
+            => PostControlAsync(
+                "test-control/begin-drain",
+                new { graceSeconds },
+                cancellationToken);
+
+        private async Task<MutationResult> PostControlAsync(
+            string route,
+            object payload,
+            CancellationToken cancellationToken)
+        {
+            using var client = new HttpClient
+            {
+                BaseAddress = new Uri(ControlUri.ToString().TrimEnd('/') + "/"),
+                Timeout = ScenarioTimeout,
+            };
+            using var content = new StringContent(
+                JsonSerializer.Serialize(payload),
+                Encoding.UTF8,
+                "application/json");
+            using var response = await client.PostAsync(route, content, cancellationToken).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            Assert.True(response.IsSuccessStatusCode, body);
+
+            using var document = JsonDocument.Parse(body);
+            return new MutationResult(
+                document.RootElement.GetProperty("accepted").GetBoolean(),
+                document.RootElement.GetProperty("stableErrorId").ValueKind == JsonValueKind.Null
+                    ? null
+                    : document.RootElement.GetProperty("stableErrorId").GetString());
+        }
+
         internal Task StopAsync(CancellationToken cancellationToken)
             => process.StopAsync(cancellationToken);
+
+        internal Task WaitForExitAsync(CancellationToken cancellationToken)
+            => process.WaitForExitAsync(cancellationToken);
 
         public async ValueTask DisposeAsync()
         {
@@ -476,6 +1141,8 @@ public sealed class HostSmokeClientAcceptanceTests
 
         internal int ExitCode => process.ExitCode;
 
+        internal int ProcessId => process.Id;
+
         internal static ChildProcess Start(
             string assembly,
             params string[] arguments)
@@ -513,6 +1180,8 @@ public sealed class HostSmokeClientAcceptanceTests
                 process.Dispose();
                 throw new InvalidOperationException($"could not start child process: {assembly}");
             }
+
+            LiveChildProcesses[process.Id] = process;
 
             var child = new ChildProcess(
                 process,
@@ -558,6 +1227,7 @@ public sealed class HostSmokeClientAcceptanceTests
         internal async Task WaitForExitAsync(CancellationToken cancellationToken)
         {
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            MarkExited(process);
             await AwaitOutputAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -580,6 +1250,7 @@ public sealed class HostSmokeClientAcceptanceTests
             }
 
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            MarkExited(process);
             await AwaitOutputAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -598,13 +1269,26 @@ public sealed class HostSmokeClientAcceptanceTests
             }
             catch (TimeoutException)
             {
-                // The bounded wait prevents cleanup from hanging the test host.
+                if (!HasExited(process))
+                {
+                    process.Kill(entireProcessTree: true);
+                    await process.WaitForExitAsync(CancellationToken.None)
+                        .WaitAsync(TimeSpan.FromSeconds(5))
+                        .ConfigureAwait(false);
+                }
             }
             catch (InvalidOperationException)
             {
                 // No process handle remains.
             }
 
+            if (!HasExited(process))
+            {
+                throw new Xunit.Sdk.XunitException(
+                    $"child process {process.Id} remained alive after bounded cleanup");
+            }
+
+            MarkExited(process);
             try
             {
                 await AwaitOutputAsync(CancellationToken.None).ConfigureAwait(false);
@@ -616,6 +1300,21 @@ public sealed class HostSmokeClientAcceptanceTests
 
             process.Dispose();
         }
+
+        internal static bool HasExited(Process candidate)
+        {
+            try
+            {
+                return candidate.HasExited;
+            }
+            catch (InvalidOperationException)
+            {
+                return true;
+            }
+        }
+
+        private static void MarkExited(Process candidate)
+            => LiveChildProcesses.TryRemove(candidate.Id, out _);
 
         private async Task AwaitOutputAsync(CancellationToken cancellationToken)
         {

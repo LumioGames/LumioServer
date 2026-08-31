@@ -9,6 +9,7 @@
     <ProjectReference Include="../Lumio.Server.MvpHost.Observability/Lumio.Server.MvpHost.Observability.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="lumio-mvp-host" />
     <InternalsVisibleTo Include="Lumio.Server.MvpHost.Session.Tests" />
   </ItemGroup>
 </Project>

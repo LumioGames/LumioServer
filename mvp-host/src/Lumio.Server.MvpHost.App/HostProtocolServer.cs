@@ -222,7 +222,19 @@ public sealed class HostProtocolServer : IAsyncDisposable
             && TryDecodeBase64Url(requested[1], out credential);
 
         var socket = await context.WebSockets.AcceptWebSocketAsync(Subprotocol).ConfigureAwait(false);
-        if (!validShape || !Authenticate(credential, requested.Count == 3 ? requested[2] : string.Empty))
+        bool authenticated;
+        try
+        {
+            authenticated = validShape
+                && Authenticate(credential, requested.Count == 3 ? requested[2] : string.Empty);
+        }
+        finally
+        {
+            Array.Clear(credential);
+            credential = Array.Empty<byte>();
+        }
+
+        if (!authenticated)
         {
             if (!validShape)
             {

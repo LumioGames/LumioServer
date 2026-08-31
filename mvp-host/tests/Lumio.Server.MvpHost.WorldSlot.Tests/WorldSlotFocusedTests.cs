@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text.Json.Nodes;
 using System.Threading;
@@ -15,8 +16,43 @@ namespace Lumio.Server.MvpHost.WorldSlot.Tests;
 
 public sealed class WorldSlotFocusedTests
 {
+    [Fact]
+    public void AdmissionAndPacingAdaptersDoNotExpandThePublicHostShape()
+    {
+        var publicMethods = typeof(WorldSlotHost)
+            .GetMethods(System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.DeclaredOnly)
+            .Select(method => method.Name)
+            .ToArray();
+
+        Assert.DoesNotContain("ReserveAdmission", publicMethods);
+        Assert.DoesNotContain("AbortAdmission", publicMethods);
+        Assert.DoesNotContain("EnqueueTickPermit", publicMethods);
+    }
+
     private static readonly string[] QuiesceAckNames =
         { "AdmissionClosed", "Drained", "SnapshotCut", "Stopped" };
+
+    [Fact]
+    public void OwnerThreadWaitsForAWorkSignalInsteadOfPollingEveryMillisecond()
+    {
+        var mvpHostDirectory = Path.GetFullPath(Path.Combine(
+            Path.GetDirectoryName(typeof(WorldSlotHost).Assembly.Location)!,
+            "..",
+            "..",
+            "..",
+            "..",
+            ".."));
+        var source = File.ReadAllText(Path.Combine(
+            mvpHostDirectory,
+            "src",
+            "Lumio.Server.MvpHost.WorldSlot",
+            "WorldSlotHost.cs"));
+
+        Assert.DoesNotContain("WaitOne(1)", source, StringComparison.Ordinal);
+        Assert.Contains("AutoResetEvent", source, StringComparison.Ordinal);
+    }
 
     private static readonly string[] AdmissionClosedOnly = { "AdmissionClosed" };
 
@@ -136,6 +172,38 @@ public sealed class WorldSlotFocusedTests
     }
 
     [Fact]
+    public void CommittedReservationCanBeReleasedIdempotently()
+    {
+        using var harness = new Harness();
+        Assert.True(harness.Host.Allocate(new SlotBudget(1, 64, 65_536)).Allocated);
+
+        var session = new ServerSessionId("session-release");
+        var reservation = harness.Host.TryReserve(new AdmissionAttemptId(1), session);
+        Assert.True(reservation.Allocated);
+        var handle = harness.Host.LastReservation;
+        Assert.True(harness.Host.BindSession(handle, session, harness.Host.Epoch).Accepted);
+        Assert.Equal(1, harness.Host.Capacity.BoundSessions);
+
+        var publicAbort = harness.Host.AbortAdmission(handle, harness.Host.Epoch);
+        Assert.False(publicAbort.Accepted);
+        Assert.Equal("InvalidArgument", publicAbort.StableErrorId);
+        var mismatchedRelease = harness.Host.ReleaseCommittedReservation(
+            handle,
+            new ServerSessionId("another-session"),
+            harness.Host.Epoch);
+        Assert.False(mismatchedRelease.Accepted);
+        Assert.Equal(1, harness.Host.Capacity.BoundSessions);
+
+        Assert.True(harness.Host.ReleaseCommittedReservation(handle, session, harness.Host.Epoch).Accepted);
+        Assert.True(harness.Host.ReleaseCommittedReservation(handle, session, harness.Host.Epoch).Accepted);
+        Assert.Equal(0, harness.Host.Capacity.BoundSessions);
+
+        Assert.True(harness.Host.TryReserve(
+            new AdmissionAttemptId(2),
+            new ServerSessionId("session-after-release")).Allocated);
+    }
+
+    [Fact]
     public void ReservationAttemptRetryReturnsTheOriginalReservation()
     {
         using var harness = new Harness();
@@ -157,11 +225,10 @@ public sealed class WorldSlotFocusedTests
     }
 
     [Fact]
-    public void PublicAdmissionPortReturnsPerCallReservationAndSlotIdentity()
+    public void InternalAdmissionPathReturnsPerCallReservationAndSlotIdentity()
     {
         using var harness = new Harness();
         Assert.True(harness.Host.Allocate(new SlotBudget(4, 64, 65_536)).Allocated);
-        Assert.IsAssignableFrom<IWorldSlotAdmissionPort>(harness.Host);
         var port = harness.Host;
         var results = new AdmissionReservationResult[4];
 
@@ -246,6 +313,113 @@ public sealed class WorldSlotFocusedTests
     }
 
     [Fact]
+    public void ReservedEventTailCannotBeBypassedByLaterPrimaryEvents()
+    {
+        using var harness = new Harness(eventCapacity: 1);
+        Assert.True(harness.Host.Allocate(new SlotBudget(1, 64, 65_536)).Allocated);
+
+        var occupied = harness.Host.ReserveAdmission(
+            new AdmissionAttemptId(99),
+            new ServerSessionId("occupied"));
+        Assert.True(occupied.Reserved);
+        Assert.True(harness.EventInbox.TryDequeue(out _));
+
+        WorldSlotEvent filler = new WorldSlotEvent.TickCompleted(
+            new LogicalTickToken(1),
+            0,
+            new SlotEpoch(0));
+        Assert.Equal(EnqueueStatus.Accepted, harness.EventInbox.TryEnqueue(in filler).Status);
+
+        var first = harness.Host.ReserveAdmission(
+            new AdmissionAttemptId(1),
+            new ServerSessionId("rejected"));
+        Assert.False(first.Reserved);
+        Assert.Equal("CapacityExceeded", first.StableErrorId);
+
+        Assert.True(harness.EventInbox.TryDequeue(out _));
+        Assert.True(harness.Host.AbortAdmission(occupied.Reservation, occupied.Epoch).Accepted);
+
+        var second = harness.Host.ReserveAdmission(
+            new AdmissionAttemptId(2),
+            new ServerSessionId("after-allocation"));
+        Assert.True(second.Reserved);
+
+        var observed = new List<WorldSlotEvent>();
+        while (harness.Host.TryDequeueEvent(out var evt))
+        {
+            observed.Add(evt);
+        }
+
+        var rejectedIndex = observed.FindIndex(evt => evt is WorldSlotEvent.AdmissionRejected rejected
+            && rejected.Attempt == new AdmissionAttemptId(1));
+        var reservedIndex = observed.FindIndex(evt => evt is WorldSlotEvent.AdmissionReserved reserved
+            && reserved.Attempt == new AdmissionAttemptId(2));
+        Assert.True(rejectedIndex >= 0);
+        Assert.True(reservedIndex > rejectedIndex);
+    }
+
+    [Fact]
+    public void FaultTerminalEventsKeepReservedSlotsAfterNonTerminalTailSaturation()
+    {
+        using var harness = new Harness(eventCapacity: 1);
+        Assert.True(harness.Host.Allocate(new SlotBudget(1, 64, 65_536)).Allocated);
+
+        var occupied = harness.Host.ReserveAdmission(
+            new AdmissionAttemptId(99),
+            new ServerSessionId("occupied"));
+        Assert.True(occupied.Reserved);
+        Assert.True(harness.EventInbox.TryDequeue(out _));
+
+        WorldSlotEvent filler = new WorldSlotEvent.TickCompleted(
+            new LogicalTickToken(1),
+            0,
+            new SlotEpoch(0));
+        Assert.Equal(EnqueueStatus.Accepted, harness.EventInbox.TryEnqueue(in filler).Status);
+
+        var rejected = harness.Host.ReserveAdmission(
+            new AdmissionAttemptId(1),
+            new ServerSessionId("rejected"));
+        Assert.False(rejected.Reserved);
+        Assert.Equal("CapacityExceeded", rejected.StableErrorId);
+        Assert.True(harness.EventInbox.TryDequeue(out _));
+
+        Assert.True(harness.Host.AbortAdmission(occupied.Reservation, occupied.Epoch).Accepted);
+
+        // Fill the tail up to the non-critical limit with real gate events. The
+        // two remaining slots must stay available for FaultAdjudicated and
+        // ReadyToStop.
+        for (var i = 0; i < WorldSlotProvisionalDefaults.SlotEventOutboxMaxItems - 1; i++)
+        {
+            var nextGate = i % 2 == 0
+                ? AdmissionGateState.Closed
+                : AdmissionGateState.Open;
+            Assert.True(harness.Host.SetGate(nextGate, harness.Host.Epoch).Accepted);
+        }
+
+        var saturated = harness.Host.SetGate(AdmissionGateState.Open, harness.Host.Epoch);
+        Assert.False(saturated.Accepted);
+        Assert.Equal("QueueFull", saturated.StableErrorId);
+
+        var fault = harness.Host.ReportFault(
+            "InternalInvariant",
+            HostFaultClass.ProcessFault,
+            harness.Host.Epoch);
+        Assert.True(fault.Accepted);
+        Assert.Equal(WorldSlotHostState.Faulted, harness.Host.State);
+
+        var observed = new List<WorldSlotEvent>();
+        while (harness.Host.TryDequeueEvent(out var evt))
+        {
+            observed.Add(evt);
+        }
+        Assert.Contains(observed, evt => evt is WorldSlotEvent.FaultAdjudicated);
+        Assert.Contains(observed, evt => evt is WorldSlotEvent.ReadyToStop);
+        var faultIndex = observed.FindIndex(evt => evt is WorldSlotEvent.FaultAdjudicated);
+        var stopIndex = observed.FindIndex(evt => evt is WorldSlotEvent.ReadyToStop);
+        Assert.True(stopIndex > faultIndex);
+    }
+
+    [Fact]
     public void ClosedGateRejectsCommitAsWellAsReservation()
     {
         using var harness = new Harness();
@@ -269,6 +443,9 @@ public sealed class WorldSlotFocusedTests
         Assert.False(harness.Host.TryReserve(
                 new AdmissionAttemptId(2),
                 new ServerSessionId("session-2")).Allocated);
+        Assert.True(harness.Host.AbortAdmission(
+            harness.Host.LastReservation,
+            harness.Host.Epoch).Accepted);
         Assert.True(harness.Host.AbortAdmission(
             harness.Host.LastReservation,
             harness.Host.Epoch).Accepted);
@@ -375,12 +552,11 @@ public sealed class WorldSlotFocusedTests
     }
 
     [Fact]
-    public void PublicPacingPortUsesBoundedQueueAndEpochFence()
+    public void InternalPacingPathUsesBoundedQueueAndEpochFence()
     {
         using var harness = new Harness();
         Assert.True(harness.Host.Allocate(new SlotBudget(1, 64, 65_536)).Allocated);
         Assert.True(harness.Host.StartRunning().Accepted);
-        Assert.IsAssignableFrom<IWorldSlotPacingPort>(harness.Host);
         var port = harness.Host;
         harness.Simulation.BlockTicks = true;
 
@@ -462,25 +638,170 @@ public sealed class WorldSlotFocusedTests
     public void ReservedCommandsUseEmergencyLaneWhenInboxIsFull()
     {
         using var harness = new Harness(aggregateCapacity: 64);
-        Assert.True(harness.Host.Allocate(new SlotBudget(1, 64, 65_536)).Allocated);
+        harness.StartRunning();
+        harness.Simulation.BlockTicks = true;
+        Assert.Equal(
+            EnqueueStatus.Accepted,
+            harness.Host.EnqueueTick(new LogicalTickToken(1), harness.Host.Epoch).Status);
+        Assert.True(harness.Simulation.TickStarted.Wait(
+            TimeSpan.FromSeconds(2),
+            TestContext.Current.CancellationToken));
 
-        for (var i = 0; i < 64; i++)
+        try
         {
-            var result = harness.Host.TryEnqueue(
-                new WorldSlotCommand.DependencyAck(new AdmissionAttemptId((ulong)i), true, null));
-            Assert.Equal(EnqueueStatus.Accepted, result.Status);
+            var attempt = 0UL;
+            while (harness.AggregateInbox.Count < harness.AggregateInbox.Budget.MaxItems)
+            {
+                var result = harness.Host.TryEnqueue(
+                    new WorldSlotCommand.DependencyAck(new AdmissionAttemptId(attempt++), true, null));
+                Assert.Equal(EnqueueStatus.Accepted, result.Status);
+            }
+
+            Assert.Equal(harness.AggregateInbox.Budget.MaxItems, harness.AggregateInbox.Count);
+
+            var abort = harness.Host.TryEnqueue(new WorldSlotCommand.AbortAdmission(
+                new SlotReservationId(1),
+                harness.Host.Epoch));
+            var quiesce = harness.Host.TryEnqueue(
+                new WorldSlotCommand.Quiesce("shutdown", harness.Host.Epoch));
+            var stop = harness.Host.TryEnqueue(new WorldSlotCommand.Stop(harness.Host.Epoch));
+            var ordinary = harness.Host.TryEnqueue(
+                new WorldSlotCommand.DependencyAck(new AdmissionAttemptId(1000), true, null));
+
+            Assert.Equal(EnqueueStatus.Full, abort.Status);
+            Assert.Equal("QueueFull", abort.StableErrorId);
+            Assert.Equal(EnqueueStatus.Accepted, quiesce.Status);
+            Assert.Equal(EnqueueStatus.Accepted, stop.Status);
+            Assert.Equal(EnqueueStatus.Full, ordinary.Status);
+            Assert.Equal("QueueFull", ordinary.StableErrorId);
+        }
+        finally
+        {
+            harness.Simulation.ReleaseTicks();
+        }
+    }
+
+    [Fact]
+    public void ReservedCommandTailCannotBeBypassedWhenPrimaryCapacityReopens()
+    {
+        using var harness = new Harness(aggregateCapacity: 64);
+        harness.StartRunning();
+        harness.Simulation.BlockTicks = true;
+        Assert.Equal(
+            EnqueueStatus.Accepted,
+            harness.Host.EnqueueTick(new LogicalTickToken(1), harness.Host.Epoch).Status);
+        Assert.True(harness.Simulation.TickStarted.Wait(
+            TimeSpan.FromSeconds(2),
+            TestContext.Current.CancellationToken));
+
+        try
+        {
+            var attempt = 0UL;
+            while (harness.AggregateInbox.Count < harness.AggregateInbox.Budget.MaxItems)
+            {
+                var result = harness.Host.TryEnqueue(
+                    new WorldSlotCommand.DependencyAck(new AdmissionAttemptId(attempt++), true, null));
+                Assert.Equal(EnqueueStatus.Accepted, result.Status);
+            }
+
+            var quiesce = harness.Host.TryEnqueue(
+                new WorldSlotCommand.Quiesce("shutdown", harness.Host.Epoch));
+            Assert.Equal(EnqueueStatus.Accepted, quiesce.Status);
+            Assert.Equal(1, harness.Host.ReservedCommandCount);
+
+            Assert.True(harness.AggregateInbox.TryDequeue(out _));
+            var laterOrdinary = harness.Host.TryEnqueue(
+                new WorldSlotCommand.DependencyAck(new AdmissionAttemptId(1000), true, null));
+            var laterStop = harness.Host.TryEnqueue(
+                new WorldSlotCommand.Stop(harness.Host.Epoch));
+
+            Assert.Equal(EnqueueStatus.Full, laterOrdinary.Status);
+            Assert.Equal("QueueFull", laterOrdinary.StableErrorId);
+            Assert.Equal(EnqueueStatus.Accepted, laterStop.Status);
+            Assert.Equal(2, harness.Host.ReservedCommandCount);
+            Assert.Equal(harness.AggregateInbox.Budget.MaxItems - 1, harness.AggregateInbox.Count);
+        }
+        finally
+        {
+            harness.Simulation.ReleaseTicks();
+        }
+    }
+
+    [Fact]
+    public async Task TimedOutReservationCannotCreateAnOrphanAfterOwnerResumes()
+    {
+        using var harness = new Harness();
+        Assert.True(harness.Host.Allocate(new SlotBudget(2, 64, 65_536)).Allocated);
+        Assert.True(harness.Host.StartRunning().Accepted);
+        harness.Simulation.BlockTicks = true;
+        Assert.Equal(
+            EnqueueStatus.Accepted,
+            harness.Host.EnqueueTick(new LogicalTickToken(1), harness.Host.Epoch).Status);
+        Assert.True(harness.Simulation.TickStarted.Wait(
+            TimeSpan.FromSeconds(2),
+            TestContext.Current.CancellationToken));
+
+        try
+        {
+            var pending = Task.Run(
+                () => harness.Host.ReserveAdmission(
+                    new AdmissionAttemptId(1),
+                    new ServerSessionId("timed-out")),
+                TestContext.Current.CancellationToken);
+            var timedOut = await pending.WaitAsync(
+                TimeSpan.FromSeconds(4),
+                TestContext.Current.CancellationToken);
+            Assert.False(timedOut.Reserved);
+            Assert.Equal("TimedOut", timedOut.StableErrorId);
+        }
+        finally
+        {
+            harness.Simulation.ReleaseTicks();
         }
 
-        var quiesce = harness.Host.TryEnqueue(
-            new WorldSlotCommand.Quiesce("shutdown", harness.Host.Epoch));
-        var stop = harness.Host.TryEnqueue(new WorldSlotCommand.Stop(harness.Host.Epoch));
-        var ordinary = harness.Host.TryEnqueue(
-            new WorldSlotCommand.DependencyAck(new AdmissionAttemptId(1000), true, null));
+        var surviving = harness.Host.ReserveAdmission(
+            new AdmissionAttemptId(2),
+            new ServerSessionId("surviving"));
+        Assert.True(surviving.Reserved);
+        Assert.Equal(new SlotReservationId(1), surviving.Reservation);
+        Assert.Equal(1, harness.Host.Capacity.BoundSessions);
+    }
 
-        Assert.Equal(EnqueueStatus.Accepted, quiesce.Status);
-        Assert.Equal(EnqueueStatus.Accepted, stop.Status);
-        Assert.Equal(EnqueueStatus.Full, ordinary.Status);
-        Assert.Equal("QueueFull", ordinary.StableErrorId);
+    [Fact]
+    public async Task TimedOutCommitCannotAssociateTheSessionAfterOwnerResumes()
+    {
+        using var harness = new Harness();
+        harness.StartRunning();
+        var session = new ServerSessionId("timed-out-commit");
+        var reservation = harness.Host.ReserveAdmission(new AdmissionAttemptId(1), session);
+        Assert.True(reservation.Reserved);
+
+        harness.Simulation.BlockTicks = true;
+        Assert.Equal(
+            EnqueueStatus.Accepted,
+            harness.Host.EnqueueTick(new LogicalTickToken(1), harness.Host.Epoch).Status);
+        Assert.True(harness.Simulation.TickStarted.Wait(
+            TimeSpan.FromSeconds(2),
+            TestContext.Current.CancellationToken));
+
+        try
+        {
+            var pending = Task.Run(
+                () => harness.Host.BindSession(reservation.Reservation, session, reservation.Epoch),
+                TestContext.Current.CancellationToken);
+            var timedOut = await pending.WaitAsync(
+                TimeSpan.FromSeconds(4),
+                TestContext.Current.CancellationToken);
+            Assert.False(timedOut.Accepted);
+            Assert.Equal("TimedOut", timedOut.StableErrorId);
+        }
+        finally
+        {
+            harness.Simulation.ReleaseTicks();
+        }
+
+        Assert.True(harness.Host.AbortAdmission(reservation.Reservation, reservation.Epoch).Accepted);
+        Assert.Equal(0, harness.Host.Capacity.BoundSessions);
     }
 
     [Fact]
@@ -505,6 +826,47 @@ public sealed class WorldSlotFocusedTests
         Assert.Equal("QueueFull", third.StableErrorId);
         Assert.Equal(1, harness.Host.TickOverruns);
         harness.Simulation.ReleaseTicks();
+    }
+
+    [Fact]
+    public void InFlightTickCannotPublishAfterExternalFailStop()
+    {
+        using var harness = new Harness();
+        harness.StartRunning();
+        harness.Simulation.BlockTicks = true;
+        Assert.Equal(
+            EnqueueStatus.Accepted,
+            harness.Host.EnqueueTick(new LogicalTickToken(1), harness.Host.Epoch).Status);
+        Assert.True(harness.Simulation.TickStarted.Wait(
+            TimeSpan.FromSeconds(2),
+            TestContext.Current.CancellationToken));
+
+        try
+        {
+            var fault = harness.Host.ReportFault(
+                "InternalInvariant",
+                HostFaultClass.SlotStateUnproven,
+                harness.Host.Epoch);
+            Assert.True(fault.Accepted);
+            Assert.Equal(WorldSlotHostState.Faulted, harness.Host.State);
+        }
+        finally
+        {
+            harness.Simulation.ReleaseTicks();
+        }
+
+        Assert.True(harness.Simulation.TickFinished.Wait(
+            TimeSpan.FromSeconds(2),
+            TestContext.Current.CancellationToken));
+        Assert.Equal(0UL, harness.Host.AuthorityRevision);
+        Assert.Equal(default, harness.Host.LastTick);
+        var events = new List<WorldSlotEvent>();
+        while (harness.Host.TryDequeueEvent(out var evt))
+        {
+            events.Add(evt);
+        }
+
+        Assert.DoesNotContain(events, evt => evt is WorldSlotEvent.TickCompleted);
     }
 
     [Fact]
@@ -565,14 +927,14 @@ public sealed class WorldSlotFocusedTests
 
     private sealed class Harness : IDisposable
     {
-        internal Harness(int aggregateCapacity = 66)
+        internal Harness(int aggregateCapacity = 66, int eventCapacity = 256)
         {
             this.Simulation = new RecordingSimulation();
             this.Clock = new FakeMonotonicClock();
             this.Timers = PlatformModule.CreateTimerService(this.Clock);
             this.Threads = PlatformModule.CreateThreadSupervisor();
             this.AggregateInbox = PlatformModule.CreateInbox<WorldSlotCommand>(new QueueBudget(aggregateCapacity, 65_536));
-            this.EventInbox = PlatformModule.CreateInbox<WorldSlotEvent>(new QueueBudget(256, 65_536));
+            this.EventInbox = PlatformModule.CreateInbox<WorldSlotEvent>(new QueueBudget(eventCapacity, 65_536));
             this.Trace = new RecordingHostTraceSink();
             var audit = PlatformModule.CreateInbox<AuditRecord>(new QueueBudget(16, 65_536));
             var diagnostics = PlatformModule.CreateInbox<DiagnosticRecord>(new QueueBudget(16, 65_536));
@@ -592,6 +954,7 @@ public sealed class WorldSlotFocusedTests
                 new EmptyIngress(),
                 new MvpFaultAdjudicator(),
                 this.Observability);
+            this.Host.AttachEventInbox(this.EventInbox);
         }
 
         internal RecordingSimulation Simulation { get; }
@@ -636,6 +999,8 @@ public sealed class WorldSlotFocusedTests
         private int revision;
 
         internal ManualResetEventSlim TickStarted { get; } = new(false);
+
+        internal ManualResetEventSlim TickFinished { get; } = new(false);
 
         internal bool BlockTicks { get; set; }
 
@@ -697,6 +1062,7 @@ public sealed class WorldSlotFocusedTests
                 this.Release.Wait(TimeSpan.FromSeconds(5));
             }
             Interlocked.Increment(ref this.revision);
+            this.TickFinished.Set();
             this.State = HostSimulationState.Running;
             return new HostTickOutcome(HostTickStatus.Completed, request.Tick, ReadOnlyMemory<byte>.Empty, AuthorityRevision, ReadOnlyMemory<WireFrame>.Empty, HostFaultClass.None, null);
         }

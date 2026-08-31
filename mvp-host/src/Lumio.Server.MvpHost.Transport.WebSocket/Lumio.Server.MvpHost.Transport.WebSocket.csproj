@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Lumio.Server.MvpHost.Transport.WebSocket.Tests" />
+    <InternalsVisibleTo Include="lumio-mvp-host" />
   </ItemGroup>
 
 </Project>

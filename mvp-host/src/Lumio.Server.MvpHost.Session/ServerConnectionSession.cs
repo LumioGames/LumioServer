@@ -13,11 +13,20 @@ public sealed class ServerConnectionSession
     private ServerConnectionSessionState state;
     private SessionBinding? binding;
     private ReplicationContextHandle? replicationContext;
+    private PrincipalId? principal;
     private WorldSlotId slot;
     private SlotEpoch slotEpoch;
     private TimerId? pendingTimer;
+    private TimerId? pendingTimerToken;
     private string? lastSnapshotId;
     private ulong lastSnapshotRevision;
+    private ulong? lastSentDeltaRevision;
+    private ulong? pendingDeltaConfirmationSequence;
+    private ulong? pendingDeltaFromRevision;
+    private ulong? pendingDeltaToRevision;
+    private string? pendingDeltaBaseSnapshotId;
+    private ulong? lastAcknowledgedDeltaConfirmationSequence;
+    private ulong? lastAcknowledgedDeltaToRevision;
     private bool baselineAcknowledged;
 
     public ServerConnectionSession(
@@ -58,6 +67,12 @@ public sealed class ServerConnectionSession
 
     public ReplicationContextHandle? ReplicationContext => replicationContext;
 
+    /// <summary>
+    /// Immutable authenticated identity retained across the reconnect window.
+    /// A reconnect must prove this same principal before a new grant is issued.
+    /// </summary>
+    internal PrincipalId? Principal => principal;
+
     public string ProductId { get; }
 
     public string GameReleaseId { get; }
@@ -73,6 +88,12 @@ public sealed class ServerConnectionSession
         set => pendingTimer = value;
     }
 
+    internal TimerId? PendingTimerToken
+    {
+        get => pendingTimerToken;
+        set => pendingTimerToken = value;
+    }
+
     /// <summary>
     /// Identity of the most recently delivered full snapshot.  The identity is
     /// retained by the session so every Delta names the exact baseline that was
@@ -81,6 +102,16 @@ public sealed class ServerConnectionSession
     internal string? LastSnapshotId => lastSnapshotId;
 
     internal ulong LastSnapshotRevision => lastSnapshotRevision;
+
+    internal ulong? LastSentDeltaRevision => lastSentDeltaRevision;
+
+    internal ulong? PendingDeltaConfirmationSequence => pendingDeltaConfirmationSequence;
+
+    internal ulong? PendingDeltaToRevision => pendingDeltaToRevision;
+
+    internal ulong? PendingDeltaFromRevision => pendingDeltaFromRevision;
+
+    internal string? PendingDeltaBaseSnapshotId => pendingDeltaBaseSnapshotId;
 
     internal bool BaselineAcknowledged => baselineAcknowledged;
 
@@ -106,6 +137,21 @@ public sealed class ServerConnectionSession
         slotEpoch = epoch;
     }
 
+    internal void SetPrincipal(PrincipalId value)
+    {
+        if (string.IsNullOrWhiteSpace(value.Value))
+        {
+            throw new ArgumentException("PrincipalId is required", nameof(value));
+        }
+
+        if (principal is { } existing && existing != value)
+        {
+            throw new InvalidOperationException("Session principal cannot be rebound");
+        }
+
+        principal = value;
+    }
+
     internal void Bind(in SessionBinding value, ReplicationContextHandle context)
     {
         binding = value;
@@ -118,6 +164,7 @@ public sealed class ServerConnectionSession
     {
         binding = null;
         baselineAcknowledged = false;
+        ClearPendingDelta();
     }
 
     internal void SetReplicationContext(ReplicationContextHandle context)
@@ -134,8 +181,9 @@ public sealed class ServerConnectionSession
     {
         SessionEpoch = new SessionEpoch(SessionEpoch.Value + 1);
         lastSnapshotId = null;
-        lastSnapshotRevision = 0;
         baselineAcknowledged = false;
+        ClearPendingDelta();
+        ClearLastAcknowledgedDelta();
     }
 
     internal void RecordSnapshot(string snapshotId, ulong revision)
@@ -148,6 +196,8 @@ public sealed class ServerConnectionSession
         lastSnapshotId = snapshotId;
         lastSnapshotRevision = revision;
         baselineAcknowledged = false;
+        ClearPendingDelta();
+        ClearLastAcknowledgedDelta();
     }
 
     internal bool TryAcknowledgeBaseline(string snapshotId, ulong confirmedRevision)
@@ -163,15 +213,69 @@ public sealed class ServerConnectionSession
         return true;
     }
 
-    internal bool TryAcknowledgeDelta(ulong toRevision)
+    internal void RecordDelta(
+        ulong confirmationSequence,
+        ulong fromRevision,
+        ulong toRevision,
+        string baseSnapshotId)
     {
-        if (!baselineAcknowledged || toRevision < lastSnapshotRevision)
+        if (!baselineAcknowledged
+            || pendingDeltaConfirmationSequence is not null
+            || string.IsNullOrWhiteSpace(lastSnapshotId)
+            || !string.Equals(lastSnapshotId, baseSnapshotId, StringComparison.Ordinal)
+            || fromRevision != lastSnapshotRevision
+            || toRevision <= fromRevision)
+        {
+            throw new InvalidOperationException("A delta cannot be recorded for the current replication cursor");
+        }
+
+        pendingDeltaConfirmationSequence = confirmationSequence;
+        pendingDeltaFromRevision = fromRevision;
+        pendingDeltaToRevision = toRevision;
+        pendingDeltaBaseSnapshotId = baseSnapshotId;
+        lastSentDeltaRevision = toRevision;
+    }
+
+    internal bool TryAcknowledgeDelta(ulong confirmationSequence, ulong toRevision)
+    {
+        if (!baselineAcknowledged)
+        {
+            return false;
+        }
+
+        if (pendingDeltaConfirmationSequence is null)
+        {
+            return lastAcknowledgedDeltaConfirmationSequence == confirmationSequence
+                && lastAcknowledgedDeltaToRevision == toRevision;
+        }
+
+        if (pendingDeltaConfirmationSequence != confirmationSequence
+            || pendingDeltaToRevision != toRevision
+            || pendingDeltaFromRevision is null
+            || toRevision <= pendingDeltaFromRevision)
         {
             return false;
         }
 
         lastSnapshotRevision = toRevision;
+        lastAcknowledgedDeltaConfirmationSequence = confirmationSequence;
+        lastAcknowledgedDeltaToRevision = toRevision;
+        ClearPendingDelta();
         return true;
+    }
+
+    private void ClearPendingDelta()
+    {
+        pendingDeltaConfirmationSequence = null;
+        pendingDeltaFromRevision = null;
+        pendingDeltaToRevision = null;
+        pendingDeltaBaseSnapshotId = null;
+    }
+
+    private void ClearLastAcknowledgedDelta()
+    {
+        lastAcknowledgedDeltaConfirmationSequence = null;
+        lastAcknowledgedDeltaToRevision = null;
     }
 
     internal static bool IsAllowed(ServerConnectionSessionState from, ServerConnectionSessionState to)

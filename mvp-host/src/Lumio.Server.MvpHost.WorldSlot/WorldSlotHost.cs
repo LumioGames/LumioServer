@@ -13,17 +13,20 @@ namespace Lumio.Server.MvpHost.WorldSlot;
 /// Host-owned WorldSlot aggregate. All externally supplied commands cross a bounded
 /// inbox, and the owner thread is the only path that touches the simulation port.
 /// </summary>
-public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWorldSlotPacingPort, IDisposable
+public sealed class WorldSlotHost : IWorldSlotHost, IDisposable
 {
+    private const int CriticalTerminalReserveSlots = 2;
     private static long nextSlotId;
 
     private readonly object sync = new();
+    private readonly AutoResetEvent ownerSignal = new(false);
     private readonly IWorldSimulationPort simulation;
     private readonly IMonotonicClock clock;
     private readonly ITimerService timers;
     private readonly INamedThreadSupervisor threads;
     private readonly IBoundedInbox<WorldSlotCommand> aggregateInbox;
     private readonly IBoundedOutbox<WorldSlotEvent> eventOutbox;
+    private IBoundedInbox<WorldSlotEvent>? eventInbox;
     private readonly IIngressReader ingress;
     private readonly IFaultAdjudicator adjudicator;
     private readonly ObservabilityServices observability;
@@ -411,7 +414,7 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
     /// reducer.  The returned value is per invocation; callers must not read a
     /// mutable "last reservation" property to identify their reservation.
     /// </summary>
-    public AdmissionReservationResult ReserveAdmission(
+    internal AdmissionReservationResult ReserveAdmission(
         AdmissionAttemptId attempt,
         ServerSessionId session)
     {
@@ -428,14 +431,7 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
             return this.ReservationFailure(enqueue.StableErrorId ?? "QueueFull");
         }
 
-        if (this.IsOwnerThread())
-        {
-            this.PumpOwnerQueues();
-        }
-        else
-        {
-            pending.Completed.Wait(TimeSpan.FromSeconds(2));
-        }
+        this.AwaitPendingCommand(pending);
 
         lock (this.sync)
         {
@@ -456,17 +452,45 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
         return this.SubmitAck(command);
     }
 
-    public AckResult AbortAdmission(SlotReservationId reservation, SlotEpoch epoch)
+    internal AckResult AbortAdmission(SlotReservationId reservation, SlotEpoch epoch)
     {
         var command = new WorldSlotCommand.AbortAdmission(reservation, epoch);
         return this.SubmitAck(command);
+    }
+
+    internal AckResult ReleaseCommittedReservation(
+        SlotReservationId reservation,
+        ServerSessionId session,
+        SlotEpoch epoch)
+    {
+        if (reservation.Value == 0 || string.IsNullOrWhiteSpace(session.Value))
+        {
+            return new AckResult(false, "InvalidArgument");
+        }
+
+        var command = new WorldSlotCommand.AbortAdmission(reservation, epoch);
+        var pending = new PendingCommand { ReleaseSession = session };
+        var enqueue = this.Enqueue(command, pending);
+        if (enqueue.Status != EnqueueStatus.Accepted)
+        {
+            return new AckResult(false, enqueue.StableErrorId ?? "QueueFull");
+        }
+
+        this.AwaitPendingCommand(pending);
+
+        lock (this.sync)
+        {
+            return pending.Completed.IsSet
+                ? pending.Ack
+                : new AckResult(false, "TimedOut");
+        }
     }
 
     /// <summary>
     /// Enqueues one typed pacing permit into the capacity-one owner queue.
     /// Epoch and lifecycle checks are shared with the internal test path.
     /// </summary>
-    public EnqueueResult EnqueueTickPermit(LogicalTickToken tick, SlotEpoch epoch)
+    internal EnqueueResult EnqueueTickPermit(LogicalTickToken tick, SlotEpoch epoch)
         => this.EnqueueTick(tick, epoch);
 
     public AckResult Quiesce(string reason, SlotEpoch epoch)
@@ -688,6 +712,11 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
                 return new EnqueueResult(EnqueueStatus.Full, "QueueFull");
             }
 
+            if (result.Status == EnqueueStatus.Accepted)
+            {
+                this.ownerSignal.Set();
+            }
+
             return result;
         }
     }
@@ -743,12 +772,10 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
     {
         lock (this.sync)
         {
-            if (this.eventOutbox is IBoundedInbox<WorldSlotEvent> inbox)
+            if (this.eventInbox is not null
+                && this.eventInbox.TryDequeue(out evt!))
             {
-                if (inbox.TryDequeue(out evt!))
-                {
-                    return true;
-                }
+                return true;
             }
 
             if (this.terminalEvents.Count > 0)
@@ -759,6 +786,16 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
 
             evt = default!;
             return false;
+        }
+    }
+
+    /// <summary>Attaches the composition-root read lane for the unified FIFO view.</summary>
+    internal void AttachEventInbox(IBoundedInbox<WorldSlotEvent> inbox)
+    {
+        ArgumentNullException.ThrowIfNull(inbox);
+        lock (this.sync)
+        {
+            this.eventInbox = inbox;
         }
     }
 
@@ -821,6 +858,7 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
 
         this.aggregateInbox.Close();
         this.tickPermitQueue.Close();
+        this.ownerSignal.Set();
 
         if (shouldJoin && !disposingOnOwner)
         {
@@ -847,14 +885,7 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
             return new AckResult(false, enqueue.StableErrorId ?? "QueueFull");
         }
 
-        if (this.IsOwnerThread())
-        {
-            this.PumpOwnerQueues();
-        }
-        else
-        {
-            pending.Completed.Wait(TimeSpan.FromSeconds(2));
-        }
+        this.AwaitPendingCommand(pending);
 
         lock (this.sync)
         {
@@ -866,6 +897,25 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
             }
 
             return pending.Ack;
+        }
+    }
+
+    private void AwaitPendingCommand(PendingCommand pending)
+    {
+        if (this.IsOwnerThread())
+        {
+            this.PumpOwnerQueues();
+            return;
+        }
+
+        if (pending.Completed.Wait(TimeSpan.FromSeconds(2)))
+        {
+            return;
+        }
+
+        if (!pending.TryCancel(new AckResult(false, "TimedOut")))
+        {
+            pending.Completed.Wait();
         }
     }
 
@@ -914,7 +964,26 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
                 + WorldSlotProvisionalDefaults.AggregateInboxReservedSlots
                 ? configuredCapacity - WorldSlotProvisionalDefaults.AggregateInboxReservedSlots
                 : configuredCapacity;
-            var reserved = command is WorldSlotCommand.Quiesce or WorldSlotCommand.Stop;
+            var reserved = command is WorldSlotCommand.Quiesce
+                or WorldSlotCommand.Stop;
+            if (this.reservedCommands.Count > 0)
+            {
+                if (!reserved
+                    || this.reservedCommands.Count >= WorldSlotProvisionalDefaults.AggregateInboxReservedSlots)
+                {
+                    return new EnqueueResult(EnqueueStatus.Full, "QueueFull");
+                }
+
+                if (pending is not null)
+                {
+                    this.pendingCommands[command] = pending;
+                }
+
+                this.reservedCommands.Enqueue(command);
+                this.ownerSignal.Set();
+                return new EnqueueResult(EnqueueStatus.Accepted, null);
+            }
+
             if (!reserved && this.aggregateInbox.Count >= ordinaryLimit)
             {
                 return new EnqueueResult(EnqueueStatus.Full, "QueueFull");
@@ -930,6 +999,7 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
                 && this.reservedCommands.Count < WorldSlotProvisionalDefaults.AggregateInboxReservedSlots)
             {
                 this.reservedCommands.Enqueue(command);
+                this.ownerSignal.Set();
                 return new EnqueueResult(EnqueueStatus.Accepted, null);
             }
 
@@ -945,6 +1015,7 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
                     : result;
             }
 
+            this.ownerSignal.Set();
             return result;
         }
     }
@@ -961,6 +1032,11 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
         {
             Interlocked.Increment(ref this.tickOverruns);
             return new EnqueueResult(EnqueueStatus.Full, "QueueFull");
+        }
+
+        if (result.Status == EnqueueStatus.Accepted)
+        {
+            this.ownerSignal.Set();
         }
 
         return result;
@@ -1012,17 +1088,19 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
     {
         while (true)
         {
-            PendingLifecycle? request;
+            PendingLifecycle request;
             lock (this.sync)
             {
-                request = this.lifecycleRequests.Count > 0
-                    ? this.lifecycleRequests.Dequeue()
-                    : null;
-            }
+                if (this.lifecycleRequests.Count == 0)
+                {
+                    return;
+                }
 
-            if (request is null)
-            {
-                return;
+                request = this.lifecycleRequests.Dequeue();
+                if (!request.TryClaim())
+                {
+                    continue;
+                }
             }
 
             HostLifecycleResult result;
@@ -1080,22 +1158,41 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
             }
 
             this.lifecycleRequests.Enqueue(pending);
+            this.ownerSignal.Set();
         }
 
-        if (owner)
-        {
-            this.ProcessLifecycleRequests();
-        }
-        else
-        {
-            pending.Completed.Wait(TimeSpan.FromSeconds(2));
-        }
+        this.AwaitPendingLifecycle(pending, owner);
 
         lock (this.sync)
         {
             return pending.Completed.IsSet
                 ? pending.Result
                 : new HostLifecycleResult(false, this.simulation.State, "TimedOut");
+        }
+    }
+
+    private void AwaitPendingLifecycle(PendingLifecycle pending, bool owner)
+    {
+        if (owner)
+        {
+            this.ProcessLifecycleRequests();
+            return;
+        }
+
+        if (pending.Completed.Wait(TimeSpan.FromSeconds(2)))
+        {
+            return;
+        }
+
+        HostSimulationState state;
+        lock (this.sync)
+        {
+            state = this.simulation.State;
+        }
+
+        if (!pending.TryCancel(new HostLifecycleResult(false, state, "TimedOut")))
+        {
+            pending.Completed.Wait();
         }
     }
 
@@ -1328,7 +1425,11 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
         PendingCommand? pending;
         lock (this.sync)
         {
-            this.pendingCommands.Remove(command, out pending);
+            if (this.pendingCommands.Remove(command, out pending)
+                && !pending.TryClaim())
+            {
+                return;
+            }
         }
 
         try
@@ -1588,11 +1689,39 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
                 return;
             }
 
-            if (this.state is WorldSlotHostState.Stopping
-                or WorldSlotHostState.Faulted
+            if (this.state is WorldSlotHostState.Faulted
                 or WorldSlotHostState.Destroyed)
             {
                 pending?.Complete(new AckResult(false, "ContextClosing"));
+                return;
+            }
+
+            if (pending?.ReleaseSession is { } releaseSession)
+            {
+                if (this.committedReservations.TryGetValue(command.Reservation.Value, out var committed))
+                {
+                    if (committed != releaseSession)
+                    {
+                        pending.Complete(new AckResult(false, "InvalidArgument"));
+                        return;
+                    }
+
+                    this.committedReservations.Remove(command.Reservation.Value);
+                    this.boundSessions.Remove(releaseSession.Value);
+                    this.RemoveReservationAttemptUnsafe(command.Reservation);
+                    pending.Complete(new AckResult(true, null));
+                    return;
+                }
+
+                pending.Complete(this.reservations.ContainsKey(command.Reservation.Value)
+                    ? new AckResult(false, "InvalidArgument")
+                    : new AckResult(true, null));
+                return;
+            }
+
+            if (this.committedReservations.ContainsKey(command.Reservation.Value))
+            {
+                pending?.Complete(new AckResult(false, "InvalidArgument"));
                 return;
             }
 
@@ -1603,7 +1732,10 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
             }
             pending?.Complete(removed
                 ? new AckResult(true, null)
-                : new AckResult(false, "InvalidArgument"));
+                : command.Reservation.Value > 0
+                    && command.Reservation.Value <= this.nextReservationId
+                    ? new AckResult(true, null)
+                    : new AckResult(false, "InvalidArgument"));
         }
     }
 
@@ -1792,6 +1924,14 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
 
             lock (this.sync)
             {
+                if (!this.CheckEpochUnsafe(permit.Epoch)
+                    || this.state != WorldSlotHostState.Running
+                    || this.pacingStopped
+                    || this.disposed)
+                {
+                    return;
+                }
+
                 if (adjudication.SlotMustFailStop)
                 {
                     this.EnterFaultedUnsafe(adjudication);
@@ -1871,8 +2011,18 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
         this.reservedCommands.Clear();
         this.tickPermitQueue.Close();
         this.disposeSimulationRequested = true;
-        this.PublishEventUnsafe(new WorldSlotEvent.FaultAdjudicated(adjudication, this.epoch));
-        this.PublishEventUnsafe(new WorldSlotEvent.ReadyToStop(this.epoch));
+        var faultPublished = this.PublishEventUnsafe(
+            new WorldSlotEvent.FaultAdjudicated(adjudication, this.epoch));
+        var stopPublished = this.PublishEventUnsafe(
+            new WorldSlotEvent.ReadyToStop(this.epoch));
+        if (!faultPublished || !stopPublished)
+        {
+            this.observability.Diagnostics.Write(
+                "Diagnostic",
+                "Error",
+                "world-slot terminal event reserve exhausted");
+            throw new InvalidOperationException("World-slot terminal event reserve exhausted");
+        }
     }
 
     private bool SetGateUnsafe(AdmissionGateState value)
@@ -1913,6 +2063,15 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
 
     private bool PublishEventUnsafe(WorldSlotEvent evt)
     {
+        // Once one event spills into the reserve, every later event joins that
+        // FIFO tail until it drains. The dequeue path drains the older primary
+        // prefix before taking this queue. Non-terminal events cannot consume
+        // the two slots reserved for the fail-stop pair.
+        if (this.terminalEvents.Count > 0)
+        {
+            return this.TryEnqueueTerminalEventUnsafe(evt);
+        }
+
         try
         {
             var result = this.eventOutbox.TryPublish(in evt);
@@ -1921,30 +2080,66 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
                 return true;
             }
 
-            if (IsTerminalEvent(evt) && this.terminalEvents.Count < WorldSlotProvisionalDefaults.AggregateInboxReservedSlots + 2)
+            if (IsTerminalEvent(evt))
             {
-                this.terminalEvents.Enqueue(evt);
-                return true;
+                return this.TryEnqueueTerminalEventUnsafe(evt);
             }
 
             return false;
         }
         catch
         {
-            if (IsTerminalEvent(evt) && this.terminalEvents.Count < WorldSlotProvisionalDefaults.AggregateInboxReservedSlots + 2)
+            if (IsTerminalEvent(evt))
             {
-                this.terminalEvents.Enqueue(evt);
-                return true;
+                return this.TryEnqueueTerminalEventUnsafe(evt);
             }
 
             return false;
         }
     }
 
+    private bool TryEnqueueTerminalEventUnsafe(WorldSlotEvent evt)
+    {
+        var capacity = Math.Max(
+            WorldSlotProvisionalDefaults.SlotEventOutboxMaxItems,
+            this.eventInbox?.Budget.MaxItems ?? 0)
+            + CriticalTerminalReserveSlots;
+        var criticalCount = 0;
+        foreach (var queued in this.terminalEvents)
+        {
+            if (IsCriticalTerminalEvent(queued))
+            {
+                criticalCount++;
+            }
+        }
+
+        if (this.terminalEvents.Count >= capacity
+            || (!IsCriticalTerminalEvent(evt)
+                && this.terminalEvents.Count
+                    >= capacity - Math.Max(0, CriticalTerminalReserveSlots - criticalCount)))
+        {
+            this.observability.Diagnostics.Write(
+                "Diagnostic",
+                "Warn",
+                IsCriticalTerminalEvent(evt)
+                    ? "world-slot terminal event reserve exhausted"
+                    : "world-slot non-terminal event tail is saturated");
+            return false;
+        }
+
+        this.terminalEvents.Enqueue(evt);
+        return true;
+    }
+
     private static bool IsTerminalEvent(WorldSlotEvent evt)
         => evt is WorldSlotEvent.ReadyToStop
             or WorldSlotEvent.FaultAdjudicated
             or WorldSlotEvent.AdmissionRejected;
+
+    private static bool IsCriticalTerminalEvent(WorldSlotEvent evt)
+        => evt is WorldSlotEvent.ReadyToStop
+            || evt is WorldSlotEvent.FaultAdjudicated fault
+                && fault.Adjudication.SlotMustFailStop;
 
     private SnapshotCutRef FixSnapshotCutUnsafe()
     {
@@ -2093,46 +2288,52 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
             or "Stop"
             or "TeardownComplete";
 
-    private sealed class OwnerThreadBody(WorldSlotHost owner) : IThreadBody
+    private sealed class OwnerThreadBody : IThreadBody
     {
+        private readonly WorldSlotHost owner;
+        private WaitHandle[]? waitHandles;
+
+        internal OwnerThreadBody(WorldSlotHost owner) => this.owner = owner;
+
         public ThreadStepResult Step(CancellationToken ct)
         {
             Interlocked.CompareExchange(
-                ref owner.ownerThreadId,
+                ref this.owner.ownerThreadId,
                 Environment.CurrentManagedThreadId,
                 comparand: 0);
 
             if (ct.IsCancellationRequested)
             {
-                owner.OnOwnerDisposeRequested();
+                this.owner.OnOwnerDisposeRequested();
                 return new ThreadStepResult(false, null);
             }
 
-            if (owner.IsDisposed)
+            if (this.owner.IsDisposed)
             {
-                owner.OnOwnerDisposeRequested();
+                this.owner.OnOwnerDisposeRequested();
                 return new ThreadStepResult(false, null);
             }
 
             try
             {
-                owner.PumpOwnerQueues();
-                if (owner.State is WorldSlotHostState.Faulted or WorldSlotHostState.Destroyed)
+                this.owner.PumpOwnerQueues();
+                if (this.owner.State is WorldSlotHostState.Faulted or WorldSlotHostState.Destroyed)
                 {
-                    owner.OnOwnerDisposeRequested();
+                    this.owner.OnOwnerDisposeRequested();
                     return new ThreadStepResult(false, null);
                 }
 
                 if (!ct.IsCancellationRequested)
                 {
-                    ct.WaitHandle.WaitOne(1);
+                    this.waitHandles ??= [this.owner.ownerSignal, ct.WaitHandle];
+                    _ = WaitHandle.WaitAny(this.waitHandles);
                 }
             }
             catch
             {
-                lock (owner.sync)
+                lock (this.owner.sync)
                 {
-                    owner.EnterFaultedUnsafe(owner.ClassifyUnproven());
+                    this.owner.EnterFaultedUnsafe(this.owner.ClassifyUnproven());
                 }
 
                 return new ThreadStepResult(false, "PanicBoundary");
@@ -2151,6 +2352,8 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
 
     private sealed class PendingLifecycle
     {
+        private int state;
+
         internal PendingLifecycle(LifecycleRequestKind kind, in HostSessionInit init)
         {
             this.Kind = kind;
@@ -2169,8 +2372,35 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
 
         internal HostLifecycleResult Result { get; private set; }
 
+        internal bool TryClaim()
+            => Interlocked.CompareExchange(
+                ref this.state,
+                (int)PendingRequestState.Claimed,
+                (int)PendingRequestState.Pending) == (int)PendingRequestState.Pending;
+
+        internal bool TryCancel(HostLifecycleResult result)
+        {
+            if (Interlocked.CompareExchange(
+                    ref this.state,
+                    (int)PendingRequestState.Canceled,
+                    (int)PendingRequestState.Pending) != (int)PendingRequestState.Pending)
+            {
+                return false;
+            }
+
+            this.Result = result;
+            this.Completed.Set();
+            return true;
+        }
+
         internal void Complete(HostLifecycleResult result)
         {
+            var prior = Interlocked.Exchange(ref this.state, (int)PendingRequestState.Completed);
+            if (prior is (int)PendingRequestState.Canceled or (int)PendingRequestState.Completed)
+            {
+                return;
+            }
+
             this.Result = result;
             this.Completed.Set();
         }
@@ -2178,15 +2408,40 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
 
     private sealed class PendingCommand
     {
+        private int state;
+
         internal ManualResetEventSlim Completed { get; } = new(false);
 
         internal AckResult Ack { get; private set; }
+
+        internal ServerSessionId? ReleaseSession { get; init; }
 
         internal AllocateResult? Allocation { get; private set; }
 
         internal AdmissionReservationResult? ReservationResult { get; private set; }
 
         internal SlotReservationId Reservation { get; private set; }
+
+        internal bool TryClaim()
+            => Interlocked.CompareExchange(
+                ref this.state,
+                (int)PendingRequestState.Claimed,
+                (int)PendingRequestState.Pending) == (int)PendingRequestState.Pending;
+
+        internal bool TryCancel(AckResult ack)
+        {
+            if (Interlocked.CompareExchange(
+                    ref this.state,
+                    (int)PendingRequestState.Canceled,
+                    (int)PendingRequestState.Pending) != (int)PendingRequestState.Pending)
+            {
+                return false;
+            }
+
+            this.Ack = ack;
+            this.Completed.Set();
+            return true;
+        }
 
         internal void SetAllocation(AllocateResult allocation, SlotReservationId reservation)
         {
@@ -2207,9 +2462,23 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
 
         internal void Complete(AckResult ack)
         {
+            var prior = Interlocked.Exchange(ref this.state, (int)PendingRequestState.Completed);
+            if (prior is (int)PendingRequestState.Canceled or (int)PendingRequestState.Completed)
+            {
+                return;
+            }
+
             this.Ack = ack;
             this.Completed.Set();
         }
+    }
+
+    private enum PendingRequestState
+    {
+        Pending,
+        Claimed,
+        Completed,
+        Canceled,
     }
 
     private sealed class CommandReferenceComparer : IEqualityComparer<WorldSlotCommand>
@@ -2221,3 +2490,14 @@ public sealed class WorldSlotHost : IWorldSlotHost, IWorldSlotAdmissionPort, IWo
         public int GetHashCode(WorldSlotCommand obj) => RuntimeHelpers.GetHashCode(obj);
     }
 }
+
+/// <summary>
+/// Result of a serialized admission reservation. This aggregate-private
+/// exchange type intentionally does not live in public HostContracts.
+/// </summary>
+internal readonly record struct AdmissionReservationResult(
+    bool Reserved,
+    SlotReservationId Reservation,
+    SlotEpoch Epoch,
+    WorldSlotId SlotId,
+    string? StableErrorId);

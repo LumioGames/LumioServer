@@ -1,15 +1,25 @@
-#!/usr/bin/env pwsh
-$ErrorActionPreference = 'Continue'
+﻿#!/usr/bin/env pwsh
+$ErrorActionPreference = 'Stop'
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $MvpHostDir = (Resolve-Path (Join-Path $ScriptDir '..')).Path
 Set-Location $MvpHostDir
 
 function Invoke-Step([string]$Name, [scriptblock]$Action) {
-    & $Action
-    if ($LASTEXITCODE -ne 0) {
+    $global:LASTEXITCODE = 0
+    try {
+        & $Action
+    }
+    catch {
         Write-Output "MVP_HOST_INTEGRATION_FAIL $Name"
-        exit $LASTEXITCODE
+        Write-Error $_
+        exit 1
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        $exitCode = $LASTEXITCODE
+        Write-Output "MVP_HOST_INTEGRATION_FAIL $Name"
+        exit $exitCode
     }
 }
 

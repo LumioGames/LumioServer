@@ -92,24 +92,11 @@ public interface IWorldSlotHost
 }
 
 /// <summary>
-/// Narrow admission capability used by Session. Reservation and compensation
-/// are separate from the broader WorldSlot lifecycle aggregate.
-/// </summary>
-public interface IWorldSlotAdmissionPort
-{
-    AdmissionReservationResult ReserveAdmission(AdmissionAttemptId attempt, ServerSessionId session);
-
-    AckResult BindSession(SlotReservationId reservation, ServerSessionId session, SlotEpoch epoch);
-
-    AckResult AbortAdmission(SlotReservationId reservation, SlotEpoch epoch);
-}
-
-/// <summary>
 /// Narrow pacing capability used by the App owner loop. A permit carries only
 /// the logical tick and slot epoch; the aggregate owns the bounded queue and all
 /// epoch/state validation.
 /// </summary>
-public interface IWorldSlotPacingPort
+internal interface IWorldSlotPacingPort
 {
     EnqueueResult EnqueueTickPermit(LogicalTickToken tick, SlotEpoch epoch);
 }

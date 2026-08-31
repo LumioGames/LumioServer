@@ -365,6 +365,28 @@ public sealed class AuditAndErrorSemanticsTest
         Assert.Contains(delivered, o => o.Verdict == CredentialVerdict.Accepted);
     }
 
+    [Fact]
+    public void 成功结果保留槽有界且耗尽时进入故障路径()
+    {
+        using var harness = new AuthHarness();
+        var rejected = new AuthenticateOutcome(
+            CredentialVerdict.Rejected, default, AntiReplayVerdict.Ok, null, "rejected");
+        var accepted = new AuthenticateOutcome(
+            CredentialVerdict.Accepted, new PrincipalId("p"), AntiReplayVerdict.Ok, null, null);
+
+        for (var i = 0; i < AuthProvisionalDefaults.AuthEventQueueMaxItems; i++)
+        {
+            harness.Service.PublishOutcome(in rejected);
+        }
+
+        for (var i = 0; i < AuthProvisionalDefaults.AuthEventQueueMaxItems; i++)
+        {
+            harness.Service.PublishOutcome(in accepted);
+        }
+
+        Assert.Throws<InvalidOperationException>(() => harness.Service.PublishOutcome(in accepted));
+    }
+
     /// <summary>关闭后请求队列拒绝新请求，事件队列只交付已入队项。</summary>
     [Fact]
     public void 关闭后请求队列拒收而事件队列只交付存量()

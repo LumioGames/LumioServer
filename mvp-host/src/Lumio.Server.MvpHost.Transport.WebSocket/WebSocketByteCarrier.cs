@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Diagnostics;
 using System.Linq;
 using System.Net.WebSockets;
 using System.Threading;
@@ -9,6 +10,7 @@ using System.Threading.Tasks;
 using Lumio.Server.MvpHost.HostContracts;
 using Lumio.Server.MvpHost.Observability;
 using Lumio.Server.MvpHost.Platform;
+using Lumio.Server.MvpHost.Transport;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Hosting;
@@ -34,6 +36,7 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
 
     private readonly object gate = new();
     private readonly Dictionary<ulong, ConnectionState> connections = new();
+    private readonly Dictionary<(ulong ConnectionId, ulong Epoch), (PrincipalId PrincipalId, string ProductId, string GameReleaseId)> authenticationMetadata = new();
     private readonly Channel<AcceptedConnection> accepted;
     private readonly ICredentialVerifier verifier;
     private readonly IAntiReplayWindow antiReplay;
@@ -43,6 +46,9 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
     private readonly WebSocketCarrierOptions options;
     private readonly TimerCommandInbox timerCommands;
     private readonly AcceptedQueue acceptedQueue;
+    private readonly TaskCompletionSource<bool> disposalCompletion = new(
+        false,
+        TaskCreationOptions.RunContinuationsAsynchronously);
 
     private WebApplication? application;
     private BindEndpointResult bindResult;
@@ -187,10 +193,7 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
                         return new CarrierAccept(
                             Accepted: true,
                             ConnectionId: item.State.Id,
-                            RequestedSubprotocols: item.RequestedSubprotocols)
-                        {
-                            AuthenticationEvidence = item.AuthenticationEvidence,
-                        };
+                            RequestedSubprotocols: item.RequestedSubprotocols);
                     }
                 }
             }
@@ -216,9 +219,27 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
             return ClosedReceive();
         }
 
-        await state.ReceiveGate.WaitAsync(ct).ConfigureAwait(false);
+        lock (state.Gate)
+        {
+            if (state.IsClosed || state.CloseRequested)
+            {
+                return ClosedReceive();
+            }
+
+            state.ActiveReceives++;
+        }
+
+        var enteredReceiveGate = false;
+        CancellationTokenSource? operationCancellation = null;
+        var operationToken = ct;
         try
         {
+            operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                ct,
+                state.ReceiveCancellation.Token);
+            operationToken = operationCancellation.Token;
+            await state.ReceiveGate.WaitAsync(operationToken).ConfigureAwait(false);
+            enteredReceiveGate = true;
             if (state.IsClosed)
             {
                 return ClosedReceive();
@@ -244,11 +265,28 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
                 ValueWebSocketReceiveResult result;
                 try
                 {
-                    result = await state.Socket.ReceiveAsync(buffer.Slice(total), ct).ConfigureAwait(false);
+                    result = await state.Socket.ReceiveAsync(buffer.Slice(total), operationToken).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                catch (OperationCanceledException)
                 {
-                    throw;
+                    if (ct.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+
+                    var lifecycleCancellation = false;
+                    lock (state.Gate)
+                    {
+                        lifecycleCancellation = state.CloseRequested || state.IsClosed;
+                    }
+
+                    if (lifecycleCancellation)
+                    {
+                        return ClosedReceive();
+                    }
+
+                    this.RequestClose(state, ConnectionCloseReason.Disconnect, flush: false);
+                    return ClosedReceive();
                 }
                 catch (Exception)
                 {
@@ -281,7 +319,10 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
 
                 if (result.EndOfMessage)
                 {
-                    this.Touch(state);
+                    if (!this.Touch(state))
+                    {
+                        return ClosedReceive();
+                    }
                     return new CarrierReceive(
                         Received: true,
                         ByteCount: total,
@@ -290,9 +331,33 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
                 }
             }
         }
+        catch (ObjectDisposedException)
+        {
+            return ClosedReceive();
+        }
         finally
         {
-            state.ReceiveGate.Release();
+            operationCancellation?.Dispose();
+            if (enteredReceiveGate)
+            {
+                try
+                {
+                    state.ReceiveGate.Release();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // A bounded carrier retirement may have disposed the gate
+                    // while this receive was unwinding.
+                }
+            }
+
+            lock (state.Gate)
+            {
+                state.ActiveReceives--;
+            }
+
+            DisposeSocketIfQuiescent(state);
+            state.TryDisposeResources();
         }
     }
 
@@ -342,8 +407,50 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
     {
         this.ProcessPendingTimerCommands();
 
-        return this.TryGetConnection(c, out var state)
-            && this.RequestClose(state, reason, flush: true);
+        if (!this.TryGetConnection(c, out var state)
+            || !this.RequestClose(state, reason, flush: true))
+        {
+            return false;
+        }
+
+        try
+        {
+            state.Completion.Task
+                .WaitAsync(TimeSpan.FromMilliseconds(CloseFlushMilliseconds))
+                .GetAwaiter()
+                .GetResult();
+        }
+        catch (TimeoutException)
+        {
+            // The send loop owns final retirement. The bounded synchronous
+            // wait only makes a successful flush observable to the caller.
+        }
+
+        return true;
+    }
+
+    internal bool TryTakeAuthenticationMetadata(
+        TransportConnectionId connectionId,
+        ConnectionEpoch connectionEpoch,
+        out PrincipalId principalId,
+        out string productId,
+        out string gameReleaseId)
+    {
+        lock (this.gate)
+        {
+            if (this.authenticationMetadata.Remove((connectionId.Value, connectionEpoch.Value), out var metadata))
+            {
+                principalId = metadata.PrincipalId;
+                productId = metadata.ProductId;
+                gameReleaseId = metadata.GameReleaseId;
+                return true;
+            }
+        }
+
+        principalId = default;
+        productId = string.Empty;
+        gameReleaseId = string.Empty;
+        return false;
     }
 
     /// <summary>Applies timer-delivered typed close commands without creating a polling thread.</summary>
@@ -352,39 +459,75 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
 
     public async ValueTask DisposeAsync()
     {
-        List<ConnectionState> snapshot;
+        List<ConnectionState>? snapshot;
         lock (this.gate)
         {
             if (this.disposed)
             {
-                return;
+                snapshot = null;
+            }
+            else
+            {
+                this.disposed = true;
+                snapshot = this.connections.Values.ToList();
+            }
+        }
+
+        if (snapshot is null)
+        {
+            await this.disposalCompletion.Task.ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            this.accepted.Writer.TryComplete();
+            this.timerCommands.Close();
+            foreach (var state in snapshot)
+            {
+                this.RequestClose(state, ConnectionCloseReason.Disconnect, flush: false);
             }
 
-            this.disposed = true;
-            snapshot = this.connections.Values.ToList();
-        }
-
-        this.accepted.Writer.TryComplete();
-        this.timerCommands.Close();
-        foreach (var state in snapshot)
-        {
-            this.RequestClose(state, ConnectionCloseReason.Disconnect, flush: false);
-        }
-
-        if (this.application is not null)
-        {
             try
             {
-                await this.application.StopAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+                var sendLoops = snapshot
+                    .Select(state => state.SendLoop ?? Task.CompletedTask)
+                    .ToArray();
+                await Task.WhenAll(sendLoops)
+                    .WaitAsync(TimeSpan.FromMilliseconds(CloseFlushMilliseconds))
+                    .ConfigureAwait(false);
             }
-            catch
+            catch (Exception) when (snapshot.Count > 0)
             {
-                // Disposal is best effort after all connection close signals have
-                // been issued; Kestrel may already have observed the same close.
+                // Retirement remains bounded; force-dispose below closes any loop
+                // that did not observe cancellation within the close budget.
             }
 
-            await this.application.DisposeAsync().ConfigureAwait(false);
-            this.application = null;
+            foreach (var state in snapshot)
+            {
+                await this.ForceRetireStateAsync(state, ConnectionCloseReason.Disconnect)
+                    .ConfigureAwait(false);
+            }
+
+            if (this.application is not null)
+            {
+                try
+                {
+                    await this.application.StopAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Disposal is best effort after all connection close signals have
+                    // been issued; Kestrel may already have observed the same close.
+                }
+
+                await this.application.DisposeAsync().ConfigureAwait(false);
+                this.application = null;
+            }
+        }
+        finally
+        {
+            this.disposalCompletion.TrySetResult(true);
         }
     }
 
@@ -464,16 +607,19 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
             return;
         }
 
-        if (!this.TryReserveConnection(out var connectionId))
-        {
-            context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
-            return;
-        }
-
+        var connectionId = default(TransportConnectionId);
+        var reservationOutstanding = false;
         WebSocketConnection? socket = null;
         ConnectionState? state = null;
         try
         {
+            if (!this.TryReserveConnection(out connectionId))
+            {
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                return;
+            }
+
+            reservationOutstanding = true;
             // The selected response protocol is deliberately only the public
             // protocol marker; opaque token and nonce values never leave this scope.
             socket = await context.WebSockets.AcceptWebSocketAsync(WebSocketCarrierConstants.Subprotocol)
@@ -513,10 +659,17 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
                 new ConnectionEpoch(0),
                 socket);
 
+            var authenticatedMetadata = (
+                PrincipalId: verification.Principal,
+                ProductId: this.options.ProductId,
+                GameReleaseId: this.options.GameReleaseId);
+
             lock (this.gate)
             {
                 this.pendingReservations--;
+                reservationOutstanding = false;
                 this.connections.Add(connectionId.Value, state);
+                this.authenticationMetadata[(connectionId.Value, state.Epoch.Value)] = authenticatedMetadata;
             }
 
             this.ScheduleIdle(state);
@@ -526,13 +679,7 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
                 state,
                 // Return only the negotiated marker. Keeping credentials in
                 // CarrierAccept would unnecessarily extend their lifetime.
-                ImmutableArray.Create(WebSocketCarrierConstants.Subprotocol),
-                new TransportAuthenticationEvidence(
-                    verification.Principal,
-                    connectionId,
-                    state.Epoch,
-                    this.options.ProductId,
-                    this.options.GameReleaseId));
+                ImmutableArray.Create(WebSocketCarrierConstants.Subprotocol));
             if (this.acceptedQueue.TryPublish(in accepted).Status != EnqueueStatus.Accepted)
             {
                 this.RequestClose(state, ConnectionCloseReason.PolicyReject, flush: false);
@@ -579,15 +726,19 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
             // The verifier owns the credential only for the call duration. Clear
             // the decoded byte array on every path, including an upgrade failure.
             Array.Clear(tokenBytes);
-            if (state is null)
+            if (reservationOutstanding)
             {
                 this.ReleaseReservation(connectionId);
             }
         }
     }
 
-    private async Task RunSendLoopAsync(ConnectionState state)
+    internal async Task RunSendLoopAsync(ConnectionState state)
     {
+        lock (state.Gate)
+        {
+            state.SendLoopRunning = 1;
+        }
         try
         {
             while (await state.Egress.Reader.WaitToReadAsync(state.SendToken).ConfigureAwait(false))
@@ -613,8 +764,10 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
                 }
             }
         }
-        catch (OperationCanceledException) when (state.SendCancellation.IsCancellationRequested
-            || state.FlushCancellation?.IsCancellationRequested == true)
+        catch (OperationCanceledException)
+        {
+        }
+        catch (ObjectDisposedException) when (state.ResourcesDisposed)
         {
         }
         catch
@@ -631,33 +784,73 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
             {
                 this.MarkClosed(state);
             }
+
+            lock (state.Gate)
+            {
+                state.SendLoopRunning = 0;
+            }
+            DisposeSocketIfQuiescent(state);
+            state.TryDisposeResources();
         }
     }
 
-    private bool RequestClose(ConnectionState state, ConnectionCloseReason reason, bool flush)
+    internal bool RequestClose(ConnectionState state, ConnectionCloseReason reason, bool flush)
     {
+        var alreadyRequested = false;
         lock (state.Gate)
         {
-            if (state.IsClosed || state.CloseRequested)
+            if (state.IsClosed)
             {
                 return false;
             }
 
-            state.CloseRequested = true;
-            state.CloseReason = reason;
-            state.FlushOnClose = flush;
-            if (flush && state.FlushCancellation is null)
+            alreadyRequested = state.CloseRequested;
+            if (!alreadyRequested)
             {
-                state.FlushCancellation = CancellationTokenSource.CreateLinkedTokenSource(state.SendCancellation.Token);
-                state.FlushCancellation.CancelAfter(CloseFlushMilliseconds);
+                state.CloseRequested = true;
+                state.CloseReason = reason;
+                state.FlushOnClose = flush;
+                if (flush)
+                {
+                    try
+                    {
+                        state.FlushCancellation.CancelAfter(CloseFlushMilliseconds);
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // A concurrent retirement already released the connection resources.
+                    }
+                }
             }
+
             state.Egress.Writer.TryComplete();
         }
 
-        if (!flush)
+        if (!flush || alreadyRequested && state.SendLoop is null)
         {
-            state.SendCancellation.Cancel();
+            try
+            {
+                state.SendCancellation.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // A concurrent close already released the connection resources.
+            }
+            try
+            {
+                state.ReceiveCancellation.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // A concurrent close already released the connection resources.
+            }
             this.MarkClosed(state);
+        }
+        else
+        {
+            // A flushed close must leave the receive loop alive long enough to
+            // observe the peer close response. SendCloseFrameAsync applies the
+            // bounded receive cancellation after the close frame is written.
         }
 
         return true;
@@ -695,13 +888,13 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
             return;
         }
 
-        using var budget = CancellationTokenSource.CreateLinkedTokenSource(
-            state.SendCancellation.Token,
-            state.FlushCancellation?.Token ?? CancellationToken.None);
-        budget.CancelAfter(CloseFlushMilliseconds);
-
         try
         {
+            using var budget = CancellationTokenSource.CreateLinkedTokenSource(
+                state.SendCancellation.Token,
+                state.FlushCancellation.Token);
+            budget.CancelAfter(CloseFlushMilliseconds);
+
             if (state.Socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
                 await state.Socket.CloseOutputAsync(
@@ -716,8 +909,36 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
         }
         finally
         {
+        try
+        {
             state.SendCancellation.Cancel();
-            this.MarkClosed(state);
+        }
+        catch (ObjectDisposedException)
+        {
+            // A concurrent retirement already released the connection resources.
+        }
+
+        var closeFrameSent = state.Socket.State is WebSocketState.CloseSent
+            or WebSocketState.CloseReceived
+            or WebSocketState.Closed;
+        if (closeFrameSent)
+        {
+            lock (state.Gate)
+            {
+                state.CloseFrameSent = true;
+            }
+
+            try
+            {
+                state.ReceiveCancellation.CancelAfter(CloseFlushMilliseconds);
+            }
+            catch (ObjectDisposedException)
+            {
+                // A concurrent retirement already released the connection resources.
+            }
+        }
+
+        this.MarkClosed(state);
         }
     }
 
@@ -747,11 +968,15 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
     private void MarkClosed(ConnectionState state)
     {
         var remove = false;
+        TimerId? idleTimer = null;
         lock (state.Gate)
         {
             if (!state.IsClosed)
             {
                 state.IsClosed = true;
+                idleTimer = state.IdleTimer;
+                state.IdleTimer = null;
+                state.IdleCommand = null;
                 remove = true;
             }
         }
@@ -761,19 +986,71 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
             return;
         }
 
-        if (state.IdleTimer is { } timer)
+        if (idleTimer is { } timer)
         {
-            this.timers.Cancel(timer);
-            state.IdleTimer = null;
+            try
+            {
+                this.timers.Cancel(timer);
+            }
+            catch
+            {
+                // Timer cancellation is best effort after the connection is terminal.
+            }
         }
 
         lock (this.gate)
         {
             this.connections.Remove(state.Id.Value);
+            this.authenticationMetadata.Remove((state.Id.Value, state.Epoch.Value));
         }
 
         state.Egress.Writer.TryComplete();
-        state.SendCancellation.Cancel();
+        try
+        {
+            state.SendCancellation.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // A concurrent retirement already released the connection resources.
+        }
+
+        var keepReceiveForCloseHandshake = false;
+        lock (state.Gate)
+        {
+            keepReceiveForCloseHandshake = state.CloseFrameSent;
+        }
+        if (!keepReceiveForCloseHandshake)
+        {
+            try
+            {
+                state.ReceiveCancellation.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // A concurrent retirement already released the connection resources.
+            }
+        }
+
+        DisposeSocketIfQuiescent(state);
+        if (state.IsClosed)
+        {
+            state.TrySignalCompletionIfQuiescent();
+        }
+        state.TryDisposeResources();
+    }
+
+    private static void DisposeSocketIfQuiescent(ConnectionState state, bool force = false)
+    {
+        lock (state.Gate)
+        {
+            if (state.SocketDisposed
+                || (!force && (state.ActiveReceives != 0 || state.SendLoopRunning != 0)))
+            {
+                return;
+            }
+
+            state.SocketDisposed = true;
+        }
 
         try
         {
@@ -781,31 +1058,54 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
         }
         catch
         {
+            // Socket disposal is terminal best effort; lifecycle completion must
+            // still be signaled so the owner cannot wait forever.
         }
 
-        state.Completion.TrySetResult(true);
+        state.TrySignalCompletionIfQuiescent(force);
     }
 
-    private void Touch(ConnectionState state)
+    private bool Touch(ConnectionState state)
     {
-        if (state.IsClosed)
+        TimerId? old;
+        lock (state.Gate)
         {
-            return;
+            if (state.IsClosed || state.CloseRequested)
+            {
+                return false;
+            }
+
+            old = state.IdleTimer;
+            state.IdleTimer = null;
+            state.IdleCommand = null;
         }
 
-        if (state.IdleTimer is { } old)
+        if (old is { } timer)
         {
-            this.timers.Cancel(old);
+            try
+            {
+                this.timers.Cancel(timer);
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceWarning(
+                    $"WebSocket idle timer cancellation failed for {state.Id.Value}: {ex.GetType().Name}");
+                this.RequestClose(state, ConnectionCloseReason.Fault, flush: false);
+                return false;
+            }
         }
 
-        this.ScheduleIdle(state);
+        return this.ScheduleIdle(state);
     }
 
-    private void ScheduleIdle(ConnectionState state)
+    private bool ScheduleIdle(ConnectionState state)
     {
-        if (state.IsClosed)
+        lock (state.Gate)
         {
-            return;
+            if (state.IsClosed || state.CloseRequested)
+            {
+                return false;
+            }
         }
 
         var idleSeconds = this.options.IdleTimeoutSeconds == 0
@@ -818,19 +1118,114 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
         try
         {
             var timer = this.timers.Schedule<ConnectionCommand>(due, this.timerCommands, in typedCommand);
-            if (state.IsClosed)
+            var cancel = false;
+            lock (state.Gate)
             {
-                this.timers.Cancel(timer);
+                if (state.IsClosed || state.CloseRequested)
+                {
+                    cancel = true;
+                }
+                else
+                {
+                    state.IdleTimer = timer;
+                    state.IdleCommand = command;
+                }
             }
-            else
+
+            if (cancel)
             {
-                state.IdleTimer = timer;
+                try
+                {
+                    this.timers.Cancel(timer);
+                }
+                catch (Exception ex)
+                {
+                    Trace.TraceWarning(
+                        $"WebSocket idle timer cancellation failed for {state.Id.Value}: {ex.GetType().Name}");
+                    this.RequestClose(state, ConnectionCloseReason.Fault, flush: false);
+                    return false;
+                }
             }
+
+            return true;
         }
-        catch
+        catch (Exception ex)
         {
-            state.IdleTimer = null;
+            lock (state.Gate)
+            {
+                state.IdleTimer = null;
+                state.IdleCommand = null;
+            }
+
+            Trace.TraceWarning(
+                $"WebSocket idle timer scheduling failed for {state.Id.Value}: {ex.GetType().Name}");
+            this.RequestClose(state, ConnectionCloseReason.Fault, flush: false);
+            return false;
         }
+    }
+
+    private async Task ForceRetireStateAsync(ConnectionState state, ConnectionCloseReason reason)
+    {
+        lock (state.Gate)
+        {
+            if (!state.IsClosed)
+            {
+                state.CloseRequested = true;
+                state.CloseReason = reason;
+                state.FlushOnClose = false;
+                state.Egress.Writer.TryComplete();
+            }
+        }
+
+        try
+        {
+            state.SendCancellation.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        try
+        {
+            state.ReceiveCancellation.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        var abortSocket = false;
+        lock (state.Gate)
+        {
+            abortSocket = !state.SocketDisposed;
+        }
+
+        if (abortSocket)
+        {
+            try
+            {
+                state.Socket.Abort();
+            }
+            catch
+            {
+            }
+        }
+
+        try
+        {
+            await state.WaitForQuiescenceAsync()
+                .WaitAsync(TimeSpan.FromMilliseconds(CloseFlushMilliseconds))
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        this.MarkClosed(state);
+        DisposeSocketIfQuiescent(state, force: true);
+        state.Dispose();
     }
 
     private void ApplyTimerCommand(in ConnectionCommand command)
@@ -840,9 +1235,18 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
             return;
         }
 
-        if (this.TryGetConnection(close.Id, out var state) && state.Epoch == close.Epoch)
+        if (this.TryGetConnection(close.Id, out var state))
         {
-            this.RequestClose(state, close.Reason, flush: true);
+            lock (state.Gate)
+            {
+                if (state.Epoch == close.Epoch
+                    && ReferenceEquals(state.IdleCommand, command))
+                {
+                    state.IdleTimer = null;
+                    state.IdleCommand = null;
+                    this.RequestClose(state, close.Reason, flush: true);
+                }
+            }
         }
     }
 
@@ -930,7 +1334,7 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
             if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
                 using var budget = new CancellationTokenSource(CloseFlushMilliseconds);
-                await socket.CloseOutputAsync(
+                await socket.CloseAsync(
                         (WebSocketCloseStatus)WebSocketCarrierConstants.CloseStatusPolicyViolation,
                         "Policy violation",
                         budget.Token)
@@ -1109,7 +1513,7 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
         return true;
     }
 
-    private sealed class ConnectionState : IDisposable
+    internal sealed class ConnectionState : IDisposable
     {
         internal ConnectionState(
             TransportConnectionId id,
@@ -1119,6 +1523,10 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
             this.Id = id;
             this.Epoch = epoch;
             this.Socket = socket;
+            this.SendCancellation = new CancellationTokenSource();
+            this.ReceiveCancellation = new CancellationTokenSource();
+            this.FlushCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                this.SendCancellation.Token);
             this.Egress = Channel.CreateBounded<EgressItem>(new BoundedChannelOptions(EgressCapacity)
             {
                 FullMode = BoundedChannelFullMode.Wait,
@@ -1131,7 +1539,9 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
 
         internal readonly object Gate = new();
         internal readonly SemaphoreSlim ReceiveGate = new(1, 1);
-        internal readonly CancellationTokenSource SendCancellation = new();
+        internal readonly CancellationTokenSource SendCancellation;
+        internal readonly CancellationTokenSource ReceiveCancellation;
+        internal readonly CancellationTokenSource FlushCancellation;
         internal readonly Channel<EgressItem> Egress;
         internal readonly EgressQueue EgressQueue;
         internal readonly TaskCompletionSource<bool> Completion = new(
@@ -1142,34 +1552,106 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
         internal readonly WebSocketConnection Socket;
         internal Task? SendLoop;
         internal TimerId? IdleTimer;
+        internal ConnectionCommand? IdleCommand;
         internal long QueuedBytes;
         internal bool CloseRequested;
         internal bool FlushOnClose;
+        internal bool CloseFrameSent;
         internal bool IsClosed;
         internal ConnectionCloseReason CloseReason;
-        internal CancellationTokenSource? FlushCancellation;
+        private int resourcesDisposed;
+        internal bool SocketDisposed;
+        internal int ActiveReceives;
+        internal int SendLoopRunning;
+        private TaskCompletionSource<bool>? quiescence;
+
+        internal bool ResourcesDisposed => Volatile.Read(ref this.resourcesDisposed) != 0;
 
         // Interface-shaped view keeps the queue registration machine-readable;
         // the concrete field remains the hot-path type used by the sender.
         private IBoundedOutbox<EgressItem> EgressQueueContract => this.EgressQueue;
 
         internal CancellationToken SendToken
-            => this.FlushCancellation?.Token ?? this.SendCancellation.Token;
+            => this.FlushCancellation.Token;
+
+        internal Task WaitForQuiescenceAsync()
+        {
+            lock (this.Gate)
+            {
+                if (this.ActiveReceives == 0 && this.SendLoopRunning == 0)
+                {
+                    return Task.CompletedTask;
+                }
+
+                this.quiescence ??= new TaskCompletionSource<bool>(
+                    false,
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                return this.quiescence.Task;
+            }
+        }
+
+        internal void TrySignalCompletionIfQuiescent(bool force = false)
+        {
+            TaskCompletionSource<bool>? completion = null;
+            var completeState = false;
+            lock (this.Gate)
+            {
+                var quiescent = this.ActiveReceives == 0 && this.SendLoopRunning == 0;
+                if (force || quiescent)
+                {
+                    completion = this.quiescence;
+                    completeState = force || (quiescent && this.SocketDisposed);
+                }
+            }
+
+            completion?.TrySetResult(true);
+            if (completeState)
+            {
+                this.Completion.TrySetResult(true);
+            }
+        }
 
         public void Dispose()
         {
+            this.TryDisposeResources(force: true);
+        }
+
+        internal void TryDisposeResources(bool force = false)
+        {
+            lock (this.Gate)
+            {
+                if (Volatile.Read(ref this.resourcesDisposed) != 0)
+                {
+                    return;
+                }
+
+                if (!force
+                    && !this.IsClosed)
+                {
+                    return;
+                }
+
+                if (!force
+                    && (this.ActiveReceives != 0 || this.SendLoopRunning != 0))
+                {
+                    return;
+                }
+
+                Volatile.Write(ref this.resourcesDisposed, 1);
+            }
+
             this.SendCancellation.Dispose();
+            this.ReceiveCancellation.Dispose();
             this.ReceiveGate.Dispose();
-            this.FlushCancellation?.Dispose();
+            this.FlushCancellation.Dispose();
         }
     }
 
-    private readonly record struct EgressItem(byte[] Bytes);
+    internal readonly record struct EgressItem(byte[] Bytes);
 
     private readonly record struct AcceptedConnection(
         ConnectionState State,
-        ImmutableArray<string> RequestedSubprotocols,
-        TransportAuthenticationEvidence AuthenticationEvidence);
+        ImmutableArray<string> RequestedSubprotocols);
 
     private sealed class AcceptedQueue : IBoundedOutbox<AcceptedConnection>
     {
@@ -1183,7 +1665,7 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
                 : new EnqueueResult(EnqueueStatus.Full, "QueueFull");
     }
 
-    private sealed class EgressQueue : IBoundedOutbox<EgressItem>
+    internal sealed class EgressQueue : IBoundedOutbox<EgressItem>
     {
         private readonly Channel<EgressItem> channel;
 
@@ -1196,8 +1678,8 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
     }
 
     /// <summary>
-    /// Timer targets are typed commands, not delegates. A due idle timer calls this
-    /// inbox, which applies the command and leaves no adapter-owned polling thread.
+    /// Timer targets are typed commands, not delegates. A due idle timer only
+    /// enqueues here; the carrier owner applies commands through its explicit pump.
     /// </summary>
     private sealed class TimerCommandInbox : IBoundedInbox<ConnectionCommand>
     {
@@ -1232,10 +1714,6 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
                 this.commands.Enqueue(item);
             }
 
-            // This is still typed timer delivery: no unbounded callback or thread
-            // is exposed by ITimerService, and the command itself is retained for
-            // ProcessPendingTimerCommands diagnostics.
-            this.owner.ApplyTimerCommand(in item);
             return new EnqueueResult(EnqueueStatus.Accepted, null);
         }
 
@@ -1277,8 +1755,9 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
         internal int Drain()
         {
             var count = 0;
-            while (this.TryDequeue(out _))
+            while (this.TryDequeue(out var command))
             {
+                this.owner.ApplyTimerCommand(in command);
                 count++;
             }
 
