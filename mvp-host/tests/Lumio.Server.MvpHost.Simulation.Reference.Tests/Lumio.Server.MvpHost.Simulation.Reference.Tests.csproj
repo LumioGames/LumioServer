@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>5</MvpHostLayer>
+    <MvpHostProductionProject>false</MvpHostProductionProject>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Lumio.Server.MvpHost.Simulation.Reference.Tests</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.Simulation.Reference.Tests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.Simulation.Reference/Lumio.Server.MvpHost.Simulation.Reference.csproj" />
+  </ItemGroup>
+
+</Project>

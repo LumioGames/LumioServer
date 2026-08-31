@@ -15,6 +15,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MVP_HOST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=eng/GateHelpers.sh
+source "$SCRIPT_DIR/GateHelpers.sh"
 cd "$MVP_HOST_DIR" || exit 1
 
 DRIFT_EXIT=33
@@ -32,31 +34,61 @@ check_not_hand_edited() {
     path="${line#* }"; path="${path# }"
     count=$((count + 1))
 
+    case "$path" in
+      contract-mirror/?*) ;;
+      *)
+        printf 'MVP_HOST_MIRROR_DRIFT invalid-path %s\n' "$path"
+        drift=$((drift + 1))
+        continue
+        ;;
+    esac
+    if ! gate_validate_relative_path "$path"; then
+      printf 'MVP_HOST_MIRROR_DRIFT invalid-path %s\n' "$path"
+      drift=$((drift + 1))
+      continue
+    fi
+
     if [ ! -f "$root/$path" ]; then
       printf 'MVP_HOST_MIRROR_DRIFT missing %s\n' "$path"
       drift=$((drift + 1))
       continue
     fi
 
-    actual="$(shasum -a 256 "$root/$path" | cut -d' ' -f1)"
+    actual="$(gate_sha256_file "$root/$path")"
     if [ "$actual" != "$expected" ]; then
       printf 'MVP_HOST_MIRROR_DRIFT modified %s (清单 %s != 实际 %s)\n' "$path" "$expected" "$actual"
       drift=$((drift + 1))
     fi
   done < "$root/$manifest"
 
+  if [ "$count" -eq 0 ]; then
+    printf 'MVP_HOST_MIRROR_DRIFT empty-manifest %s\n' "$manifest"
+    drift=$((drift + 1))
+  fi
+
   # 清单外的文件同样是漂移：白名单只有 MIRROR.md，它是本仓手写的说明，
   # 架构源没有对应文件，进清单会与「与架构源字节相同」互斥。
   local registered
   registered="$(grep -v '^#' "$root/$manifest" | grep -v '^[[:space:]]*$' | sed 's/^[^ ]*  *//')"
-  while IFS= read -r found; do
-    [ -n "$found" ] || continue
-    case "$found" in contract-mirror/MIRROR.md) continue ;; esac
-    if ! printf '%s\n' "$registered" | grep -Fxq "$found"; then
-      printf 'MVP_HOST_MIRROR_DRIFT unregistered %s\n' "$found"
-      drift=$((drift + 1))
+  if [ ! -d "$root/contract-mirror" ]; then
+    printf 'MVP_HOST_MIRROR_DRIFT missing contract-mirror\n'
+    drift=$((drift + 1))
+  else
+    found_files="$(cd "$root" && gate_find_sorted contract-mirror -type f)"
+    find_status=$?
+    if [ "$find_status" -ne 0 ]; then
+      printf 'MVP_HOST_MIRROR_FAIL enumeration-error\n'
+      return "$DRIFT_EXIT"
     fi
-  done < <(cd "$root" && find contract-mirror -type f 2>/dev/null | sort)
+    while IFS= read -r found; do
+      [ -n "$found" ] || continue
+      case "$found" in contract-mirror/MIRROR.md) continue ;; esac
+      if ! printf '%s\n' "$registered" | grep -Fxq "$found"; then
+        printf 'MVP_HOST_MIRROR_DRIFT unregistered %s\n' "$found"
+        drift=$((drift + 1))
+      fi
+    done <<< "$found_files"
+  fi
 
   if [ "$drift" -gt 0 ]; then
     printf 'MVP_HOST_MIRROR_FAIL drift=%d\n' "$drift"
@@ -94,8 +126,7 @@ report_upstream_sync() {
       *)           src="$mirrored" ;;
     esac
 
-    upstream="$(git -C "$arch_root" show "$arch_commit:$src" 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"
-    if [ -z "$upstream" ]; then
+    if ! upstream="$(git -C "$arch_root" show "$arch_commit:$src" 2>/dev/null | gate_sha256_stream)"; then
       printf 'MVP_HOST_MIRROR_UPSTREAM gone %s（架构源 %s 下已无 %s）\n' "$path" "$arch_commit" "$src"
       ahead=$((ahead + 1))
     elif [ "$upstream" != "$expected" ]; then
@@ -122,7 +153,9 @@ self_test() {
   mkdir -p "$sandbox/contract-mirror" "$sandbox/eng"
   printf 'probe\n' > "$sandbox/contract-mirror/probe.json"
   printf 'MIRROR.md 是白名单项，不进清单。\n' > "$sandbox/contract-mirror/MIRROR.md"
-  (cd "$sandbox" && shasum -a 256 contract-mirror/probe.json > eng/contract-mirror.sha256)
+  local digest
+  digest="$(gate_sha256_file "$sandbox/contract-mirror/probe.json")"
+  printf '%s  contract-mirror/probe.json\n' "$digest" > "$sandbox/eng/contract-mirror.sha256"
 
   check_not_hand_edited "$MANIFEST" "$sandbox" > /dev/null; status=$?
   if [ "$status" -ne 0 ]; then
@@ -147,6 +180,15 @@ self_test() {
     return 1
   fi
   printf 'SELFTEST 实验组（清单外新增文件）→ 退出 %d\n' "$DRIFT_EXIT"
+
+  rm -f "$sandbox/contract-mirror/probe.json" "$sandbox/contract-mirror/sneaked-in.json"
+  printf '%s  ../outside.json\n' "$digest" > "$sandbox/$MANIFEST"
+  check_not_hand_edited "$MANIFEST" "$sandbox" > /dev/null; status=$?
+  if [ "$status" -ne "$DRIFT_EXIT" ]; then
+    printf 'MVP_HOST_MIRROR_SELFTEST_FAIL 越界路径本应退出 %d，实际 %d\n' "$DRIFT_EXIT" "$status"
+    return 1
+  fi
+  printf 'SELFTEST 实验组（manifest 路径越界）→ 退出 %d\n' "$DRIFT_EXIT"
 
   printf 'MVP_HOST_MIRROR_SELFTEST_OK\n'
   return 0

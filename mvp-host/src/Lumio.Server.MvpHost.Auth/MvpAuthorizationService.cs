@@ -37,6 +37,7 @@ public sealed class MvpAuthorizationService : IAuthorizationService
     private const string ReplayRejected = "channel credential replayed or outside the anti-replay window";
 
     private const string EventQueueFull = "MvpAuthEventQueue full: success ack held in reserve, never dropped";
+    private const string SuccessReserveExhausted = "MvpAuthEventQueue success reserve exhausted";
 
     private readonly ICredentialVerifier verifier;
     private readonly IAntiReplayWindow antiReplay;
@@ -54,6 +55,8 @@ public sealed class MvpAuthorizationService : IAuthorizationService
     /// 丢一条成功 ack 的后果是一条已经通过认证的连接在编排层永远等不到回执。
     /// </summary>
     private readonly Queue<AuthenticateOutcome> successReserve = new();
+    private readonly object successReserveGate = new();
+    private readonly int successReserveCapacity = AuthProvisionalDefaults.AuthEventQueueMaxItems;
 
     private ulong grantEpoch;
     private ulong eventSeq;
@@ -247,7 +250,19 @@ public sealed class MvpAuthorizationService : IAuthorizationService
 
         if (IsSuccessAck(in outcome))
         {
-            this.successReserve.Enqueue(outcome);
+            lock (this.successReserveGate)
+            {
+                if (this.successReserve.Count >= this.successReserveCapacity)
+                {
+                    this.observability.Diagnostics.Write(
+                        "Diagnostic",
+                        "Error",
+                        SuccessReserveExhausted);
+                    throw new InvalidOperationException(SuccessReserveExhausted);
+                }
+
+                this.successReserve.Enqueue(outcome);
+            }
         }
 
         this.observability.Diagnostics.Write("Diagnostic", "Error", EventQueueFull);
@@ -256,10 +271,13 @@ public sealed class MvpAuthorizationService : IAuthorizationService
     /// <summary>保留槽优先：成功 ack 必须先于普通存量被交付。</summary>
     public bool TryDequeueOutcome(out AuthenticateOutcome outcome)
     {
-        if (this.successReserve.Count > 0)
+        lock (this.successReserveGate)
         {
-            outcome = this.successReserve.Dequeue();
-            return true;
+            if (this.successReserve.Count > 0)
+            {
+                outcome = this.successReserve.Dequeue();
+                return true;
+            }
         }
 
         return this.eventInbox.TryDequeue(out outcome);

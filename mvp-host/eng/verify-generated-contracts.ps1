@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # eng/verify-generated-contracts.sh 的 Windows 对应物。**两条互相独立的检查**：
 #   ① 产物未被手改 —— 不需要架构源，漂移即退出码 32。这是门禁。
 #   ② 与上游同步   —— 需要 $LUMIO_ARCHITECTURE_ROOT，只报告、不影响退出码。
@@ -45,7 +45,14 @@ function Test-NotHandEdited([string]$Root) {
     $drift = 0
 
     foreach ($entry in $entries) {
-        $full = Join-Path $generatedRoot $entry.Path
+        try {
+            $full = Resolve-ContainedPathPortable -BasePath $generatedRoot -RelativePath $entry.Path
+        }
+        catch {
+            Say "MVP_HOST_GENERATED_DRIFT invalid-path $($entry.Path)"
+            $drift++
+            continue
+        }
         if (-not (Test-Path -LiteralPath $full)) {
             Say "MVP_HOST_GENERATED_DRIFT missing $($entry.Path)"
             $drift++
@@ -64,8 +71,8 @@ function Test-NotHandEdited([string]$Root) {
     $registered = [System.Collections.Generic.HashSet[string]]::new(
         [string[]]($entries | ForEach-Object { $_.Path }), [System.StringComparer]::Ordinal)
     if (Test-Path -LiteralPath $generatedRoot) {
-        foreach ($file in (Get-ChildItem -LiteralPath $generatedRoot -Recurse -File -Filter '*.cs')) {
-            $rel = [System.IO.Path]::GetRelativePath($generatedRoot, $file.FullName).Replace('\', '/')
+        foreach ($file in (Get-RecursiveFilesChecked -Path $generatedRoot -Filter '*.cs')) {
+            $rel = Get-RelativePathPortable -BasePath $generatedRoot -FullPath $file.FullName
             if (-not $registered.Contains($rel)) {
                 Say "MVP_HOST_GENERATED_DRIFT unregistered $rel"
                 $drift++
@@ -157,6 +164,17 @@ function Invoke-SelfTest {
             return 1
         }
         Say "SELFTEST 实验组（篡改一个字节）→ 退出 $driftExit"
+
+        Remove-Item -LiteralPath $probe -Force
+        [System.IO.File]::WriteAllText((Join-Path $sandbox $manifestRelative),
+            "ArtifactHashes = new[] { `"$digest  ../outside.cs`" };`n",
+            (New-Object System.Text.UTF8Encoding $false))
+        $status = Test-NotHandEdited $sandbox | Select-Object -Last 1
+        if ($status -ne $driftExit) {
+            Say "MVP_HOST_GENERATED_SELFTEST_FAIL 越界路径本应退出 $driftExit，实际 $status"
+            return 1
+        }
+        Say "SELFTEST 实验组（manifest 路径越界）→ 退出 $driftExit"
 
         Say 'MVP_HOST_GENERATED_SELFTEST_OK'
         return 0

@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # eng/generate-contracts.sh 的 Windows 对应物。只拷 .cs、不拷 .csproj，理由见 .sh 与
 # contract-mirror/MIRROR.md（架构源工程原样 net8.0，本构建根硬断言 net10.0）。
 Set-StrictMode -Version Latest
@@ -72,7 +72,12 @@ dotnet_diagnostic.CS8669.severity = none
 
 $sources = @(& git -C $archRoot ls-tree -r --name-only $archCommit -- packages/csharp |
     Where-Object { $_ -like '*.cs' } | Sort-Object)
+$sourceEnumerationExit = $LASTEXITCODE
 
+if ($sourceEnumerationExit -ne 0) {
+    Say "MVP_HOST_GENERATE_FAIL 架构源 packages/csharp 枚举失败（exit $sourceEnumerationExit）"
+    exit 1
+}
 if ($sources.Count -eq 0) {
     Say 'MVP_HOST_GENERATE_FAIL 架构源 packages/csharp 下一个 .cs 都没有'
     exit 1

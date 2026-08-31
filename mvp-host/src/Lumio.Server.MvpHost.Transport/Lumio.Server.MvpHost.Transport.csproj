@@ -18,7 +18,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="lumio-mvp-host" />
     <InternalsVisibleTo Include="Lumio.Server.MvpHost.Transport.Tests" />
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.Transport.WebSocket" />
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.Transport.WebSocket.Tests" />
   </ItemGroup>
 
 </Project>

@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # eng/verify-contract-mirror.sh 的 Windows 对应物。**两条互相独立的检查**：
 #   ① 产物未被手改 —— 不需要架构源，漂移即退出码 33。这是门禁。
 #   ② 与上游同步   —— 需要 $LUMIO_ARCHITECTURE_ROOT，只报告、不影响退出码。
@@ -18,7 +18,7 @@ $driftExit = 33
 $manifestRelative = 'eng/contract-mirror.sha256'
 
 function Read-ManifestEntries([string]$manifestPath) {
-    Get-Content -LiteralPath $manifestPath |
+    Get-Content -LiteralPath $manifestPath -Encoding UTF8 |
         Where-Object { $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*$' } |
         ForEach-Object {
             $parts = $_ -split '\s+', 2
@@ -36,8 +36,25 @@ function Test-NotHandEdited([string]$Root) {
     $entries = @(Read-ManifestEntries $manifestPath)
     $drift = 0
 
+    if ($entries.Count -eq 0) {
+        Say "MVP_HOST_MIRROR_DRIFT empty-manifest $manifestRelative"
+        $drift++
+    }
+
     foreach ($entry in $entries) {
-        $full = Join-Path $Root $entry.Path
+        if (-not $entry.Path.StartsWith('contract-mirror/', [System.StringComparison]::Ordinal)) {
+            Say "MVP_HOST_MIRROR_DRIFT invalid-path $($entry.Path)"
+            $drift++
+            continue
+        }
+        try {
+            $full = Resolve-ContainedPathPortable -BasePath $Root -RelativePath $entry.Path
+        }
+        catch {
+            Say "MVP_HOST_MIRROR_DRIFT invalid-path $($entry.Path)"
+            $drift++
+            continue
+        }
         if (-not (Test-Path -LiteralPath $full)) {
             Say "MVP_HOST_MIRROR_DRIFT missing $($entry.Path)"
             $drift++
@@ -57,14 +74,18 @@ function Test-NotHandEdited([string]$Root) {
     # 刻意用 foreach 语句而非 `| ForEach-Object`：后者的脚本块跑在自己的作用域里，
     # `$drift++` 只会改一份局部副本，计数永远归零——检查从此静默通过。
     $mirrorRoot = Join-Path $Root 'contract-mirror'
-    if (Test-Path $mirrorRoot) {
-        foreach ($file in (Get-ChildItem -LiteralPath $mirrorRoot -Recurse -File)) {
-            $rel = [System.IO.Path]::GetRelativePath($Root, $file.FullName).Replace('\', '/')
+    if (Test-Path -LiteralPath $mirrorRoot) {
+        foreach ($file in (Get-RecursiveFilesChecked -Path $mirrorRoot)) {
+            $rel = Get-RelativePathPortable -BasePath $Root -FullPath $file.FullName
             if ($rel -ne 'contract-mirror/MIRROR.md' -and -not $registered.Contains($rel)) {
                 Say "MVP_HOST_MIRROR_DRIFT unregistered $rel"
                 $drift++
             }
         }
+    }
+    else {
+        Say 'MVP_HOST_MIRROR_DRIFT missing contract-mirror'
+        $drift++
     }
 
     if ($drift -gt 0) {
@@ -154,6 +175,17 @@ function Invoke-SelfTest {
             return 1
         }
         Say "SELFTEST 实验组（清单外新增文件）→ 退出 $driftExit"
+
+        Remove-Item -LiteralPath $probe -Force
+        Remove-Item -LiteralPath (Join-Path $sandbox 'contract-mirror/sneaked-in.json') -Force
+        [System.IO.File]::WriteAllText((Join-Path $sandbox $manifestRelative),
+            "$digest  ../outside.json`n", (New-Object System.Text.UTF8Encoding $false))
+        $status = Test-NotHandEdited $sandbox | Select-Object -Last 1
+        if ($status -ne $driftExit) {
+            Say "MVP_HOST_MIRROR_SELFTEST_FAIL 越界路径本应退出 $driftExit，实际 $status"
+            return 1
+        }
+        Say "SELFTEST 实验组（manifest 路径越界）→ 退出 $driftExit"
 
         Say 'MVP_HOST_MIRROR_SELFTEST_OK'
         return 0

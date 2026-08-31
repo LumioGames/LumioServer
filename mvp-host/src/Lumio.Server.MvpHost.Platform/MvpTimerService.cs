@@ -34,7 +34,6 @@ internal sealed class MvpTimerService : ITimerService
     public TimerId Schedule<TCommand>(MonotonicInstant dueAt, IBoundedInbox<TCommand> target, in TCommand command)
     {
         ArgumentNullException.ThrowIfNull(target);
-        ObjectDisposedException.ThrowIf(_disposed, this);
 
         // 命令在 Schedule 期就被捕获成一个无参投递闭包的等价物（一个小状态对象），
         // 因此到期路径上没有任何类型擦除的委托暴露到公开面。
@@ -42,6 +41,7 @@ internal sealed class MvpTimerService : ITimerService
 
         lock (_gate)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             var id = ++_nextId;
             _pending[id] = new PendingTimer(dueAt, entry);
             return new TimerId(id);
@@ -52,6 +52,12 @@ internal sealed class MvpTimerService : ITimerService
     {
         lock (_gate)
         {
+            if (!_pending.TryGetValue(id.Value, out var timer)
+                || timer.State != TimerState.Pending)
+            {
+                return false;
+            }
+
             return _pending.Remove(id.Value);
         }
     }
@@ -59,25 +65,16 @@ internal sealed class MvpTimerService : ITimerService
     private void PumpDueTimers()
     {
         var now = _clock.Now;
-        List<ITypedDelivery>? due = null;
+        List<(ulong Id, PendingTimer Timer)>? due = null;
 
         lock (_gate)
         {
-            List<ulong>? fired = null;
             foreach (var (id, timer) in _pending)
             {
-                if (timer.DueAt.Ticks <= now.Ticks)
+                if (timer.State == TimerState.Pending
+                    && timer.DueAt.Ticks <= now.Ticks)
                 {
-                    (fired ??= []).Add(id);
-                    (due ??= []).Add(timer.Delivery);
-                }
-            }
-
-            if (fired is not null)
-            {
-                foreach (var id in fired)
-                {
-                    _pending.Remove(id);
+                    (due ??= []).Add((id, timer));
                 }
             }
         }
@@ -93,11 +90,26 @@ internal sealed class MvpTimerService : ITimerService
         // 若让异常穿透到线程体，platform-timer 线程即刻死亡，此后每次 Schedule 照常返回合法 TimerId
         // 但永不投递——重连窗口、防重放窗口、ack 超时全部静默失效，且无异常、无日志。
         // 一个坏 payload 只许影响它自己那一条定时器。
-        foreach (var delivery in due)
+        foreach (var (id, timer) in due)
         {
+            // 快照不授予投递权；必须与 Cancel 在同一把锁内 claim。
+            // 因而 Cancel 返回 true 后，旧快照无法再把该命令投出去。
+            lock (_gate)
+            {
+                if (!_pending.TryGetValue(id, out var current)
+                    || !ReferenceEquals(current, timer)
+                    || current.State != TimerState.Pending)
+                {
+                    continue;
+                }
+
+                current.State = TimerState.Delivering;
+            }
+
+            var terminal = false;
             try
             {
-                delivery.Deliver();
+                terminal = timer.Delivery.Deliver().Status != EnqueueStatus.Full;
             }
 #pragma warning disable CA1031 // 隔离边界：故意捕获一切，理由见上。
             catch (Exception)
@@ -106,24 +118,42 @@ internal sealed class MvpTimerService : ITimerService
                 // 已知缺口（登记项）：Layer 1 的 Platform 零依赖，没有诊断汇聚面可写，
                 // 因此这条失败在 MVP 期**不上报任何地方**。保住整个定时子系统不死，
                 // 优先于报告单条投递失败。Rust 侧 host-runtime 落地后由其监督面承接。
+                terminal = true;
+            }
+
+            lock (_gate)
+            {
+                if (_pending.TryGetValue(id, out var current)
+                    && ReferenceEquals(current, timer)
+                    && current.State == TimerState.Delivering)
+                {
+                    if (terminal)
+                    {
+                        _pending.Remove(id);
+                    }
+                    else
+                    {
+                        current.State = TimerState.Pending;
+                    }
+                }
             }
         }
     }
 
     public void Dispose()
     {
-        if (_disposed)
-        {
-            return;
-        }
-
-        _disposed = true;
-        _supervisor.Dispose();
-
         lock (_gate)
         {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
             _pending.Clear();
         }
+
+        _supervisor.Dispose();
     }
 
     private sealed class TimerBody : IThreadBody
@@ -140,11 +170,24 @@ internal sealed class MvpTimerService : ITimerService
         }
     }
 
-    private sealed record PendingTimer(MonotonicInstant DueAt, ITypedDelivery Delivery);
+    private sealed class PendingTimer(MonotonicInstant dueAt, ITypedDelivery delivery)
+    {
+        internal MonotonicInstant DueAt { get; } = dueAt;
+
+        internal ITypedDelivery Delivery { get; } = delivery;
+
+        internal TimerState State { get; set; }
+    }
+
+    private enum TimerState
+    {
+        Pending,
+        Delivering,
+    }
 
     private interface ITypedDelivery
     {
-        void Deliver();
+        EnqueueResult Deliver();
     }
 
     private sealed class TypedDelivery<TCommand> : ITypedDelivery
@@ -158,6 +201,6 @@ internal sealed class MvpTimerService : ITimerService
             _command = command;
         }
 
-        public void Deliver() => _target.TryEnqueue(in _command);
+        public EnqueueResult Deliver() => _target.TryEnqueue(in _command);
     }
 }

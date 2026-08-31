@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>5</MvpHostLayer>
+    <MvpHostProductionProject>false</MvpHostProductionProject>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Lumio.Server.MvpHost.WorldSlot.Tests</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.WorldSlot.Tests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.WorldSlot/Lumio.Server.MvpHost.WorldSlot.csproj" />
+    <ProjectReference Include="../../testkit/Lumio.Server.MvpHost.TestKit/Lumio.Server.MvpHost.TestKit.csproj" />
+  </ItemGroup>
+
+</Project>

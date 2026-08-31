@@ -30,6 +30,21 @@ namespace Lumio.Server.MvpHost.Wire
         /// </summary>
         public const string Reliability = "Reliable";
 
+        /// <summary>Provisional outbound message budget shared by host modules.</summary>
+        public const int MaxMessageBytes = 65536;
+
+        /// <summary>Provisional transport fragmentation budget.</summary>
+        public const int MaxFragmentBytes = 4096;
+
+        /// <summary>Provisional anti-replay window advertised by the host.</summary>
+        public const int AntiReplayWindow = 1024;
+
+        /// <summary>Authentication binding advertised by MVP envelopes.</summary>
+        public const string AuthBinding = "SessionAdmission";
+
+        /// <summary>Default transport error class for host-generated control frames.</summary>
+        public const string TransportErrorClass = "Rejectable";
+
         /// <summary>出站 <c>integrity.algorithm</c> 恒取值：本仓不产出任何校验和。</summary>
         public const string IntegrityAlgorithmNone = "None";
 

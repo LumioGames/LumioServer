@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # verify-sdk.sh 的 Windows 对应物；判据同为「前缀 10.0. + major.minor 一致」，不锁补丁号。
 $ErrorActionPreference = 'Stop'
 

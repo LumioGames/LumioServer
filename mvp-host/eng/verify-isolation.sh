@@ -6,6 +6,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MVP_HOST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$MVP_HOST_DIR/.." && pwd)"
+# shellcheck source=eng/GateHelpers.sh
+source "$SCRIPT_DIR/GateHelpers.sh"
 
 VIOLATION_EXIT=34
 violations=0
@@ -26,17 +28,29 @@ done
 # ② Rust 侧的七个仓根目录（存在时）不得出现 C# 源码或工程。
 for d in modules crates tools benches contracts generated tests; do
   [ -d "$REPO_ROOT/$d" ] || continue
+  hits="$(gate_find_sorted "$REPO_ROOT/$d" \( -name '*.csproj' -o -name '*.cs' -o -name '*.slnx' \) -type f)"
+  find_status=$?
+  if [ "$find_status" -ne 0 ]; then
+    printf 'MVP_HOST_ISOLATION_FAIL enumeration=%s\n' "$d"
+    exit "$VIOLATION_EXIT"
+  fi
   while IFS= read -r hit; do
     [ -n "$hit" ] || continue
     report "${hit#"$REPO_ROOT"/}"
-  done < <(find "$REPO_ROOT/$d" \( -name '*.csproj' -o -name '*.cs' -o -name '*.slnx' \) -type f 2>/dev/null | sort)
+  done <<< "$hits"
 done
 
 # ③ mvp-host/ 下不得出现 Rust 工程文件。
+hits="$(gate_find_sorted "$MVP_HOST_DIR" \( -name '*.rs' -o -name 'Cargo.toml' \) -type f)"
+find_status=$?
+if [ "$find_status" -ne 0 ]; then
+  printf 'MVP_HOST_ISOLATION_FAIL enumeration=mvp-host\n'
+  exit "$VIOLATION_EXIT"
+fi
 while IFS= read -r hit; do
   [ -n "$hit" ] || continue
   report "${hit#"$REPO_ROOT"/}"
-done < <(find "$MVP_HOST_DIR" \( -name '*.rs' -o -name 'Cargo.toml' \) -type f 2>/dev/null | sort)
+done <<< "$hits"
 
 if [ "$violations" -gt 0 ]; then
   printf 'MVP_HOST_ISOLATION_FAIL violations=%d\n' "$violations"

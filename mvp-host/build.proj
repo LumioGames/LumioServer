@@ -21,21 +21,21 @@
   <Target Name="Restore">
     <MSBuild Projects="@(TraversalProject)"
              Targets="Restore"
-             BuildInParallel="true"
+             BuildInParallel="false"
              Condition="'@(TraversalProject)' != ''" />
   </Target>
 
   <Target Name="Build">
     <MSBuild Projects="@(TraversalProject)"
              Targets="Build"
-             BuildInParallel="true"
+             BuildInParallel="false"
              Condition="'@(TraversalProject)' != ''" />
   </Target>
 
   <Target Name="Clean">
     <MSBuild Projects="@(TraversalProject)"
              Targets="Clean"
-             BuildInParallel="true"
+             BuildInParallel="false"
              Condition="'@(TraversalProject)' != ''" />
   </Target>
 

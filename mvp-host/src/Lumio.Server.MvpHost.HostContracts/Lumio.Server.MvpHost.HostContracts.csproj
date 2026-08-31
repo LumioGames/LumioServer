@@ -18,4 +18,10 @@
     <ProjectReference Include="../Lumio.Server.MvpHost.Platform/Lumio.Server.MvpHost.Platform.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="lumio-mvp-host" />
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.WorldSlot.Tests" />
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.Session.Tests" />
+  </ItemGroup>
+
 </Project>

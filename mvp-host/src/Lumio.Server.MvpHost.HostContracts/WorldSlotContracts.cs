@@ -1,3 +1,5 @@
+using Lumio.Server.MvpHost.Platform;
+
 namespace Lumio.Server.MvpHost.HostContracts;
 
 /// <summary>送给 world-slot 聚合根的类型化命令。</summary>
@@ -87,6 +89,16 @@ public interface IWorldSlotHost
     QuotaView Capacity { get; }
 
     AckResult ReportFault(string registeredErrorCode, HostFaultClass faultClass, SlotEpoch epoch);
+}
+
+/// <summary>
+/// Narrow pacing capability used by the App owner loop. A permit carries only
+/// the logical tick and slot epoch; the aggregate owns the bounded queue and all
+/// epoch/state validation.
+/// </summary>
+internal interface IWorldSlotPacingPort
+{
+    EnqueueResult EnqueueTickPermit(LogicalTickToken tick, SlotEpoch epoch);
 }
 
 /// <summary>

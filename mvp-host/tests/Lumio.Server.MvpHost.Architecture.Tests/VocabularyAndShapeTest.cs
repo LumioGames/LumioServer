@@ -36,6 +36,133 @@ public sealed class VocabularyAndShapeTest
             }
             .SelectMany(a => a.GetTypes());
 
+    [Fact]
+    public void FrozenAuthenticationBoundaryHasNoPublicProofSurface()
+    {
+        var hostContracts = typeof(IWorldSimulationPort).Assembly;
+
+        Assert.DoesNotContain(
+            hostContracts.GetExportedTypes(),
+            type => type.Name.Contains("AuthenticationEvidence", StringComparison.Ordinal)
+                || type.Name.Contains("AuthenticationProof", StringComparison.Ordinal)
+                || type.Name.Contains("AuthenticationMetadata", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            hostContracts
+                .GetExportedTypes()
+                .SelectMany(type => type.GetMembers(
+                    BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly)),
+            member => member.Name.Contains("AuthenticationEvidence", StringComparison.Ordinal)
+                || member.Name.Contains("AuthenticationProof", StringComparison.Ordinal)
+                || member.Name.Contains("AuthenticationMetadata", StringComparison.Ordinal));
+
+        AssertNoAuthenticationSidecar(typeof(CarrierAccept));
+        AssertNoAuthenticationSidecar(typeof(ConnectionEvent.HandshakeEnvelope));
+
+        AssertExactPublicRecordShape(
+            typeof(CarrierAccept),
+            new[] { typeof(bool), typeof(TransportConnectionId), typeof(System.Collections.Immutable.ImmutableArray<string>) },
+            "Accepted",
+            "ConnectionId",
+            "RequestedSubprotocols");
+        AssertExactPublicRecordShape(
+            typeof(ConnectionEvent.HandshakeEnvelope),
+            new[] { typeof(TransportConnectionId), typeof(ConnectionEpoch), typeof(ValidatedEnvelopeBytes) },
+            "Envelope",
+            "Epoch",
+            "Id");
+        AssertExactPublicRecordShape(
+            typeof(SessionCommand.ConnectionCandidate),
+            new[] { typeof(TransportConnectionId), typeof(ConnectionEpoch), typeof(ValidatedEnvelopeBytes) },
+            "ConnectionEpoch",
+            "ConnectionId",
+            "Handshake");
+    }
+
+    [Fact]
+    public void AuthenticationMetadataSideChannelStaysInsideTransportPipeline()
+    {
+        var sources = Directory
+            .EnumerateFiles(Path.Combine(BuildGraph.MvpHostRoot, "src"), "*.cs", SearchOption.AllDirectories)
+            .ToDictionary(
+                path => Path.GetRelativePath(BuildGraph.MvpHostRoot, path).Replace('\\', '/'),
+                File.ReadAllText,
+                StringComparer.Ordinal);
+
+        var webSocketPath = "src/Lumio.Server.MvpHost.Transport.WebSocket/WebSocketByteCarrier.cs";
+        var transportPath = "src/Lumio.Server.MvpHost.Transport/TransportService.cs";
+        var appPath = "src/Lumio.Server.MvpHost.App/FullGraphComposition.cs";
+        var webSocketSource = sources[webSocketPath];
+        var transportSource = sources[transportPath];
+        var appSource = sources[appPath];
+
+        Assert.DoesNotContain(
+            sources,
+            source => source.Value.Contains("TransportAuthenticationEvidence", StringComparison.Ordinal));
+        Assert.Contains("TryTakeAuthenticationMetadata", webSocketSource, StringComparison.Ordinal);
+        Assert.Equal(
+            new[] { webSocketPath },
+            sources
+                .Where(source => source.Value.Contains("authenticationMetadata[", StringComparison.Ordinal))
+                .Select(source => source.Key)
+                .OrderBy(path => path, StringComparer.Ordinal)
+                .ToArray());
+        Assert.Contains("this.carrier is ITransportAuthenticationMetadataSource", transportSource, StringComparison.Ordinal);
+        Assert.Contains("entry.SetAuthenticationMetadata", transportSource, StringComparison.Ordinal);
+        Assert.Contains("transport.TryTakeAuthenticationMetadata", appSource, StringComparison.Ordinal);
+        Assert.Contains("HandleAuthenticatedConnectionEvent", appSource, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            sources.Where(source => source.Key.StartsWith(
+                "src/Lumio.Server.MvpHost.HostContracts/",
+                StringComparison.Ordinal)),
+            source => source.Value.Contains("AuthenticationMetadata", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void InternalWorldSlotAdaptersAreNotPublishedByHostContracts()
+    {
+        var exportedNames = typeof(IWorldSimulationPort).Assembly
+            .GetExportedTypes()
+            .Select(type => type.Name)
+            .ToArray();
+
+        Assert.DoesNotContain("AdmissionReservationResult", exportedNames);
+        Assert.DoesNotContain("IWorldSlotAdmissionPort", exportedNames);
+        Assert.DoesNotContain("IWorldSlotPacingPort", exportedNames);
+    }
+
+    private static void AssertExactPublicRecordShape(
+        Type type,
+        Type[] constructorParameterTypes,
+        params string[] propertyNames)
+    {
+        var constructor = Assert.Single(type.GetConstructors(BindingFlags.Public | BindingFlags.Instance));
+        Assert.Equal(
+            constructorParameterTypes,
+            constructor.GetParameters().Select(parameter => parameter.ParameterType).ToArray());
+
+        var actualProperties = type
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .Select(property => property.Name)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(
+            propertyNames.OrderBy(name => name, StringComparer.Ordinal).ToArray(),
+            actualProperties);
+    }
+
+    private static void AssertNoAuthenticationSidecar(Type type)
+    {
+        var hiddenMembers = type.GetMembers(
+                BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .Where(member => member.Name.Contains("AuthenticationEvidence", StringComparison.Ordinal)
+                || member.Name.Contains("AuthenticationProof", StringComparison.Ordinal)
+                || member.Name.Contains("AuthenticationMetadata", StringComparison.Ordinal)
+                || member.Name.Contains("<Authentication", StringComparison.Ordinal))
+            .ToArray();
+
+        Assert.Empty(hiddenMembers);
+    }
+
     /// <summary>
     /// 无 DI 容器、无 EventBus、无 <c>Common</c> / <c>Utils</c> 这类命名。
     /// 前者会让依赖关系从构建图里消失（变成运行期字符串查找），

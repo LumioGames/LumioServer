@@ -12,6 +12,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MVP_HOST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=eng/GateHelpers.sh
+source "$SCRIPT_DIR/GateHelpers.sh"
 cd "$MVP_HOST_DIR" || exit 1
 
 MANIFEST=eng/contract-mirror.sha256
@@ -60,6 +62,17 @@ count=0
 while IFS= read -r line; do
   case "$line" in ''|'#'*) continue ;; esac
   path="${line#* }"; path="${path# }"
+  case "$path" in
+    contract-mirror/?*) ;;
+    *)
+      echo "MVP_HOST_MIRROR_SYNC_FAIL 非法镜像路径：$path" >&2
+      exit 1
+      ;;
+  esac
+  if ! gate_validate_relative_path "$path"; then
+    echo "MVP_HOST_MIRROR_SYNC_FAIL 非法镜像路径：$path" >&2
+    exit 1
+  fi
   src="$(source_path_of "$path")"
 
   if ! git -C "$ARCH_ROOT" cat-file -e "$ARCH_COMMIT:$src" 2>/dev/null; then
@@ -69,7 +82,8 @@ while IFS= read -r line; do
 
   mkdir -p "$(dirname "$path")"
   git -C "$ARCH_ROOT" show "$ARCH_COMMIT:$src" > "$path" || exit 1
-  printf '%s\n' "$(shasum -a 256 "$path")" >> "$tmp_manifest"
+  digest="$(gate_sha256_file "$path")" || exit 1
+  printf '%s  %s\n' "$digest" "$path" >> "$tmp_manifest"
   count=$((count + 1))
 done < "$MANIFEST"
 

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>6</MvpHostLayer>
+    <MvpHostProductionProject>false</MvpHostProductionProject>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Lumio.Server.MvpHost.Transport.WebSocket.Tests</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.Transport.WebSocket.Tests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="TngTech.ArchUnitNET.xUnitV3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.Transport.WebSocket/Lumio.Server.MvpHost.Transport.WebSocket.csproj" />
+    <ProjectReference Include="../../testkit/Lumio.Server.MvpHost.TestKit/Lumio.Server.MvpHost.TestKit.csproj" />
+  </ItemGroup>
+
+</Project>

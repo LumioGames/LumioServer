@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>6</MvpHostLayer>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Lumio.Server.MvpHost.App</RootNamespace>
+    <AssemblyName>lumio-mvp-host</AssemblyName>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- The dependent wave lands these projects independently. Once all four
+       composition inputs exist, compile the explicit production graph; until
+       then the process shell keeps its deterministic local fallback. -->
+  <PropertyGroup Condition="Exists('../Lumio.Server.MvpHost.Transport.WebSocket/Lumio.Server.MvpHost.Transport.WebSocket.csproj') and Exists('../Lumio.Server.MvpHost.WorldSlot/Lumio.Server.MvpHost.WorldSlot.csproj') and Exists('../Lumio.Server.MvpHost.Simulation.Reference/Lumio.Server.MvpHost.Simulation.Reference.csproj') and Exists('../Lumio.Server.MvpHost.Session/Lumio.Server.MvpHost.Session.csproj')">
+    <DefineConstants>$(DefineConstants);MVP_HOST_FULL_GRAPH</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.App.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Lumio.Server.MvpHost.GeneratedContracts/Lumio.Server.MvpHost.GeneratedContracts.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Wire/Lumio.Server.MvpHost.Wire.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Platform/Lumio.Server.MvpHost.Platform.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.HostContracts/Lumio.Server.MvpHost.HostContracts.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Observability/Lumio.Server.MvpHost.Observability.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Transport/Lumio.Server.MvpHost.Transport.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Transport.WebSocket/Lumio.Server.MvpHost.Transport.WebSocket.csproj" Condition="Exists('../Lumio.Server.MvpHost.Transport.WebSocket/Lumio.Server.MvpHost.Transport.WebSocket.csproj')" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Auth/Lumio.Server.MvpHost.Auth.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.WorldSlot/Lumio.Server.MvpHost.WorldSlot.csproj" Condition="Exists('../Lumio.Server.MvpHost.WorldSlot/Lumio.Server.MvpHost.WorldSlot.csproj')" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Simulation.Reference/Lumio.Server.MvpHost.Simulation.Reference.csproj" Condition="Exists('../Lumio.Server.MvpHost.Simulation.Reference/Lumio.Server.MvpHost.Simulation.Reference.csproj')" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Session/Lumio.Server.MvpHost.Session.csproj" Condition="Exists('../Lumio.Server.MvpHost.Session/Lumio.Server.MvpHost.Session.csproj')" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>7</MvpHostLayer>
+    <MvpHostProductionProject>false</MvpHostProductionProject>
+    <IsTestProject>true</IsTestProject>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Lumio.Server.MvpHost.App.Tests</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.App.Tests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="TngTech.ArchUnitNET.xUnitV3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.App/Lumio.Server.MvpHost.App.csproj" />
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.SmokeClient/Lumio.Server.MvpHost.SmokeClient.csproj" />
+  </ItemGroup>
+
+</Project>

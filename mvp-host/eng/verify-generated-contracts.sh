@@ -11,6 +11,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MVP_HOST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=eng/GateHelpers.sh
+source "$SCRIPT_DIR/GateHelpers.sh"
 cd "$MVP_HOST_DIR" || exit 1
 
 DRIFT_EXIT=32
@@ -51,13 +53,19 @@ check_not_hand_edited() {
     path="${entry#* }"; path="${path# }"
     count=$((count + 1))
 
+    if ! gate_validate_relative_path "$path"; then
+      printf 'MVP_HOST_GENERATED_DRIFT invalid-path %s\n' "$path"
+      drift=$((drift + 1))
+      continue
+    fi
+
     if [ ! -f "$generated/$path" ]; then
       printf 'MVP_HOST_GENERATED_DRIFT missing %s\n' "$path"
       drift=$((drift + 1))
       continue
     fi
 
-    actual="$(shasum -a 256 "$generated/$path" | cut -d' ' -f1)"
+    actual="$(gate_sha256_file "$generated/$path")"
     if [ "$actual" != "$expected" ]; then
       printf 'MVP_HOST_GENERATED_DRIFT modified %s (manifest %s != 实际 %s)\n' "$path" "$expected" "$actual"
       drift=$((drift + 1))
@@ -65,13 +73,21 @@ check_not_hand_edited() {
   done <<< "$entries"
 
   # manifest 之外的 .cs 同样是漂移——多拷一个文件与改一个字节等价危险。
-  while IFS= read -r found; do
-    [ -n "$found" ] || continue
-    if ! printf '%s\n' "$entries" | sed 's/^[^ ]*  *//' | grep -Fxq "$found"; then
-      printf 'MVP_HOST_GENERATED_DRIFT unregistered %s\n' "$found"
-      drift=$((drift + 1))
+  if [ -d "$generated" ]; then
+    found_files="$(cd "$generated" && gate_find_sorted . -name '*.cs' -type f | sed 's|^\./||')"
+    find_status=$?
+    if [ "$find_status" -ne 0 ]; then
+      printf 'MVP_HOST_GENERATED_FAIL enumeration-error\n'
+      return "$DRIFT_EXIT"
     fi
-  done < <(cd "$generated" 2>/dev/null && find . -name '*.cs' -type f | sed 's|^\./||' | sort)
+    while IFS= read -r found; do
+      [ -n "$found" ] || continue
+      if ! printf '%s\n' "$entries" | sed 's/^[^ ]*  *//' | grep -Fxq "$found"; then
+        printf 'MVP_HOST_GENERATED_DRIFT unregistered %s\n' "$found"
+        drift=$((drift + 1))
+      fi
+    done <<< "$found_files"
+  fi
 
   if [ "$drift" -gt 0 ]; then
     printf 'MVP_HOST_GENERATED_FAIL drift=%d\n' "$drift"
@@ -104,8 +120,7 @@ report_upstream_sync() {
     local expected path upstream
     expected="${entry%% *}"
     path="${entry#* }"; path="${path# }"
-    upstream="$(git -C "$arch_root" show "$arch_commit:packages/csharp/$path" 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"
-    if [ -z "$upstream" ]; then
+    if ! upstream="$(git -C "$arch_root" show "$arch_commit:packages/csharp/$path" 2>/dev/null | gate_sha256_stream)"; then
       printf 'MVP_HOST_GENERATED_UPSTREAM gone packages/csharp/%s\n' "$path"
       drift=$((drift + 1))
     elif [ "$upstream" != "$expected" ]; then
@@ -135,7 +150,7 @@ self_test() {
   mkdir -p "$sandbox/$GENERATED_DIR/Lumio.Gen.Probe"
   printf 'namespace Probe { }\n' > "$sandbox/$GENERATED_DIR/Lumio.Gen.Probe/Probe.cs"
   local digest
-  digest="$(shasum -a 256 "$sandbox/$GENERATED_DIR/Lumio.Gen.Probe/Probe.cs" | cut -d' ' -f1)"
+  digest="$(gate_sha256_file "$sandbox/$GENERATED_DIR/Lumio.Gen.Probe/Probe.cs")"
   mkdir -p "$sandbox/$PROJECT_DIR"
   printf 'ArtifactHashes = new[] { "%s  Lumio.Gen.Probe/Probe.cs" };\n' "$digest" > "$sandbox/$MANIFEST_CS"
 
@@ -153,6 +168,15 @@ self_test() {
     return 1
   fi
   printf 'SELFTEST 实验组（篡改一个字节）→ 退出 %d\n' "$DRIFT_EXIT"
+
+  rm -f "$sandbox/$GENERATED_DIR/Lumio.Gen.Probe/Probe.cs"
+  printf 'ArtifactHashes = new[] { "%s  ../outside.cs" };\n' "$digest" > "$sandbox/$MANIFEST_CS"
+  check_not_hand_edited "$sandbox" > /dev/null; status=$?
+  if [ "$status" -ne "$DRIFT_EXIT" ]; then
+    printf 'MVP_HOST_GENERATED_SELFTEST_FAIL 越界路径本应退出 %d，实际 %d\n' "$DRIFT_EXIT" "$status"
+    return 1
+  fi
+  printf 'SELFTEST 实验组（manifest 路径越界）→ 退出 %d\n' "$DRIFT_EXIT"
 
   printf 'MVP_HOST_GENERATED_SELFTEST_OK\n'
   return 0

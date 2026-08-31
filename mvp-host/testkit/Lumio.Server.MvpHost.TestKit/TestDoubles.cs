@@ -125,8 +125,16 @@ public sealed class InMemoryByteCarrier : IByteCarrier
     private readonly Dictionary<ulong, Queue<byte[]>> inbound = new();
     private readonly List<(TransportConnectionId Connection, byte[] Bytes)> sent = new();
     private readonly HashSet<ulong> closed = new();
+    private readonly List<(TransportConnectionId Connection, ConnectionCloseReason Reason)> closeCalls = new();
+    private readonly List<(string Operation, TransportConnectionId Connection)> operations = new();
 
     public IReadOnlyList<(TransportConnectionId Connection, byte[] Bytes)> Sent => this.sent;
+
+    public IReadOnlyList<(TransportConnectionId Connection, ConnectionCloseReason Reason)> CloseCalls
+        => this.closeCalls;
+
+    public IReadOnlyList<(string Operation, TransportConnectionId Connection)> Operations
+        => this.operations;
 
     public void QueueAccept(TransportConnectionId id, params string[] requestedSubprotocols)
     {
@@ -184,10 +192,16 @@ public sealed class InMemoryByteCarrier : IByteCarrier
         }
 
         this.sent.Add((c, bytes.ToArray()));
+        this.operations.Add(("Send", c));
         return true;
     }
 
-    public bool Close(TransportConnectionId c, ConnectionCloseReason reason) => this.closed.Add(c.Value);
+    public bool Close(TransportConnectionId c, ConnectionCloseReason reason)
+    {
+        this.closeCalls.Add((c, reason));
+        this.operations.Add(("Close", c));
+        return this.closed.Add(c.Value);
+    }
 }
 
 /// <summary>

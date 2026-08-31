@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <MvpHostLayer>5</MvpHostLayer>
+    <RootNamespace>Lumio.Server.MvpHost.Session</RootNamespace>
+    <AssemblyName>Lumio.Server.MvpHost.Session</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Lumio.Server.MvpHost.HostContracts/Lumio.Server.MvpHost.HostContracts.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Observability/Lumio.Server.MvpHost.Observability.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="lumio-mvp-host" />
+    <InternalsVisibleTo Include="Lumio.Server.MvpHost.Session.Tests" />
+  </ItemGroup>
+</Project>

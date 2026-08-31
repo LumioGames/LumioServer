@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <MvpHostLayer>6</MvpHostLayer>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Lumio.Server.MvpHost.SmokeClient</RootNamespace>
+    <AssemblyName>lumio-mvp-smoke-client</AssemblyName>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Lumio.Server.MvpHost.Wire/Lumio.Server.MvpHost.Wire.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Platform/Lumio.Server.MvpHost.Platform.csproj" />
+  </ItemGroup>
+
+</Project>

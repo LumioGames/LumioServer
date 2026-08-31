@@ -1,0 +1,25 @@
+{
+  "queues": [
+    {
+      "name": "MvpWebSocketAcceptQueue",
+      "owner": "Lumio.Server.MvpHost.Transport.WebSocket",
+      "producer": "Kestrel request handler",
+      "consumer": "Transport accept loop",
+      "ordering": "FIFO",
+      "budget": "MaxConnections provisional",
+      "onFull": "Policy reject and close the upgrade",
+      "onClose": "Close pending connections"
+    },
+    {
+      "name": "MvpWebSocketEgressQueue",
+      "owner": "Lumio.Server.MvpHost.Transport.WebSocket",
+      "producer": "Transport send caller",
+      "consumer": "Per-connection WebSocket send loop",
+      "ordering": "FIFO per connection epoch",
+      "budget": "512 messages / 1 MiB provisional",
+      "onFull": "Return false from TrySend",
+      "onClose": "Drain before the bounded close budget expires"
+    }
+  ],
+  "note": "The adapter owns only carrier queues; envelope validation and transport ingress queues remain in Lumio.Server.MvpHost.Transport."
+}
