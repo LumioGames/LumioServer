@@ -29,7 +29,7 @@ LumioServer 是七仓库体系中的 Rust Dedicated Server Host 与网络基础�
 
 - **本仓拥有**：进程、监听 Endpoint、认证、Connection、Session Admission、Release 身份代理、WorldSlot 聚合根、Host Wall Clock/pacing、CoreCLR Hosting、维护代理执行与资源配额。
 - **本仓不拥有**：ECS Storage、Logical Phase 语义、Gameplay 规则、Voxel 内部状态、Client ReplicaWorld，以及**集群期望状态**（哪些 Pool 存在、流量分配、实例替换时机——归外部控制面，架构源 ADR-012）。Server 只保存句柄、Context、Snapshot 元数据和编排状态。
-- **编译依赖**（架构源 §2.2）：`LumioServer -> LumioGameRuntime + LumioCoreEngine Package`；Gameplay Assembly、Config/Content 与生成契约以版本化构建产物输入，不形成对 Host 源码的反向依赖。
+- **编译依赖**：`LumioServer -> LumioEngineSDK`；Gameplay Assembly、Config/Content 由 `LumioGame` 组合后输入，不形成对 SDK provider 源码的反向依赖。
 - **运行时加载**：`ReleaseCatalog -> Server Host -> one CoreEngine package per process -> stable Runtime -> ServerGameplay Assembly -> Config/Content/Snapshot`。
 
 五条全局硬约束（各模块 README 不得违背）：

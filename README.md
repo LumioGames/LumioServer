@@ -51,7 +51,7 @@ Runtime 拥有 Logical Tick、GameWorld 和 Coordinator；VoxelEngine 拥有 Vox
 - 启动配置、Endpoint、WorldSlot、健康检查、资源预算、Watchdog、日志和 Metrics。
 - 收包、Envelope/Release/权限校验、可靠/不可靠通道、Ack、重传、分片、认证、防重放和背压。
 - 将网络/IO/Native Completion 通过有界 Queue/Batch 交给 Runtime Tick，网络线程不得调用 Gameplay。
-- 统一加载一个 `LumioCoreEngine` 平台包、托管 Runtime 和 Server Gameplay ALC。
+- 统一加载一个 `LumioEngineSDK` Native 包、托管 Runtime 和 Server Gameplay ALC。
 - 驱动 Host Wall Clock；在 Runtime 规定的 Phase 入口调用逻辑 Tick。
 - 编排 Release Catalog、版本池、Session 排空、强制维护、Snapshot/WAL 落盘和恢复。
 - 提供 Dedicated、LocalEmbedded Server Role、LocalSplitProcess、Headless Bot Endpoint。
@@ -116,7 +116,7 @@ Old Serving -> Draining -> Empty -> Retired
 ## Source / Compile-Time Dependencies
 
 - Rust toolchain、网络/IO/日志基础 crates 和平台 SDK。
-- `LumioCoreEngine` 统一 Native 包与生成 Header；不直接依赖 NativeCore/VoxelEngine 源码。
+- `LumioEngineSDK` 统一 Native 包、ABI Binding 与共享 Loader；不直接暴露 NativeCore/VoxelEngine 源码。
 - `LumioGameRuntime` 稳定 Managed Host/ABI；不编译依赖 Client 或 Game 实现源码。
 - Release/Gameplay Payload 只通过版本化契约消费。
 

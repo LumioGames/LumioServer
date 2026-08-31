@@ -21,7 +21,8 @@ public sealed record HostCommandLineOptions(
     int ReconnectWindowSeconds,
     bool EnableTestControl,
     string? TestControlListenUri,
-    string? AuditTraceFile)
+    string? AuditTraceFile,
+    string? EngineNativePath = null)
 {
     public const string DefaultListenUri = "ws://127.0.0.1:0";
     public const string DefaultHostProfile = "LocalSplitProcess";
@@ -61,6 +62,7 @@ public static class HostCommandLineParser
         var enableControl = false;
         string? controlListen = null;
         string? traceFile = null;
+        string? engineNativePath = null;
 
         for (var index = 0; index < args.Count; index++)
         {
@@ -141,6 +143,13 @@ public static class HostCommandLineParser
                     }
 
                     break;
+                case "--engine-native":
+                    if (!TryReadValue(args, ref index, out engineNativePath))
+                    {
+                        return HostParseResult.Invalid("--engine-native requires a path");
+                    }
+
+                    break;
                 case "--help":
                 case "-h":
                     return HostParseResult.Invalid("help");
@@ -204,7 +213,8 @@ public static class HostCommandLineParser
             reconnectSeconds,
             enableControl,
             controlListen,
-            traceFile));
+            traceFile,
+            engineNativePath));
     }
 
     private static bool TryReadValue(IReadOnlyList<string> args, ref int index, out string value)

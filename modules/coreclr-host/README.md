@@ -9,7 +9,7 @@
 ## 负责什么
 
 - CoreCLR 启动与配置：进程唯一 CoreCLR 实例的初始化参数、GC 模式与关闭时序。
-- CoreEngine 包装载协调：调用 CoreEngine Loader 装载唯一 Native 组合；Loader 对第二版本、符号冲突、ABI/Capability 不匹配和重复释放的拒绝语义归 `LumioCoreEngine`（架构源 §8.2），本模块负责调用与结果处置。
+- Engine SDK 装载协调：调用 `LumioEngineSDK` 共享 Loader 装载唯一 Native 组合；Loader 对路径、ABI/BuildId 不匹配和重复释放的拒绝语义归 SDK，本模块负责调用与结果处置。
 - 稳定 Runtime 装载：装载 `LumioGameRuntime` Managed Host，完成 `RuntimeApiV*` 版本校验。
 - Gameplay ALC 生命周期：ServerGameplay Assembly 的 Collectible ALC 装载、激活、热重载与卸载；卸载遵循 `Quiesce -> Cancel -> Drain -> Dispose -> Root 验证 -> Unload` 顺序，配合 Runtime 的 `GameplayModuleScope` 契约。
 - ABI 校验：按 `NativeManagedAbiV1` 校验 `abi_version`、`struct_size`、`capability_bits`、指针宽度与端序；不匹配在 World 创建前失败（架构源 ADR-006）。
@@ -19,7 +19,7 @@
 
 ## 明确不负责什么
 
-- 不定义 ABI、Loader 拒绝规则或生成 Header（归 `LumioCoreEngine`/`LumioNativeCore`）。
+- 不定义 ABI、Loader 拒绝规则或生成 Header（归 `LumioGameEngine` SDK）。
 - 不拥有 ALC 内部的 Managed 对象生命周期与 Hot Reload 契约语义（归 `LumioGameRuntime`）。
 - 不拥有 Simulation Owner Thread（归 [world-slot](../world-slot/README.md)）；本模块提供入口，不提供线程。
 - 不加载第二套 Native 包、不支持一进程多 Release（D-001 变更需新 ADR 并更新架构源 ADR-006/012 与 Loader Schema）。

@@ -8,6 +8,15 @@
         "resolved": "5.6.0",
         "contentHash": "Kcobt3pnOdO0A+6CKiMHZdTEluJpsfxiV20axtZdmfBQnDmiWTKPJADlgAfdTuKNAnVarrkJa0UEGwuOo91muw=="
       },
+      "lumio.engine.nativeloader": {
+        "type": "Project"
+      },
+      "lumio.engine.sdk": {
+        "type": "Project",
+        "dependencies": {
+          "Lumio.Engine.NativeLoader": "[1.0.0, )"
+        }
+      },
       "lumio.server.mvphost.auth": {
         "type": "Project",
         "dependencies": {

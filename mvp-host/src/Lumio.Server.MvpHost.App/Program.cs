@@ -2,6 +2,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Runtime.InteropServices;
+using Lumio.Engine.SDK;
 
 namespace Lumio.Server.MvpHost.App;
 
@@ -45,8 +46,16 @@ public static class Program
         Console.CancelKeyPress += OnCancel;
 
         HostComposition? composition = null;
+        LumioEngineLease? engine = null;
         try
         {
+            if (options.EngineNativePath is not null)
+            {
+                engine = LumioEngineSdk.LoadNative(options.EngineNativePath);
+                engine.Ping();
+                Console.WriteLine($"ENGINE_NATIVE path={engine.NativePath} buildId={engine.BuildId} abiHash={engine.AbiHash} binarySha256={engine.BinarySha256}");
+            }
+
             composition = HostComposition.Create(options);
             await composition.StartAsync(shutdown.Token).ConfigureAwait(false);
             Console.WriteLine(new HostReadyLine(composition.BoundListenUri, composition.BoundTestControlUri));
@@ -95,6 +104,7 @@ public static class Program
                     Console.Error.WriteLine($"shutdown failed: {ex.Message}");
                 }
             }
+            engine?.Dispose();
         }
 
         void OnCancel(object? sender, ConsoleCancelEventArgs eventArgs)
