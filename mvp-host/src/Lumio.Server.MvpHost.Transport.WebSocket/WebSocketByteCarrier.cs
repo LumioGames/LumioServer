@@ -909,36 +909,36 @@ public sealed class WebSocketByteCarrier : IByteCarrier, IAsyncDisposable, IDisp
         }
         finally
         {
-        try
-        {
-            state.SendCancellation.Cancel();
-        }
-        catch (ObjectDisposedException)
-        {
-            // A concurrent retirement already released the connection resources.
-        }
-
-        var closeFrameSent = state.Socket.State is WebSocketState.CloseSent
-            or WebSocketState.CloseReceived
-            or WebSocketState.Closed;
-        if (closeFrameSent)
-        {
-            lock (state.Gate)
-            {
-                state.CloseFrameSent = true;
-            }
-
             try
             {
-                state.ReceiveCancellation.CancelAfter(CloseFlushMilliseconds);
+                state.SendCancellation.Cancel();
             }
             catch (ObjectDisposedException)
             {
                 // A concurrent retirement already released the connection resources.
             }
-        }
 
-        this.MarkClosed(state);
+            var closeFrameSent = state.Socket.State is WebSocketState.CloseSent
+                or WebSocketState.CloseReceived
+                or WebSocketState.Closed;
+            if (closeFrameSent)
+            {
+                lock (state.Gate)
+                {
+                    state.CloseFrameSent = true;
+                }
+
+                try
+                {
+                    state.ReceiveCancellation.CancelAfter(CloseFlushMilliseconds);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // A concurrent retirement already released the connection resources.
+                }
+            }
+
+            this.MarkClosed(state);
         }
     }
 
