@@ -27,7 +27,7 @@ Game Server 只在 Account Server 准入凭证验证通过后才为连接分配�
 - **重绑**：窗内新准入复用同一 `NetEntityId`，`connectionGeneration` 严格递增；复制 FullSnapshot 只含当前纪元，不含墓碑与旧代。这不是持久化 Snapshot/Restore。
 - **过期**：到期墓碑化 A（`tombstoned`）；之后同 AccountId 登录创建 B，新的 `NetEntityId`。旧引用永不改指 B。
 - **进程重启**：登记是进程内状态，不保留旧连接窗；重启后必须重新 login。`NetEntityId` 含进程实例前缀，避免重启后序号撞车。
-- **组装**：`Lumio.Server.MvpHost.App` 经 `HostComposition.CreateRoomAdmissionRegistry` 接线 Host 时钟与 Timer。契约真值是架构仓 `engine/wire/entity-binding-and-query-v1.json`（本仓镜像 `mvp-host/contract/`）。
+- **组装**：`FullGraphComposition.Create` 经 `HostComposition.CreateRoomAdmissionRegistry` 接线 Host 时钟与 Timer。通道升级在共享密钥之外还接受 C-3 `admissionCredential`；握手路径 `Admit` + 绑定查找把活连接分类为 Bot/Player。公钥来自 `LUMIO_ACCOUNT_ADMISSION_PUBLIC_KEY_HEX`（缺省则进程内临时密钥，仅供未对接账号服的 smoke）。契约真值是架构仓 `engine/wire/entity-binding-and-query-v1.json`（本仓镜像 `mvp-host/contract/`）。
 
 ## 待解决
 
