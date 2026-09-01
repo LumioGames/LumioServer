@@ -2,9 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
+using ArchUnitNET.Domain.Extensions;
+using ArchUnitNET.Loader;
 using Lumio.Server.MvpHost.HostContracts;
 using Lumio.Server.MvpHost.Observability;
 using Lumio.Server.MvpHost.Platform;
@@ -16,6 +19,21 @@ namespace Lumio.Server.MvpHost.WorldSlot.Tests;
 
 public sealed class WorldSlotFocusedTests
 {
+    private static readonly ArchUnitNET.Domain.Architecture WorldSlotArchitecture = new ArchLoader()
+        .LoadAssemblies(typeof(WorldSlotHost).Assembly)
+        .Build();
+
+    private static readonly string[] DeferredTransitionEvents =
+    {
+        "Resume",
+        "BeginSnapshot",
+        "SnapshotComplete",
+        "BeginReload",
+        "ReloadComplete",
+        "BeginMigrate",
+        "MigrationHandedOff",
+    };
+
     [Fact]
     public void AdmissionAndPacingAdaptersDoNotExpandThePublicHostShape()
     {
@@ -130,6 +148,55 @@ public sealed class WorldSlotFocusedTests
         Assert.Equal(
             new FaultAdjudication(HostFaultClass.None, false, false),
             adjudicator.Classify(HostFaultClass.None));
+    }
+
+    [Fact]
+    public void NeverInfersFromCatchTest()
+    {
+        var classify = typeof(MvpFaultAdjudicator).GetMethod(
+            nameof(MvpFaultAdjudicator.Classify),
+            BindingFlags.Public | BindingFlags.Instance);
+        Assert.NotNull(classify);
+        var parameters = classify.GetParameters();
+        var parameter = Assert.Single(parameters);
+        Assert.Equal(typeof(HostFaultClass?), parameter.ParameterType);
+        Assert.Equal(typeof(FaultAdjudication), classify.ReturnType);
+
+        var fields = typeof(MvpFaultAdjudicator).GetFields(
+            BindingFlags.Public
+            | BindingFlags.NonPublic
+            | BindingFlags.Instance
+            | BindingFlags.Static
+            | BindingFlags.DeclaredOnly);
+        Assert.Empty(fields);
+
+        var adjudicator = WorldSlotArchitecture.Types.Single(type =>
+            string.Equals(type.FullName, typeof(MvpFaultAdjudicator).FullName, StringComparison.Ordinal));
+        var exceptionCalls = adjudicator.Members
+            .SelectMany(member => member.GetMethodCallDependencies())
+            .Where(dependency => IsExceptionName(dependency.Target.FullName)
+                || IsExceptionName(dependency.TargetMember.FullName))
+            .Select(dependency => dependency.TargetMember.FullName)
+            .ToList();
+        var exceptionTypes = adjudicator.Dependencies
+            .Where(dependency => IsExceptionName(dependency.Target.FullName))
+            .Select(dependency => dependency.Target.FullName)
+            .ToList();
+
+        Assert.Empty(exceptionCalls);
+        Assert.Empty(exceptionTypes);
+    }
+
+    [Fact]
+    public void UnattestedOutcomeIsUnprovenTest()
+    {
+        HostTickOutcome outcome = default;
+        Assert.Null(outcome.FaultClass);
+
+        var adjudicator = new MvpFaultAdjudicator();
+        Assert.Equal(
+            new FaultAdjudication(HostFaultClass.SlotStateUnproven, true, false),
+            adjudicator.Classify(outcome.FaultClass));
     }
 
     [Fact]
@@ -552,6 +619,99 @@ public sealed class WorldSlotFocusedTests
     }
 
     [Fact]
+    public void NativeReadyIsTraversedNotSkippedTest()
+    {
+        using var harness = new Harness();
+        harness.StartRunning();
+
+        Assert.Equal(WorldSlotHostState.Running, harness.Host.State);
+        Assert.Contains(
+            harness.Trace.States,
+            state => state.SessionState == nameof(WorldSlotHostState.NativeReady));
+        Assert.NotEqual(WorldSlotHostState.NativeReady, WorldSlotHostState.ManagedReady);
+        Assert.NotEqual(WorldSlotHostState.NativeReady, WorldSlotHostState.Bootstrapping);
+        Assert.Contains(
+            WorldSlotStateMachine.ForwardTransitions,
+            transition => transition.From == WorldSlotHostState.Bootstrapping
+                && transition.To == WorldSlotHostState.NativeReady
+                && transition.Event == "NativeLoaded");
+        Assert.Contains(
+            WorldSlotStateMachine.ForwardTransitions,
+            transition => transition.From == WorldSlotHostState.NativeReady
+                && transition.To == WorldSlotHostState.ManagedReady
+                && transition.Event == "ManagedLoaded");
+
+        var source = ReadWorldSlotHostSource();
+        var startRunningAt = source.IndexOf("ApplyStartRunning", StringComparison.Ordinal);
+        Assert.True(startRunningAt >= 0);
+        Assert.True(
+            source.IndexOf("ABS-WORLDSLOT-NATIVE", startRunningAt, StringComparison.Ordinal) >= 0,
+            "ABS-WORLDSLOT-NATIVE must sit on the production StartRunning path, not only Advance.");
+
+        var startRunning = WorldSlotArchitecture.Types
+            .Single(type => string.Equals(type.FullName, typeof(WorldSlotHost).FullName, StringComparison.Ordinal))
+            .Members
+            .Single(member => member.Name.Contains("ApplyStartRunning", StringComparison.Ordinal));
+        var called = startRunning.GetMethodCallDependencies()
+            .Select(dependency => dependency.TargetMember.Name)
+            .ToList();
+        Assert.Contains(
+            called,
+            name => name.Contains("LoadAbsentNativeRuntime", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void DeferredTransitionsAreDefinedButUnreachableTest()
+    {
+        foreach (var name in DeferredTransitionEvents)
+        {
+            Assert.Contains(
+                WorldSlotStateMachine.ForwardTransitions,
+                transition => transition.Event == name);
+        }
+
+        Assert.Equal(
+            DeferredTransitionEvents.Length,
+            WorldSlotStateMachine.ForwardTransitions.Count(transition =>
+                DeferredTransitionEvents.Contains(transition.Event, StringComparer.Ordinal)));
+
+        var commandNames = typeof(WorldSlotCommand)
+            .GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic)
+            .Select(type => type.Name)
+            .ToArray();
+        Assert.DoesNotContain(
+            commandNames,
+            name => DeferredTransitionEvents.Contains(name, StringComparer.Ordinal));
+
+        var reachable = typeof(WorldSlotHost).GetMethod(
+            "IsMvpReachableEvent",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(reachable);
+        foreach (var name in DeferredTransitionEvents)
+        {
+            Assert.False((bool)reachable.Invoke(null, new object[] { name })!);
+        }
+
+        var hostSource = ReadWorldSlotHostSource();
+        foreach (var name in DeferredTransitionEvents)
+        {
+            Assert.DoesNotContain($"\"{name}\"", hostSource, StringComparison.Ordinal);
+        }
+
+        Assert.DoesNotContain("this.state = WorldSlotHostState.Snapshotting", hostSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("this.state = WorldSlotHostState.Reloading", hostSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("this.state = WorldSlotHostState.Migrating", hostSource, StringComparison.Ordinal);
+
+        using var harness = new Harness();
+        harness.StartRunning();
+        Assert.True(harness.Host.Quiesce("shutdown", harness.Host.Epoch).Accepted);
+        Assert.Equal(WorldSlotHostState.Stopping, harness.Host.State);
+        Assert.NotEqual(WorldSlotHostState.Snapshotting, harness.Host.State);
+        Assert.NotEqual(WorldSlotHostState.Reloading, harness.Host.State);
+        Assert.NotEqual(WorldSlotHostState.Migrating, harness.Host.State);
+    }
+
+    [Fact]
     public void InternalPacingPathUsesBoundedQueueAndEpochFence()
     {
         using var harness = new Harness();
@@ -632,6 +792,31 @@ public sealed class WorldSlotFocusedTests
         Assert.Equal(AdmissionGateState.Closed, harness.Host.Gate);
         Assert.True(harness.Host.IsPacingStopped);
         Assert.Equal(AdmissionClosedOnly, harness.Trace.Acks.Select(a => a.Effect));
+    }
+
+    [Theory]
+    [InlineData(QuiesceFailureStep.CloseGate)]
+    [InlineData(QuiesceFailureStep.Drain)]
+    [InlineData(QuiesceFailureStep.SnapshotCut)]
+    [InlineData(QuiesceFailureStep.PausePacing)]
+    [InlineData(QuiesceFailureStep.Stop)]
+    public void QuiesceStepFailureEntersFaultedTest(QuiesceFailureStep step)
+    {
+        using var harness = new Harness();
+        harness.StartRunning();
+        harness.ArmQuiesceFailure(step);
+
+        var result = harness.Host.Quiesce("shutdown", harness.Host.Epoch);
+
+        Assert.False(result.Accepted);
+        Assert.Equal("InternalInvariant", result.StableErrorId);
+        Assert.Equal(WorldSlotHostState.Faulted, harness.Host.State);
+        Assert.Equal(AdmissionGateState.Closed, harness.Host.Gate);
+        Assert.True(harness.Host.IsPacingStopped);
+        Assert.DoesNotContain(harness.Host.State, NonSnapshotStates);
+        Assert.Equal(
+            AcksBeforeFailedStep(step),
+            harness.Trace.Acks.Select(ack => ack.Effect).ToArray());
     }
 
     [Fact]
@@ -897,6 +1082,38 @@ public sealed class WorldSlotFocusedTests
         Assert.Equal(AdmissionGateState.Closed, harness.Host.Gate);
     }
 
+    private static string[] AcksBeforeFailedStep(QuiesceFailureStep step) => step switch
+    {
+        QuiesceFailureStep.CloseGate => Array.Empty<string>(),
+        QuiesceFailureStep.Drain => AdmissionClosedOnly,
+        QuiesceFailureStep.SnapshotCut => new[] { "AdmissionClosed", "Drained" },
+        QuiesceFailureStep.PausePacing => new[] { "AdmissionClosed", "Drained", "SnapshotCut" },
+        QuiesceFailureStep.Stop => new[] { "AdmissionClosed", "Drained", "SnapshotCut" },
+        _ => throw new ArgumentOutOfRangeException(nameof(step), step, null),
+    };
+
+    private static bool IsExceptionName(string? fullName)
+        => !string.IsNullOrEmpty(fullName)
+            && (string.Equals(fullName, "System.Exception", StringComparison.Ordinal)
+                || (fullName.StartsWith("System.", StringComparison.Ordinal)
+                    && fullName.Contains("Exception", StringComparison.Ordinal)));
+
+    private static string ReadWorldSlotHostSource()
+    {
+        var mvpHostDirectory = Path.GetFullPath(Path.Combine(
+            Path.GetDirectoryName(typeof(WorldSlotHost).Assembly.Location)!,
+            "..",
+            "..",
+            "..",
+            "..",
+            ".."));
+        return File.ReadAllText(Path.Combine(
+            mvpHostDirectory,
+            "src",
+            "Lumio.Server.MvpHost.WorldSlot",
+            "WorldSlotHost.cs"));
+    }
+
     private static bool SpinUntil(Func<bool> predicate)
     {
         var deadline = Environment.TickCount64 + 5_000;
@@ -931,10 +1148,11 @@ public sealed class WorldSlotFocusedTests
         {
             this.Simulation = new RecordingSimulation();
             this.Clock = new FakeMonotonicClock();
-            this.Timers = PlatformModule.CreateTimerService(this.Clock);
+            this.Timers = new ControllableTimerService(PlatformModule.CreateTimerService(this.Clock));
             this.Threads = PlatformModule.CreateThreadSupervisor();
             this.AggregateInbox = PlatformModule.CreateInbox<WorldSlotCommand>(new QueueBudget(aggregateCapacity, 65_536));
             this.EventInbox = PlatformModule.CreateInbox<WorldSlotEvent>(new QueueBudget(eventCapacity, 65_536));
+            this.EventFilter = new FilteringOutbox(PlatformModule.CreateOutbox(this.EventInbox));
             this.Trace = new RecordingHostTraceSink();
             var audit = PlatformModule.CreateInbox<AuditRecord>(new QueueBudget(16, 65_536));
             var diagnostics = PlatformModule.CreateInbox<DiagnosticRecord>(new QueueBudget(16, 65_536));
@@ -950,7 +1168,7 @@ public sealed class WorldSlotFocusedTests
                 this.Timers,
                 this.Threads,
                 this.AggregateInbox,
-                PlatformModule.CreateOutbox(this.EventInbox),
+                this.EventFilter,
                 new EmptyIngress(),
                 new MvpFaultAdjudicator(),
                 this.Observability);
@@ -961,7 +1179,9 @@ public sealed class WorldSlotFocusedTests
 
         internal FakeMonotonicClock Clock { get; }
 
-        internal ITimerService Timers { get; }
+        internal ControllableTimerService Timers { get; }
+
+        internal FilteringOutbox EventFilter { get; }
 
         internal INamedThreadSupervisor Threads { get; }
 
@@ -979,6 +1199,30 @@ public sealed class WorldSlotFocusedTests
         {
             Assert.True(this.Host.Allocate(new SlotBudget(1, 64, 65_536)).Allocated);
             Assert.True(this.Host.StartRunning().Accepted);
+        }
+
+        internal void ArmQuiesceFailure(QuiesceFailureStep step)
+        {
+            switch (step)
+            {
+                case QuiesceFailureStep.CloseGate:
+                    this.EventFilter.RejectOnce(typeof(WorldSlotEvent.GateStateChanged));
+                    break;
+                case QuiesceFailureStep.Drain:
+                    this.Simulation.FailDrain = true;
+                    break;
+                case QuiesceFailureStep.SnapshotCut:
+                    this.EventFilter.RejectOnce(typeof(WorldSlotEvent.Quiesced));
+                    break;
+                case QuiesceFailureStep.PausePacing:
+                    this.Timers.ThrowOnCancel = true;
+                    break;
+                case QuiesceFailureStep.Stop:
+                    this.EventFilter.RejectOnce(typeof(WorldSlotEvent.ReadyToStop));
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(step), step, null);
+            }
         }
 
         public void Dispose()
@@ -1088,5 +1332,76 @@ public sealed class WorldSlotFocusedTests
         public void Dispose() => this.State = HostSimulationState.Disposed;
 
         internal void ReleaseTicks() => this.Release.Set();
+    }
+
+    public enum QuiesceFailureStep
+    {
+        CloseGate,
+        Drain,
+        SnapshotCut,
+        PausePacing,
+        Stop,
+    }
+
+    internal sealed class FilteringOutbox : IBoundedOutbox<WorldSlotEvent>
+    {
+        private readonly IBoundedOutbox<WorldSlotEvent> inner;
+        private readonly object gate = new();
+        private System.Type? rejectType;
+        private int remaining;
+
+        internal FilteringOutbox(IBoundedOutbox<WorldSlotEvent> inner) => this.inner = inner;
+
+        internal void RejectOnce(System.Type eventType)
+        {
+            lock (this.gate)
+            {
+                this.rejectType = eventType;
+                this.remaining = 1;
+            }
+        }
+
+        public EnqueueResult TryPublish(in WorldSlotEvent item)
+        {
+            lock (this.gate)
+            {
+                if (this.rejectType is not null
+                    && this.remaining > 0
+                    && this.rejectType.IsInstanceOfType(item))
+                {
+                    this.remaining--;
+                    return new EnqueueResult(EnqueueStatus.Full, "QueueFull");
+                }
+            }
+
+            return this.inner.TryPublish(in item);
+        }
+    }
+
+    internal sealed class ControllableTimerService : ITimerService
+    {
+        private readonly ITimerService inner;
+
+        internal ControllableTimerService(ITimerService inner) => this.inner = inner;
+
+        internal bool ThrowOnCancel { get; set; }
+
+        public TimerId Schedule<TCommand>(
+            MonotonicInstant dueAt,
+            IBoundedInbox<TCommand> target,
+            in TCommand command)
+            => this.inner.Schedule(dueAt, target, in command);
+
+        public bool Cancel(TimerId id)
+        {
+            if (this.ThrowOnCancel)
+            {
+                throw new InvalidOperationException("pacing-stop");
+            }
+
+            return this.inner.Cancel(id);
+        }
+
+        public void Dispose() => this.inner.Dispose();
     }
 }
