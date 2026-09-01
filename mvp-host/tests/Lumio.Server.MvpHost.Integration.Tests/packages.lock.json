@@ -33,6 +33,33 @@
           "xunit.v3.mtp-v1": "[3.2.2]"
         }
       },
+      "BouncyCastle.Cryptography": {
+        "type": "Transitive",
+        "resolved": "2.6.1",
+        "contentHash": "vZsG2YILhthgRqO+ZVgRff4ZFKKTl0v7kqaVBLCtRvpREhfBP33pcWrdA3PRYgWuFL1RxiUFvjMUHTdBZlJcoA=="
+      },
+      "Isopoh.Cryptography.Argon2": {
+        "type": "Transitive",
+        "resolved": "2.0.0",
+        "contentHash": "8ytWN19j+qARb/XYi7KkNMm4Z8zS6tfGgnsZ1N5ihbQ5LXfyL+uYowfJxtGW9TO0S8NM2q0BaTKGOtOlsrhclQ==",
+        "dependencies": {
+          "Isopoh.Cryptography.Blake2b": "2.0.0",
+          "Isopoh.Cryptography.SecureArray": "2.0.0"
+        }
+      },
+      "Isopoh.Cryptography.Blake2b": {
+        "type": "Transitive",
+        "resolved": "2.0.0",
+        "contentHash": "Co56bjSZV13fpvYHEN04qG8hqc0rKRm4os8iEgpJ/kujvt0pYtOVhj5J0Q7HBPbHwpcChRh2CjYVCGm4nw85VQ==",
+        "dependencies": {
+          "Isopoh.Cryptography.SecureArray": "2.0.0"
+        }
+      },
+      "Isopoh.Cryptography.SecureArray": {
+        "type": "Transitive",
+        "resolved": "2.0.0",
+        "contentHash": "oWbRv/BTztKJxKFr3FBurWBBCgE1+nUTm3pwtA3Yg7Xeo4wDpaLstAwqx8HeQG3/b9yOs2qykpqfbNPJ40McIw=="
+      },
       "Microsoft.ApplicationInsights": {
         "type": "Transitive",
         "resolved": "2.23.0",
@@ -166,6 +193,7 @@
       "lumio-mvp-host": {
         "type": "Project",
         "dependencies": {
+          "Lumio.Server.MvpHost.Admission": "[1.0.0, )",
           "Lumio.Server.MvpHost.Auth": "[1.0.0, )",
           "Lumio.Server.MvpHost.GeneratedContracts": "[1.0.0, )",
           "Lumio.Server.MvpHost.HostContracts": "[1.0.0, )",
@@ -184,6 +212,19 @@
         "dependencies": {
           "Lumio.Server.MvpHost.Platform": "[1.0.0, )",
           "Lumio.Server.MvpHost.Wire": "[1.0.0, )"
+        }
+      },
+      "lumio.server.account": {
+        "type": "Project",
+        "dependencies": {
+          "BouncyCastle.Cryptography": "[2.6.1, )",
+          "Isopoh.Cryptography.Argon2": "[2.0.0, )"
+        }
+      },
+      "lumio.server.mvphost.admission": {
+        "type": "Project",
+        "dependencies": {
+          "Lumio.Server.Account": "[1.0.0, )"
         }
       },
       "lumio.server.mvphost.auth": {
