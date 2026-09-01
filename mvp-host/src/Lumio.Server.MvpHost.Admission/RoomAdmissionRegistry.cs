@@ -363,7 +363,11 @@ public sealed class RoomAdmissionRegistry
         }
 
         CancelExpiryLocked(existing);
-        byConnection.Remove((existing.RoomId, existing.ConnectionId));
+        if (byConnection.TryGetValue((existing.RoomId, existing.ConnectionId), out var mapped)
+            && ReferenceEquals(mapped, existing))
+        {
+            byConnection.Remove((existing.RoomId, existing.ConnectionId));
+        }
 
         existing.ConnectionId = connectionId;
         existing.ConnectionGeneration++;

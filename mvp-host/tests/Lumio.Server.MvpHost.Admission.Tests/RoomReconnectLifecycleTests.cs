@@ -62,6 +62,40 @@ public sealed class RoomReconnectLifecycleTests
     }
 
     [Fact]
+    public void WindowReconnectDoesNotUnmapAnotherAccountOnTheVacatedConnectionId()
+    {
+        var harness = new AdmissionHarness();
+        var alice = harness.AdmitAccepted(AdmissionHarness.MainRoom, "conn-1", "alice", false);
+        var aliceEntity = alice.Binding.NetEntityId;
+
+        Assert.True(harness.Registry.Disconnect(AdmissionHarness.MainRoom, "conn-1"));
+
+        var bob = harness.AdmitAccepted(AdmissionHarness.MainRoom, "conn-1", "bob", false);
+        Assert.NotEqual(aliceEntity, bob.Binding.NetEntityId);
+        Assert.Equal(1UL, bob.Binding.ConnectionGeneration);
+
+        var reconnected = harness.AdmitAccepted(AdmissionHarness.MainRoom, "conn-2", "alice", false);
+
+        Assert.Equal(aliceEntity, reconnected.Binding.NetEntityId);
+        Assert.Equal(alice.Binding.AccountId, reconnected.Binding.AccountId);
+        Assert.Equal(2UL, reconnected.Binding.ConnectionGeneration);
+
+        var bobInput = harness.Registry.TryAcceptInput(AdmissionHarness.MainRoom, "conn-1");
+        var bobAccepted = Assert.IsType<InputAdmissionOutcome.Accepted>(bobInput);
+        Assert.Equal(bob.Binding, bobAccepted.Binding);
+        Assert.True(harness.Registry.TryGetBindingByConnection(
+            AdmissionHarness.MainRoom,
+            "conn-1",
+            out var bobLive));
+        Assert.Equal(bob.Binding, bobLive);
+
+        var aliceInput = harness.Registry.TryAcceptInput(AdmissionHarness.MainRoom, "conn-2");
+        Assert.Equal(
+            reconnected.Binding,
+            Assert.IsType<InputAdmissionOutcome.Accepted>(aliceInput).Binding);
+    }
+
+    [Fact]
     public void ReconnectWithinWindowReusesEntityAndReplicationSnapshotOmitsStaleGeneration()
     {
         var harness = new AdmissionHarness();
