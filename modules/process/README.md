@@ -34,7 +34,18 @@
 
 - **输入**：命令行参数、环境变量、部署配置文件、信号、上次运行遗留的 crash marker。
 - **输出**：不可变配置快照（分发给全部模块）、分类退出码、启动/关闭 Audit 事件、Failure Bundle 触发请求。
-- **稳定接口**（未来实现的边界承诺）：`run_from_os(...) -> ExitCode` 薄入口；`ConfigSnapshot` 只读句柄；具体 `Components` 与逐模块类型化 command/event ports。初始化、健康检查和关闭由固定编排直接调用具体组件接口，不注册任意回调。
+- **稳定接口**（未来实现的边界承诺）：`run(...) -> 退出码` 薄入口（MS-00002 已按此落地，见下节）；`ConfigSnapshot` 只读句柄；具体 `Components` 与逐模块类型化 command/event ports。初始化、健康检查和关闭由固定编排直接调用具体组件接口，不注册任意回调。
+
+## 当前实现（MS-00002 Hello World 垂直切片）
+
+`lumio-server` 二进制已是可运行的专用服务器进程：动态端口 loopback WebSocket（子协议 `lumio-hello-v1`）、双会话准入、SDK DLL 加载校验、CoreCLR Runtime 桥、权威 tick 路由、NDJSON audit 与优雅关闭。wire 真值是架构仓 `engine/wire/hello-wire-v1.json`，经 `--wire-contract` 启动时装载并驱动全部限额。crate 内模块划分：`cli`（参数）、`wire`（契约装载与错误码）、`audit`（NDJSON sink）、`session`（准入状态机）、`sdk_loader`（手写 FFI：sidecar/root 表校验 + `create_clr_host`/`clr_host_call`/`destroy_clr_host`）、`runtime_bridge`（op 协议编解码与 `ClrBridge`）、`server`（transport：子协议守卫、有界 ingress 队列、reader/writer 任务）、`world`（权威循环：enqueue→tick→路由、审计、graceful shutdown）。
+
+约束与边界：
+
+- **`create_clr_host` 每进程只允许成功一次**（CoreCLR 无法卸载，二次 `initialize_for_runtime_config` 返回 0x80008081）。本模块按"启动创建一次、关闭 destroy 一次"设计，`ClrBridge` 的 Drop 序保证不重复创建。
+- 域级拒绝（`{"ok":false,"code":...}` + rc=0）映射为 wire `Error` 回执并记 `ingress_rejected` audit；FFI 层失败映射 `runtime_failure`。
+- `--client` 参数仅为集成启动器兼容而保留，本波不实现静态 HTTP 服务（启动器传空）。
+- 完整架构（host-runtime 监督、world-slot 聚合根、observability durable 管道）仍按模块规划逐步落地；本切片的 tokio 任务与定时器为过渡实现，未走监督 API。
 
 ## 上游与下游依赖
 
