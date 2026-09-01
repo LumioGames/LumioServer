@@ -29,7 +29,7 @@ public sealed record HostCommandLineOptions(
     public const string DefaultProductId = "A";
     public const string DefaultGameReleaseId = "A-1.1.0";
     public const string DefaultReleasePoolId = "pool-a-1.1";
-    public const int DefaultReconnectWindowSeconds = 120;
+    public const int DefaultReconnectWindowSeconds = 300;
 }
 
 public readonly record struct HostParseResult(

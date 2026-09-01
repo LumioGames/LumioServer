@@ -13,6 +13,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/Lumio.Server.MvpHost.Admission/Lumio.Server.MvpHost.Admission.csproj" />
+    <ProjectReference Include="../../src/Lumio.Server.MvpHost.Platform/Lumio.Server.MvpHost.Platform.csproj" />
     <ProjectReference Include="../../../account-server/src/Lumio.Server.Account/Lumio.Server.Account.csproj" />
   </ItemGroup>
   <ItemGroup>

@@ -45,7 +45,8 @@
       "lumio.server.mvphost.admission": {
         "type": "Project",
         "dependencies": {
-          "Lumio.Server.Account": "[1.0.0, )"
+          "Lumio.Server.Account": "[1.0.0, )",
+          "Lumio.Server.MvpHost.Platform": "[1.0.0, )"
         }
       },
       "lumio.server.mvphost.auth": {

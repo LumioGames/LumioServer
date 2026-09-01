@@ -1,0 +1,14 @@
+{
+  "queues": [
+    {
+      "name": "MvpAdmissionReconnectExpiryInbox",
+      "owner": "Lumio.Server.MvpHost.Admission",
+      "producer": "platform host timer",
+      "consumer": "Lumio.Server.MvpHost.Admission",
+      "ordering": "FIFO per retained NetEntityId generation",
+      "budget": "4096 items (maxBindingsPerRoom)",
+      "onFull": "drain due expiry then retry schedule; never drop a reconnect deadline",
+      "onClose": "reject new expiry delivery; the process-local window is abandoned"
+    }
+  ]
+}

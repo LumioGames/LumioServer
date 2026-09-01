@@ -41,6 +41,9 @@
           "BouncyCastle.Cryptography": "[2.6.1, )",
           "Isopoh.Cryptography.Argon2": "[2.0.0, )"
         }
+      },
+      "lumio.server.mvphost.platform": {
+        "type": "Project"
       }
     }
   }

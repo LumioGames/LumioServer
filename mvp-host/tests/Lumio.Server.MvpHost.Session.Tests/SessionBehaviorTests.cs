@@ -142,6 +142,19 @@ public sealed class SessionBehaviorTests
     }
 
     [Fact]
+    public void ProductionReconnectWindowIsFiveHostMinutes()
+    {
+        var normalized = new SessionHostConfiguration(
+            "A", "A-1.1.0", "pool-a", 0, 0, false).Normalize();
+
+        Assert.Equal(300, SessionProvisionalDefaults.ReconnectWindowSeconds);
+        Assert.Equal(SessionProvisionalDefaults.ReconnectWindowSeconds, normalized.ReconnectWindowSeconds);
+        Assert.Equal(
+            TimeSpan.FromMinutes(5),
+            TimeSpan.FromSeconds(normalized.ReconnectWindowSeconds));
+    }
+
+    [Fact]
     public void HostContractsDoesNotGrantProductionFriendAccessToSessionOrWorldSlot()
     {
         var hostContracts = typeof(IWorldSimulationPort).Assembly;
