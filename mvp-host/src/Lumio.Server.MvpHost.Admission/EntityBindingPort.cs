@@ -26,4 +26,6 @@ public static class EntityBindingPort
     public const string BindingNotFound = "binding_not_found";
     public const string StaleGeneration = "stale_generation";
     public const string NonExistent = "non_existent";
+    public const string Tombstoned = "tombstoned";
+    public const string ReplicationFullSnapshotKind = "replication.FullSnapshot";
 }

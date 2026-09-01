@@ -3,10 +3,10 @@ namespace Lumio.Server.MvpHost.Session;
 /// <summary>Session queue and reconnect defaults; values remain provisional until SRV-D measurement.</summary>
 public static class SessionProvisionalDefaults
 {
-    /// <summary>Provisional reconnect retention window in seconds.</summary>
-    public const int ReconnectWindowSeconds = 120;
+    /// <summary>Host monotonic reconnect window in seconds (C-4 five minutes).</summary>
+    public const int ReconnectWindowSeconds = 300;
 
-    /// <summary>Provisional test-profile override.</summary>
+    /// <summary>Test-profile override; production remains five minutes.</summary>
     public const int TestReconnectWindowSeconds = 10;
 
     /// <summary>Bounded session control inbox capacity.</summary>

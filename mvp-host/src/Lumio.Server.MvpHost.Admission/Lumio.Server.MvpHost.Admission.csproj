@@ -6,6 +6,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../../account-server/src/Lumio.Server.Account/Lumio.Server.Account.csproj" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Platform/Lumio.Server.MvpHost.Platform.csproj" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="lumio-mvp-host" />

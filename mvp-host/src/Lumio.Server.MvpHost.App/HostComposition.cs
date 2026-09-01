@@ -147,9 +147,18 @@ public sealed class HostComposition : IAsyncDisposable
     public static RoomAdmissionRegistry CreateRoomAdmissionRegistry(
         byte admissionKeyId,
         ReadOnlyMemory<byte> admissionPublicKey,
-        IAdmissionClock clock)
+        IAdmissionClock clock,
+        IMonotonicClock monotonic,
+        ITimerService timers,
+        int reconnectWindowSeconds)
     {
-        return RoomAdmissionFactory.Create(admissionKeyId, admissionPublicKey, clock);
+        return RoomAdmissionFactory.Create(
+            admissionKeyId,
+            admissionPublicKey,
+            clock,
+            monotonic,
+            timers,
+            reconnectWindowSeconds);
     }
 
     public static HostComposition Create(HostCommandLineOptions options)
