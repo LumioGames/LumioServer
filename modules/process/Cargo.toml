@@ -10,7 +10,10 @@ publish = false
 workspace = true
 
 [dependencies]
+ed25519-compact.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
+lumio-host-runtime = { path = "../host-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -18,8 +21,13 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 
 [[bin]]
 name = "lumio-server"
 path = "src/main.rs"
+
+[[bin]]
+name = "lumio-entity-chat-replay"
+path = "src/entity_chat_replay.rs"

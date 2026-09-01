@@ -1,0 +1,8 @@
+<Project>
+  <Target Name="ValidateEntityChatHostBuildProfile" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(TargetFramework)' != 'net10.0'"
+           Text="ENTITY_CHAT_HOST_BUILD_PROFILE: $(MSBuildProjectName) TargetFramework must be net10.0, was '$(TargetFramework)'." />
+    <Error Condition="'$(LangVersion)' != '14.0'"
+           Text="ENTITY_CHAT_HOST_BUILD_PROFILE: $(MSBuildProjectName) LangVersion must be 14.0, was '$(LangVersion)'." />
+  </Target>
+</Project>
