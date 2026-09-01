@@ -5,6 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Text.Json.Nodes;
 using System.Threading;
+using ArchUnitNET.Domain.Extensions;
+using ArchUnitNET.Loader;
 using Lumio.Server.MvpHost.HostContracts;
 using Lumio.Server.MvpHost.Platform;
 using Xunit;
@@ -13,11 +15,18 @@ namespace Lumio.Server.MvpHost.Simulation.Reference.Tests;
 
 public sealed class ReferenceWorldSimulationTests
 {
+    private static readonly ArchUnitNET.Domain.Architecture SimulationArchitecture = new ArchLoader()
+        .LoadAssemblies(typeof(ReferenceWorldSimulation).Assembly)
+        .Build();
+
     private static readonly string[] ExpectedProjectReferences =
         { "Lumio.Server.MvpHost.HostContracts" };
 
     private static readonly string[] QueueContractFields =
         { "owner", "producer", "consumer", "ordering", "budget", "onFull", "onClose" };
+
+    private static readonly string[] ForbiddenVocabulary =
+        { "Chunk", "Block", "Entity", "Component", "Ability", "Voxel", "Phase", "Tick" };
 
     [Fact]
     public void MutationSinkOnlyEnqueuesAndOwnerAppliesAtNextRunStart()
@@ -205,6 +214,58 @@ public sealed class ReferenceWorldSimulationTests
         {
             Assert.False(string.IsNullOrWhiteSpace(entry[field]!.GetValue<string>()));
         }
+    }
+
+    [Fact]
+    public void SimulationVocabularyIsEmptyTest()
+    {
+        var assembly = typeof(ReferenceWorldSimulation).Assembly;
+        Assert.Equal("Lumio.Server.MvpHost.Simulation.Reference", assembly.GetName().Name);
+
+        var offenders = assembly.GetTypes()
+            .Where(type => ForbiddenVocabulary.Any(token =>
+                type.Name.Contains(token, StringComparison.Ordinal)))
+            .Select(type => type.FullName)
+            .ToList();
+
+        Assert.Empty(offenders);
+    }
+
+    [Fact]
+    public void WorldMutationSinkIsOutOfBandTest()
+    {
+        var referenced = typeof(ReferenceWorldSimulation).Assembly
+            .GetReferencedAssemblies()
+            .Select(name => name.Name)
+            .ToArray();
+        Assert.DoesNotContain("Lumio.Server.MvpHost.Wire", referenced);
+        Assert.DoesNotContain("Lumio.Server.MvpHost.Transport", referenced);
+
+        var envelopeNames = new[] { "MvpEnvelopeWriter", "MvpEnvelopeReader" };
+        var named = SimulationArchitecture.Types
+            .SelectMany(type => type.Members.Select(member => member.FullName).Prepend(type.FullName))
+            .Where(name => name is not null && envelopeNames.Any(envelope =>
+                name.Contains(envelope, StringComparison.Ordinal)))
+            .ToList();
+        Assert.Empty(named);
+
+        var calls = SimulationArchitecture.Types
+            .SelectMany(type => type.Members)
+            .SelectMany(member => member.GetMethodCallDependencies())
+            .Where(dependency => envelopeNames.Any(envelope =>
+                (dependency.Target.FullName ?? string.Empty).Contains(envelope, StringComparison.Ordinal)
+                || (dependency.TargetMember.FullName ?? string.Empty).Contains(envelope, StringComparison.Ordinal)))
+            .Select(dependency => dependency.TargetMember.FullName)
+            .ToList();
+        Assert.Empty(calls);
+
+        var typeDependencies = SimulationArchitecture.Types
+            .SelectMany(type => type.Dependencies)
+            .Where(dependency => envelopeNames.Any(envelope =>
+                (dependency.Target.FullName ?? string.Empty).Contains(envelope, StringComparison.Ordinal)))
+            .Select(dependency => dependency.Target.FullName)
+            .ToList();
+        Assert.Empty(typeDependencies);
     }
 
     private static ReferenceWorldSimulation ReadySimulation(

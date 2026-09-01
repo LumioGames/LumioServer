@@ -635,8 +635,6 @@ public sealed class WorldSlotHost : IWorldSlotHost, IDisposable
                 return false;
             }
 
-            // No Native library is available in this MVP; NativeReady is still
-            // traversed explicitly. See absences.json ABS-WORLDSLOT-NATIVE.
             this.state = target;
             return true;
         }
@@ -1363,6 +1361,10 @@ public sealed class WorldSlotHost : IWorldSlotHost, IDisposable
 
             if (this.state == WorldSlotHostState.Bootstrapping)
             {
+                // ABS-WORLDSLOT-NATIVE: MVP has no Native library to load.
+                // NativeReady remains a distinct state; the empty load below is
+                // the explicit NativeLoaded traversal.
+                this.LoadAbsentNativeRuntimeUnsafe();
                 this.state = WorldSlotHostState.NativeReady;
             }
 
@@ -1396,6 +1398,16 @@ public sealed class WorldSlotHost : IWorldSlotHost, IDisposable
                 this.simulation.State,
                 null);
         }
+    }
+
+    private void LoadAbsentNativeRuntimeUnsafe()
+    {
+        this.observability.Trace.State(
+            null,
+            nameof(WorldSlotHostState.NativeReady),
+            this.authorityRevision,
+            this.epoch.Value,
+            null);
     }
 
     private void ObserveSimulationLifecycleUnsafe()
@@ -1825,6 +1837,7 @@ public sealed class WorldSlotHost : IWorldSlotHost, IDisposable
 
                 this.pacingStopped = true;
                 this.tickPermitQueue.Close();
+                this.timers.Cancel(default);
 
                 this.state = WorldSlotHostState.Stopping;
                 if (!this.PublishEventUnsafe(new WorldSlotEvent.ReadyToStop(this.epoch)))
