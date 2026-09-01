@@ -20,6 +20,7 @@ mod admission;
 mod clr;
 mod crypto;
 mod discover;
+mod envelope;
 mod gameplay;
 mod host;
 mod suite;
@@ -31,6 +32,7 @@ pub use admission::{
 };
 pub use clr::{ClrGameplay, ClrGameplayConfig};
 pub use discover::{discover, ReplayArtifacts};
+pub use envelope::{CommandBlock, InputCommand, CHAT_INPUT_MAPPING, MESSAGE_TYPE};
 pub use gameplay::{
     ChatMessageEvent, ChatOpKind, ChatOperation, ChatPersistEntity, ChatPersistSnapshot,
     ChatTickResult, GameplayWorld, LocalGameplay,

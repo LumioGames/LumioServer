@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use super::account::{login_or_register, AccountServerProcess};
 use super::admission::{generate_keys, issue_bot_tool_credential, verify_admission};
 use super::clr::{ClrGameplay, ClrGameplayConfig};
+use super::envelope::InputCommand;
 use super::gameplay::{ChatOpKind, LocalGameplay};
 use super::host::{
     AttributeQueryOutcome, AttributeQueryRequest, AttributeQueryScope, BoundEntityKind,
@@ -368,10 +369,18 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         }),
     );
 
+    let mut first_envelope: Option<InputCommand> = None;
     for (connection, name) in &connections {
-        let _ = host.admit_chat_input(connection.clone(), format!("hello-{name}"));
+        let command = InputCommand::from_chat_text(&format!("hello-{name}"));
+        if first_envelope.is_none() {
+            first_envelope = Some(command.clone());
+        }
+        let _ = host.admit_chat_input(connection.clone(), command);
     }
-    let _ = host.admit_chat_input("c-browser".to_owned(), "hello-browser".to_owned());
+    let _ = host.admit_chat_input(
+        "c-browser".to_owned(),
+        InputCommand::from_chat_text("hello-browser"),
+    );
     let tick = host.run_tick(MAIN_ROOM.to_owned());
     let window = host.client_chat_window("c-browser".to_owned());
     let chat_ok = window.len() == 101 && tick.applied_tick == 1;
@@ -385,12 +394,19 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         })
         .collect();
     let applied_ticks: Vec<u64> = window.iter().map(|ev| ev.applied_tick).collect();
+    let first_block = first_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.commands.first());
     scenarios.insert(
         "6".to_owned(),
         json!({
             "ok": chat_ok,
             "eventCount": window.len(),
             "appliedTick": tick.applied_tick,
+            "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
+            "mappingId": first_block.map(|block| block.mapping_id.as_str()),
+            "payload": first_block.map(|block| block.payload.as_str()),
+            "payloadSha256": first_block.map(|block| block.payload_sha256.as_str()),
         }),
     );
 
@@ -424,8 +440,14 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
 
     let entity_a = host.must_self("c-bot100").net_entity_id;
     assert!(host.disconnect("c-bot100".to_owned()));
-    let rejected = host.admit_chat_input("c-bot100".to_owned(), "while-down".to_owned());
-    let _ = host.admit_chat_input("c-browser".to_owned(), "room-continues".to_owned());
+    let rejected = host.admit_chat_input(
+        "c-bot100".to_owned(),
+        InputCommand::from_chat_text("while-down"),
+    );
+    let _ = host.admit_chat_input(
+        "c-browser".to_owned(),
+        InputCommand::from_chat_text("room-continues"),
+    );
     let _ = host.run_tick(MAIN_ROOM.to_owned());
     let re_login = login_or_register(&account.uri(), "Bot100", TEST_PASSWORD, Some(&bot_claim))
         .await
@@ -508,7 +530,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             {
                 let _ = host.admit(ISO_ROOM.to_owned(), "iso-a".to_owned(), cred_a);
                 let _ = host.admit(ISO_ROOM.to_owned(), "iso-b".to_owned(), cred_b);
-                let _ = host.admit_chat_input("iso-a".to_owned(), "iso-only".to_owned());
+                let _ = host
+                    .admit_chat_input("iso-a".to_owned(), InputCommand::from_chat_text("iso-only"));
                 let _ = host.run_tick(ISO_ROOM.to_owned());
                 let cross = host.query_attribute(AttributeQueryRequest {
                     caller_scope: AttributeQueryScope::ServerAuthoritative,
