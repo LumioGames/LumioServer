@@ -411,7 +411,12 @@ public sealed class RoomAdmissionRegistry
     {
         CancelExpiryLocked(live);
         byAccount.Remove(live.AccountId);
-        byConnection.Remove((live.RoomId, live.ConnectionId));
+        if (byConnection.TryGetValue((live.RoomId, live.ConnectionId), out var mapped)
+            && ReferenceEquals(mapped, live))
+        {
+            byConnection.Remove((live.RoomId, live.ConnectionId));
+        }
+
         byNetEntity.Remove((live.RoomId, live.NetEntityId));
         roomCounts[live.RoomId] = Math.Max(0, RoomCount(live.RoomId) - 1);
         tombstones.Add(live.NetEntityId);
