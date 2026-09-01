@@ -11,6 +11,7 @@ use lumio_host_runtime::{
 use super::admission::{
     classify_entity_kind, is_bot_namespace, verify_admission, AdmissionPayload,
 };
+use super::envelope::InputCommand;
 use super::gameplay::{
     ChatMessageEvent, ChatOperation, ChatPersistEntity, ChatPersistSnapshot, ChatTickResult,
     GameplayWorld,
@@ -338,10 +339,10 @@ impl EntityChatHost {
         self.on_owner(Inner::expire_due)
     }
 
-    /// Queues text-only ChatInput for the next tick.
+    /// Decodes a frozen InputCommand (chat.input) envelope, then queues ChatInput.
     #[must_use]
-    pub fn admit_chat_input(&self, connection_id: String, text: String) -> ChatOperation {
-        self.on_owner(move |inner| inner.admit_chat_input(&connection_id, &text))
+    pub fn admit_chat_input(&self, connection_id: String, envelope: InputCommand) -> ChatOperation {
+        self.on_owner(move |inner| inner.admit_chat_input(&connection_id, &envelope))
     }
 
     /// Runs one fixed tick in `room_id`.
@@ -585,7 +586,11 @@ impl Inner {
         }
     }
 
-    fn admit_chat_input(&mut self, connection_id: &str, text: &str) -> ChatOperation {
+    fn admit_chat_input(&mut self, connection_id: &str, envelope: &InputCommand) -> ChatOperation {
+        let text = match envelope.try_decode_chat_text() {
+            Ok(text) => text,
+            Err(code) => return ChatOperation::rejected(code),
+        };
         self.expire_due();
         let Some(account_id) = self.by_connection.get(connection_id) else {
             return ChatOperation::rejected("disconnected");
@@ -598,7 +603,7 @@ impl Inner {
         }
         let room_id = live.room_id.clone();
         let net_entity_id = live.net_entity_id;
-        self.gameplay.admit_chat(&room_id, net_entity_id, text)
+        self.gameplay.admit_chat(&room_id, net_entity_id, &text)
     }
 
     fn run_tick(&mut self, room_id: &str) -> ChatTickResult {
@@ -905,7 +910,7 @@ mod tests {
     use super::*;
     use crate::entity_chat::admission::{generate_keys, issue_admission_credential};
     use crate::entity_chat::gameplay::{ChatOpKind, LocalGameplay};
-    use crate::entity_chat::{ADMISSION_KEY_ID, RECONNECT_WINDOW_MS};
+    use crate::entity_chat::{InputCommand, ADMISSION_KEY_ID, RECONNECT_WINDOW_MS};
 
     fn host_with(keys: &crate::entity_chat::Ed25519KeyPair) -> EntityChatHost {
         EntityChatHost::new(
@@ -972,7 +977,10 @@ mod tests {
         );
         let entity_a = host.must_self("c-bot01").net_entity_id;
         assert!(host.disconnect("c-bot01".to_owned()));
-        let rejected = host.admit_chat_input("c-bot01".to_owned(), "while-down".to_owned());
+        let rejected = host.admit_chat_input(
+            "c-bot01".to_owned(),
+            InputCommand::from_chat_text("while-down"),
+        );
         assert_eq!(rejected.kind, ChatOpKind::Rejected);
         let rebind = host.admit(
             "room-main".to_owned(),
