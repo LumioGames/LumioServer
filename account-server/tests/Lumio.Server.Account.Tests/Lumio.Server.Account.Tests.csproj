@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AccountServerProductionProject>false</AccountServerProductionProject>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Lumio.Server.Account.Tests</RootNamespace>
+    <AssemblyName>Lumio.Server.Account.Tests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Lumio.Server.Account/Lumio.Server.Account.csproj" />
+    <ProjectReference Include="../../src/Lumio.Server.Account.App/Lumio.Server.Account.App.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../contract/account-port-v1.json" Link="contract/account-port-v1.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,5 @@
+architectureCommit=2b7e3219a980946d2296f1fbf780a4cb854759f9
+path=engine/wire/account-port-v1.json
+contractId=lumio.account-port.v1
+sha256=29466228ee40b2a22b9cd924235acc7da9c3398b0d77777e655e32ab550bee9b
+adr=ADR-054-account-server-topology-and-port.md
