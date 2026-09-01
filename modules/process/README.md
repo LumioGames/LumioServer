@@ -36,6 +36,10 @@
 - **输出**：不可变配置快照（分发给全部模块）、分类退出码、启动/关闭 Audit 事件、Failure Bundle 触发请求。
 - **稳定接口**（未来实现的边界承诺）：`run(...) -> 退出码` 薄入口（MS-00002 已按此落地，见下节）；`ConfigSnapshot` 只读句柄；具体 `Components` 与逐模块类型化 command/event ports。初始化、健康检查和关闭由固定编排直接调用具体组件接口，不注册任意回调。
 
+## 当前实现（R-00359 切片级 entity-chat Rust host）
+
+`entity_chat` 模块是本切片的最小 Rust host：`host-runtime` 监督的 Simulation Owner Thread、有界 owner/ingress 队列、对 Account Server 准入凭证的离线验签、Room world-slot（绑定/五分钟重连/过期墓碑/隔离）、以及经 CoreCLR 加载的同一份 C# `ChatRoomWorld`。不扩展 `hello-wire-v1`。验收是 `integration/entity-chat` 的 11 场景原样复跑。
+
 ## 当前实现（MS-00002 Hello World 垂直切片）
 
 `lumio-server` 二进制已是可运行的专用服务器进程：动态端口 loopback WebSocket（子协议 `lumio-hello-v1`）、双会话准入、SDK DLL 加载校验、CoreCLR Runtime 桥、权威 tick 路由、NDJSON audit 与优雅关闭。wire 真值是架构仓 `engine/wire/hello-wire-v1.json`，经 `--wire-contract` 启动时装载并驱动全部限额。crate 内模块划分：`cli`（参数）、`wire`（契约装载与错误码）、`audit`（NDJSON sink）、`session`（准入状态机）、`sdk_loader`（手写 FFI：sidecar/root 表校验 + `create_clr_host`/`clr_host_call`/`destroy_clr_host`）、`runtime_bridge`（op 协议编解码与 `ClrBridge`）、`server`（transport：子协议守卫、有界 ingress 队列、reader/writer 任务）、`world`（权威循环：enqueue→tick→路由、审计、graceful shutdown）。

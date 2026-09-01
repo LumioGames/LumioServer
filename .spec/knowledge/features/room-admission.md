@@ -8,7 +8,7 @@ metadata:
 
 # Room 准入与绑定登记
 
-`mvp-host` 的 `Lumio.Server.MvpHost.Admission` 是 RM-00011 在 C# MVP 宿主上的 Room 准入与连接绑定登记：离线 `verify_admission`、Player/Bot 分类、五元组绑定、顶号重绑、五分钟断线保留与 Room 隔离。它是 Host 身份面，不是第二套 ECS。
+`mvp-host` 的 `Lumio.Server.MvpHost.Admission` 是 RM-00011 在 C# MVP 宿主上的 Room 准入与连接绑定登记：离线 `verify_admission`、Player/Bot 分类、五元组绑定、顶号重绑、五分钟断线保留与 Room 隔离。它是 Host 身份面，不是第二套 ECS。R-00359 通过后该 C# MVP 面冻结为 reference；切片交付宿主是 Rust `entity_chat` world-slot。
 
 ## 背景 / 目标
 

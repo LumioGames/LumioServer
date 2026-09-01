@@ -12,6 +12,7 @@
 
 pub mod audit;
 pub mod cli;
+pub mod entity_chat;
 pub mod runtime_bridge;
 pub mod sdk_loader;
 pub mod server;

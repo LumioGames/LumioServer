@@ -157,6 +157,11 @@ impl ClrBridge {
         Ok(Self { lease, handle })
     }
 
+    /// One JSON op call used by hello-wire and the entity-chat gameplay bridge.
+    pub(crate) fn invoke_json(&mut self, request: &str) -> Result<String, BridgeError> {
+        self.call(request)
+    }
+
     /// One op call: send `request`, return the response body.
     fn call(&mut self, request: &str) -> Result<String, BridgeError> {
         let mut output = vec![0_u8; OUTPUT_BUFFER_BYTES];

@@ -82,6 +82,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed25519-compact"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f05391a505666bdf2b5d2626f41b7f0f49052b1e33cceac960eaa818008141da"
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -232,6 +238,10 @@ version = "0.0.0"
 source = "git+https://github.com/LumioGames/LumioGameEngineArchitecture?rev=3d5e29db72b70c88fb61e392832afe2a762b25cb#3d5e29db72b70c88fb61e392832afe2a762b25cb"
 
 [[package]]
+name = "lumio-host-runtime"
+version = "0.1.0"
+
+[[package]]
 name = "lumio-host-testkit"
 version = "0.1.0"
 
@@ -239,7 +249,10 @@ version = "0.1.0"
 name = "lumio-server-process"
 version = "0.1.0"
 dependencies = [
+ "ed25519-compact",
  "futures-util",
+ "getrandom",
+ "lumio-host-runtime",
  "serde",
  "serde_json",
  "sha2",

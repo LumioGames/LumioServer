@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/lumio-host-testkit",
     "generated/lumio-architecture-contracts",
+    "modules/host-runtime",
     "modules/process",
     "tools/xtask",
 ]
@@ -15,7 +16,9 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+ed25519-compact = { version = "2.1.1", default-features = false, features = ["std"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+getrandom = "0.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"

@@ -8,7 +8,7 @@
 | 架构基线 BaselineId | `LGE-V1.4-2026-08-27` |
 | 来源需求 | R-00260（RM-00006 / MS-00001，P0） |
 | 设计真值 | [`../docs/specs/2026-08-28-mvp-csharp-host-design.md`](../docs/specs/2026-08-28-mvp-csharp-host-design.md) |
-| **退场条件** | **Rust Dedicated Host 主线（51 张 Rust 卡）交付后，本目录整体删除。** |
+| **退场条件** | **R-00359 切片级 Rust host 验收通过后，本目录冻结为 reference，不再作为 entity-chat 切片的交付宿主；整目录删除仍等到 51 张 Rust 主线。Hello 归档不得删除。** |
 
 ## 范围
 
