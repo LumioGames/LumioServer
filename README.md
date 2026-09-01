@@ -46,6 +46,8 @@ Runtime 拥有 Logical Tick、GameWorld 和 Coordinator；VoxelEngine 拥有 Vox
 | [`host-profiles`](modules/host-profiles/README.md) | Capability/Preset、LocalEmbedded 保真、DS/Split/Bot 测试 Host 组装 | P1 |
 | [`protocol-dispatch`](modules/protocol-dispatch/README.md) | 生成式消息分发边界（公共契约 D-009 冻结前封锁） | 封锁 |
 
+独立进程（不属于上表 15 个 Host crate）：[`account-server/`](account-server/README.md) 实现 `lumio.account-port.v1` login-or-register、AccountEntity 与准入凭证签发。
+
 ## 职责
 
 - 启动配置、Endpoint、WorldSlot、健康检查、资源预算、Watchdog、日志和 Metrics。
@@ -150,6 +152,7 @@ lumio-server / LocalEmbedded ServerRoleHost
 - Release Catalog、Hash/Signature/Capability 拒绝、滚动更新、Drain、强制踢人和 Rollback。
 - Snapshot/WAL 恢复、磁盘满、OOM、CoreCLR/ALC/Native 故障、日志背压和 Failure Bundle。
 - 1/10/25/50/100/150/200 玩家 Workload，记录 Tick p50/p95/p99、CPU、RSS、GC、队列和网络。
+- Account Server login-or-register、Bot 命名空间四触点、账号库跨重启 AccountId 稳定、准入凭证解形/验签。
 
 ## Version / Manifest
 
