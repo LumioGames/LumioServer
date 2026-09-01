@@ -278,8 +278,17 @@ public sealed class ServerConnectionSession
         lastAcknowledgedDeltaToRevision = null;
     }
 
+    /// <summary>
+    /// Legal MVP transitions. <see cref="ServerConnectionSessionState.Faulted"/> is
+    /// modeled but unreachable here (absences.json <c>ABS-SESSION-FAULTED-UNREACHABLE</c>).
+    /// </summary>
     internal static bool IsAllowed(ServerConnectionSessionState from, ServerConnectionSessionState to)
     {
+        if (to == ServerConnectionSessionState.Faulted)
+        {
+            return false;
+        }
+
         if (to == ServerConnectionSessionState.Closed
             && from is not ServerConnectionSessionState.Closed
             and not ServerConnectionSessionState.Expired
