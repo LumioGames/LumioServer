@@ -1840,7 +1840,7 @@ public sealed class WorldSlotHost : IWorldSlotHost, IDisposable
                 this.timers.Cancel(default);
 
                 this.state = WorldSlotHostState.Stopping;
-                if (!this.TryPublishPrimaryUnsafe(new WorldSlotEvent.ReadyToStop(this.epoch)))
+                if (!this.PublishEventUnsafe(new WorldSlotEvent.ReadyToStop(this.epoch)))
                 {
                     throw new InvalidOperationException();
                 }
@@ -2072,18 +2072,6 @@ public sealed class WorldSlotHost : IWorldSlotHost, IDisposable
             ? AdmissionGateState.Closed
             : previous;
         return false;
-    }
-
-    private bool TryPublishPrimaryUnsafe(in WorldSlotEvent evt)
-    {
-        try
-        {
-            return this.eventOutbox.TryPublish(in evt).Status == EnqueueStatus.Accepted;
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     private bool PublishEventUnsafe(WorldSlotEvent evt)

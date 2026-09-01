@@ -820,6 +820,35 @@ public sealed class WorldSlotFocusedTests
     }
 
     [Fact]
+    public void QuiesceReadyToStopUsesTerminalReserveWhenPrimaryIsFull()
+    {
+        using var harness = new Harness(eventCapacity: 2);
+        harness.StartRunning();
+
+        var result = harness.Host.Quiesce("shutdown", harness.Host.Epoch);
+
+        Assert.True(result.Accepted);
+        Assert.Equal(WorldSlotHostState.Stopping, harness.Host.State);
+        Assert.NotEqual(WorldSlotHostState.Faulted, harness.Host.State);
+        Assert.Equal(AdmissionGateState.Closed, harness.Host.Gate);
+        Assert.Equal(QuiesceAckNames, harness.Trace.Acks.Select(ack => ack.Effect));
+
+        var events = new List<WorldSlotEvent>();
+        while (harness.Host.TryDequeueEvent(out var evt))
+        {
+            events.Add(evt);
+        }
+
+        Assert.Contains(events, evt => evt is WorldSlotEvent.GateStateChanged);
+        Assert.Contains(events, evt => evt is WorldSlotEvent.Quiesced);
+        Assert.Contains(events, evt => evt is WorldSlotEvent.ReadyToStop);
+
+        var source = ReadWorldSlotHostSource();
+        Assert.Contains("PublishEventUnsafe(new WorldSlotEvent.ReadyToStop", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("TryPublishPrimaryUnsafe", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ReservedCommandsUseEmergencyLaneWhenInboxIsFull()
     {
         using var harness = new Harness(aggregateCapacity: 64);
@@ -1154,13 +1183,14 @@ public sealed class WorldSlotFocusedTests
             this.EventInbox = PlatformModule.CreateInbox<WorldSlotEvent>(new QueueBudget(eventCapacity, 65_536));
             this.EventFilter = new FilteringOutbox(PlatformModule.CreateOutbox(this.EventInbox));
             this.Trace = new RecordingHostTraceSink();
+            this.TraceControl = new ControllableHostTraceSink(this.Trace);
             var audit = PlatformModule.CreateInbox<AuditRecord>(new QueueBudget(16, 65_536));
             var diagnostics = PlatformModule.CreateInbox<DiagnosticRecord>(new QueueBudget(16, 65_536));
             this.Observability = ObservabilityModule.Create(
                 audit,
                 diagnostics,
                 new FakeWallClock("2026-08-30T00:00:00Z"),
-                this.Trace,
+                this.TraceControl,
                 new HostIdentity("A", "A-1", "worldslot-tests"));
             this.Host = WorldSlotHost.Create(
                 this.Simulation,
@@ -1191,6 +1221,8 @@ public sealed class WorldSlotFocusedTests
 
         internal RecordingHostTraceSink Trace { get; }
 
+        internal ControllableHostTraceSink TraceControl { get; }
+
         internal ObservabilityServices Observability { get; }
 
         internal WorldSlotHost Host { get; }
@@ -1218,7 +1250,7 @@ public sealed class WorldSlotFocusedTests
                     this.Timers.ThrowOnCancel = true;
                     break;
                 case QuiesceFailureStep.Stop:
-                    this.EventFilter.RejectOnce(typeof(WorldSlotEvent.ReadyToStop));
+                    this.TraceControl.ThrowOnAck = "Stopped";
                     break;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(step), step, null);
@@ -1403,5 +1435,39 @@ public sealed class WorldSlotFocusedTests
         }
 
         public void Dispose() => this.inner.Dispose();
+    }
+
+    internal sealed class ControllableHostTraceSink : IHostTraceSink
+    {
+        private readonly RecordingHostTraceSink inner;
+
+        internal ControllableHostTraceSink(RecordingHostTraceSink inner) => this.inner = inner;
+
+        internal string? ThrowOnAck { get; set; }
+
+        public void Audit(in AuditRecord record) => this.inner.Audit(in record);
+
+        public void Ack(
+            string effect,
+            ulong? admissionAttemptId,
+            ulong? slotEpoch,
+            ulong? connectionEpoch)
+        {
+            if (this.ThrowOnAck is not null
+                && string.Equals(this.ThrowOnAck, effect, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("stopped-ack");
+            }
+
+            this.inner.Ack(effect, admissionAttemptId, slotEpoch, connectionEpoch);
+        }
+
+        public void State(
+            string? sessionId,
+            string? sessionState,
+            ulong? authorityRevision,
+            ulong? slotEpoch,
+            ulong? grantEpoch)
+            => this.inner.State(sessionId, sessionState, authorityRevision, slotEpoch, grantEpoch);
     }
 }
