@@ -19,7 +19,8 @@ Game Server 只在 Account Server 准入凭证验证通过后才为连接分配�
 - **verify_admission**：进程内端口。`AccountAdmissionVerifier` 调用 `account-server` 的 `AdmissionCredential.Verify`，不重写 Ed25519，也不接受用户名/口令。
 - **分类**：`^Bot[0-9]+$` 且 `botToolContext=true` → Bot；否则 Player。Bot 命名空间且无工具上下文 → `bot_namespace_admission_forbidden`。
 - **绑定五元组**：`{accountId, roomId, netEntityId, entityType: player|bot, connectionGeneration}`。AccountId 只作为身份属性值；记录不携带 AccountEntity 对象引用。
-- **顶号**：同一账号第二条已认证准入踢旧连接，发出 `TakeoverNotice`（`reasonCode=connection_superseded`），同 Room 重绑同一 `NetEntityId` 且 `connectionGeneration` 严格递增。
+- **顶号**：仅当该 AccountId 已在**请求的同一 Room** 有活跃绑定（或同一连接的幂等重复）时才顶号：踢旧连接、发出 `TakeoverNotice`（`reasonCode=connection_superseded`）、重绑同一 `NetEntityId` 且 `connectionGeneration` 严格递增。
+- **跨 Room**：已在另一 Room 存活的 AccountId 再 `Admit` 到不同 Room → `invalid_request` 拒绝。原 Room 绑定、`NetEntityId`、`connectionGeneration` 不变，旧连接不踢、不解绑、不分配新实体、不做跨 World 转移。
 - **隔离**：解析与列表均限定单一 Room；对他 Room 实体返回 `cross_room_reference`。
 - **组装**：`Lumio.Server.MvpHost.App` 经 `HostComposition.CreateRoomAdmissionRegistry` 接线。契约真值是架构仓 `engine/wire/entity-binding-and-query-v1.json`（本仓镜像 `mvp-host/contract/`）。
 

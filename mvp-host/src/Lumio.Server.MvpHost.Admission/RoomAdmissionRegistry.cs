@@ -197,6 +197,11 @@ public sealed class RoomAdmissionRegistry
                 return new RoomAdmitOutcome.Accepted(existing.ToBinding(), null, null);
             }
 
+            if (!string.Equals(existing.RoomId, roomId, StringComparison.Ordinal))
+            {
+                return new RoomAdmitOutcome.Rejected(EntityBindingPort.InvalidRequest);
+            }
+
             return TakeoverLocked(roomId, connectionId, existing);
         }
 
@@ -218,7 +223,7 @@ public sealed class RoomAdmissionRegistry
         return new RoomAdmitOutcome.Accepted(created.ToBinding(), null, null);
     }
 
-    private RoomAdmitOutcome TakeoverLocked(string roomId, string connectionId, LiveBinding existing)
+    private RoomAdmitOutcome.Accepted TakeoverLocked(string roomId, string connectionId, LiveBinding existing)
     {
         var superseded = existing.ConnectionId;
         var notice = new TakeoverNotice(
@@ -229,34 +234,10 @@ public sealed class RoomAdmissionRegistry
         terminationNotices[superseded] = notice;
         byConnection.Remove((existing.RoomId, existing.ConnectionId));
 
-        if (string.Equals(existing.RoomId, roomId, StringComparison.Ordinal))
-        {
-            existing.ConnectionId = connectionId;
-            existing.ConnectionGeneration++;
-            byConnection[(roomId, connectionId)] = existing;
-            return new RoomAdmitOutcome.Accepted(existing.ToBinding(), notice, superseded);
-        }
-
-        byNetEntity.Remove((existing.RoomId, existing.NetEntityId));
-        DecrementRoom(existing.RoomId);
-        byAccount.Remove(existing.AccountId);
-
-        if (RoomCount(roomId) >= EntityBindingPort.MaxBindingsPerRoom)
-        {
-            return new RoomAdmitOutcome.Rejected(EntityBindingPort.InvalidRequest);
-        }
-
-        var moved = new LiveBinding
-        {
-            AccountId = existing.AccountId,
-            RoomId = roomId,
-            NetEntityId = AllocateNetEntityId(),
-            EntityType = existing.EntityType,
-            ConnectionGeneration = 1,
-            ConnectionId = connectionId,
-        };
-        Attach(moved);
-        return new RoomAdmitOutcome.Accepted(moved.ToBinding(), notice, superseded);
+        existing.ConnectionId = connectionId;
+        existing.ConnectionGeneration++;
+        byConnection[(roomId, connectionId)] = existing;
+        return new RoomAdmitOutcome.Accepted(existing.ToBinding(), notice, superseded);
     }
 
     private void Attach(LiveBinding live)
@@ -266,14 +247,6 @@ public sealed class RoomAdmissionRegistry
         byNetEntity[(live.RoomId, live.NetEntityId)] = live;
         netEntityHomeRoom[live.NetEntityId] = live.RoomId;
         roomCounts[live.RoomId] = RoomCount(live.RoomId) + 1;
-    }
-
-    private void DecrementRoom(string roomId)
-    {
-        if (roomCounts.TryGetValue(roomId, out var count) && count > 0)
-        {
-            roomCounts[roomId] = count - 1;
-        }
     }
 
     private int RoomCount(string roomId)
