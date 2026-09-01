@@ -35,6 +35,7 @@
     <ProjectReference Include="../Lumio.Server.MvpHost.WorldSlot/Lumio.Server.MvpHost.WorldSlot.csproj" Condition="Exists('../Lumio.Server.MvpHost.WorldSlot/Lumio.Server.MvpHost.WorldSlot.csproj')" />
     <ProjectReference Include="../Lumio.Server.MvpHost.Simulation.Reference/Lumio.Server.MvpHost.Simulation.Reference.csproj" Condition="Exists('../Lumio.Server.MvpHost.Simulation.Reference/Lumio.Server.MvpHost.Simulation.Reference.csproj')" />
     <ProjectReference Include="../Lumio.Server.MvpHost.Session/Lumio.Server.MvpHost.Session.csproj" Condition="Exists('../Lumio.Server.MvpHost.Session/Lumio.Server.MvpHost.Session.csproj')" />
+    <ProjectReference Include="../Lumio.Server.MvpHost.Admission/Lumio.Server.MvpHost.Admission.csproj" />
     <ProjectReference Include="../../../../LumioGameEngineArchitecture/engine/managed/Lumio.Engine.SDK/Lumio.Engine.SDK.csproj" />
   </ItemGroup>
 

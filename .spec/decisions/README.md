@@ -29,3 +29,4 @@
 | 编号 | 决策 | 状态 |
 |------|------|------|
 | [0001](0001-gate-review-remediation.md) | 按架构门审退回结论重构模块边界(聚合根收权 + 控制面收缩 + host-runtime 新设) | 生效 |
+| [0002](0002-room-admission-host-binding-registry.md) | Room 准入做成 Host 绑定登记，不引入第二套 ECS | 生效 |

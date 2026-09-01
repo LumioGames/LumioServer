@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Lumio.Server.MvpHost.Admission;
 using Lumio.Server.MvpHost.Auth;
 using Lumio.Server.MvpHost.HostContracts;
 using Lumio.Server.MvpHost.Observability;
@@ -141,6 +142,14 @@ public sealed class HostComposition : IAsyncDisposable
             return NeverCompletingTask;
 #endif
         }
+    }
+
+    public static RoomAdmissionRegistry CreateRoomAdmissionRegistry(
+        byte admissionKeyId,
+        ReadOnlyMemory<byte> admissionPublicKey,
+        IAdmissionClock clock)
+    {
+        return RoomAdmissionFactory.Create(admissionKeyId, admissionPublicKey, clock);
     }
 
     public static HostComposition Create(HostCommandLineOptions options)

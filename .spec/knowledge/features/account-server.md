@@ -24,10 +24,11 @@ metadata:
 
 ## 待解决
 
-- Game Server 的 `verify_admission` 端口与顶号（R-00346 / R-00350）不在本进程。
+- 重连保留窗与过期销毁（R-00350）仍不在本进程。
 - 生产口令策略、在线吊销、非环回暴露的访问控制面。
 
 ## 相关
 
 - 契约：架构仓 `engine/wire/account-port-v1.json`、ADR-054
 - 实现：[`account-server/`](../../../account-server/README.md)
+- Game Server 消费：[`room-admission.md`](room-admission.md)（进程内 `verify_admission`）

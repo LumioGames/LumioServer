@@ -1,0 +1,5 @@
+architectureCommit=fb3dca451aef5b392876e284ba871b05e58186bb
+path=engine/wire/entity-binding-and-query-v1.json
+contractId=lumio.entity-binding-query.v1
+sha256=0cff8d3d15ff94f3e80939f72aae58eee14456a263277d4f82652eb5a17b726a
+adr=ADR-053-entity-binding-and-attribute-query.md

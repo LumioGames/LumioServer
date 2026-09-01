@@ -56,6 +56,21 @@ internal static class BuildGraph
             }
         }
 
+        // verify_admission lives in account-server; Game Server consumes that
+        // assembly in-process. Including the library (not App/Tests) keeps
+        // LayeringTest's extra-graph assertion intact instead of weakening it.
+        var accountLibrary = Path.GetFullPath(Path.Combine(
+            MvpHostRoot,
+            "..",
+            "account-server",
+            "src",
+            "Lumio.Server.Account",
+            "Lumio.Server.Account.csproj"));
+        if (File.Exists(accountLibrary))
+        {
+            nodes.Add(Parse(accountLibrary));
+        }
+
         return nodes.OrderBy(n => n.Name, StringComparer.Ordinal).ToList();
     }
 
