@@ -2,8 +2,12 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Globalization;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Lumio.Server.Account;
+using Lumio.Server.MvpHost.Admission;
 using Lumio.Server.MvpHost.Auth;
 using Lumio.Server.MvpHost.HostContracts;
 using Lumio.Server.MvpHost.Observability;
@@ -27,8 +31,11 @@ internal sealed class FullGraphComposition : IAsyncDisposable
     private const int MaxMessageBytes = 65_536;
     private const int MaxFragmentBytes = 4_096;
     private const int AntiReplayWindow = 1_024;
-    private const int MaxConnections = 64;
-    private const int MaxSessions = 64;
+    private const int MaxConnections = 128;
+    private const int MaxSessions = 128;
+    internal const string ProductionRoomId = "room-main";
+    internal const string AdmissionPublicKeyEnv = "LUMIO_ACCOUNT_ADMISSION_PUBLIC_KEY_HEX";
+    internal const string AdmissionKeyIdEnv = "LUMIO_ACCOUNT_ADMISSION_KEY_ID";
     // The carrier facade waits only on the wrapper task.  It never cancels the
     // underlying WebSocket receive, because cancellation aborts Kestrel sockets.
     private static readonly TimeSpan CarrierPollInterval = TimeSpan.FromMilliseconds(25);
@@ -46,6 +53,8 @@ internal sealed class FullGraphComposition : IAsyncDisposable
     private readonly MultiplexedIngress worldIngress;
     private readonly INamedThreadSupervisor threads;
     private readonly IHostTraceSink trace;
+    private readonly RoomAdmissionRegistry admission;
+    private readonly AdmissionCredentialCapture capture;
     private readonly Dictionary<ulong, ActiveConnection> connections = new();
     private readonly object sessionsGate = new();
     private readonly TaskCompletionSource<object?> faultSignal = new(
@@ -69,7 +78,9 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         IBoundedInbox<WorldSlotEvent> worldEvents,
         MultiplexedIngress worldIngress,
         INamedThreadSupervisor threads,
-        IHostTraceSink trace)
+        IHostTraceSink trace,
+        RoomAdmissionRegistry admission,
+        AdmissionCredentialCapture capture)
     {
         this.productId = productId;
         this.gameReleaseId = gameReleaseId;
@@ -84,6 +95,8 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         this.worldIngress = worldIngress;
         this.threads = threads;
         this.trace = trace;
+        this.admission = admission;
+        this.capture = capture;
     }
 
     internal string BoundUri => carrier.BoundUri;
@@ -113,6 +126,21 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(faultPolicy);
         ArgumentNullException.ThrowIfNull(trace);
 
+        var admissionClock = new SystemAdmissionClock();
+        var (admissionKeyId, admissionPublicKey) = ResolveAdmissionSigningKey();
+        var admission = HostComposition.CreateRoomAdmissionRegistry(
+            admissionKeyId,
+            admissionPublicKey,
+            admissionClock,
+            clock,
+            timers,
+            Math.Max(1, options.ReconnectWindowSeconds));
+        var capture = new AdmissionCredentialCapture();
+        var channelVerifier = new ChannelAdmissionVerifier(
+            verifier,
+            new AccountAdmissionVerifier(admissionKeyId, admissionPublicKey, admissionClock),
+            capture);
+
         var carrierOptions = new WebSocketCarrierOptions(
             options.ListenUri,
             options.ListenUri.StartsWith("wss://", StringComparison.OrdinalIgnoreCase),
@@ -126,7 +154,7 @@ internal sealed class FullGraphComposition : IAsyncDisposable
             HostCommandLineOptions.DefaultReleasePoolId);
         var carrier = WebSocketByteCarrier.Create(
             in carrierOptions,
-            verifier,
+            channelVerifier,
             antiReplay,
             clock,
             timers,
@@ -230,7 +258,135 @@ internal sealed class FullGraphComposition : IAsyncDisposable
             worldEvents,
             worldIngress,
             threads,
-            trace);
+            trace,
+            admission,
+            capture);
+    }
+
+    internal static bool TryAdmitLiveWebsocketClient(
+        RoomAdmissionRegistry registry,
+        string roomId,
+        string connectionId,
+        string admissionCredential,
+        out ConnectionBinding binding)
+    {
+        ArgumentNullException.ThrowIfNull(registry);
+        ArgumentNullException.ThrowIfNull(roomId);
+        ArgumentNullException.ThrowIfNull(connectionId);
+        ArgumentNullException.ThrowIfNull(admissionCredential);
+
+        binding = default;
+        if (registry.Admit(roomId, connectionId, admissionCredential) is not RoomAdmitOutcome.Accepted)
+        {
+            return false;
+        }
+
+        return registry.TryGetBindingByConnection(roomId, connectionId, out binding);
+    }
+
+    private static (byte KeyId, byte[] PublicKey) ResolveAdmissionSigningKey()
+    {
+        byte keyId = 1;
+        var keyIdText = Environment.GetEnvironmentVariable(AdmissionKeyIdEnv);
+        if (!string.IsNullOrEmpty(keyIdText)
+            && byte.TryParse(keyIdText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+        {
+            keyId = parsed;
+        }
+
+        var hex = Environment.GetEnvironmentVariable(AdmissionPublicKeyEnv);
+        if (!string.IsNullOrWhiteSpace(hex))
+        {
+            hex = hex.Trim();
+            if ((hex.Length & 1) == 0)
+            {
+                try
+                {
+                    var publicKey = Convert.FromHexString(hex);
+                    if (publicKey.Length == Ed25519Keys.PublicKeyLength)
+                    {
+                        return (keyId, publicKey);
+                    }
+                }
+                catch (FormatException)
+                {
+                }
+            }
+        }
+
+        return (keyId, Ed25519Keys.Generate().PublicKey);
+    }
+
+    private sealed class ChannelAdmissionVerifier(
+        ICredentialVerifier inner,
+        IAdmissionCredentialVerifier admission,
+        AdmissionCredentialCapture capture) : ICredentialVerifier
+    {
+        private static readonly UTF8Encoding StrictUtf8 = new(
+            encoderShouldEmitUTF8Identifier: false,
+            throwOnInvalidBytes: true);
+
+        public CredentialVerification Verify(OpaqueCredentialInput credential, in VerificationContext context)
+        {
+            ArgumentNullException.ThrowIfNull(credential);
+            var channel = inner.Verify(credential, in context);
+            if (channel.Verdict == CredentialVerdict.Accepted)
+            {
+                return channel;
+            }
+
+            if (!TryDecodeUtf8(credential.Span, out var text))
+            {
+                return channel;
+            }
+
+            if (admission.Verify(text) is not AdmissionCredentialOutcome.Accepted accepted)
+            {
+                return channel;
+            }
+
+            capture.Remember(accepted.AccountId, text);
+            return new CredentialVerification(
+                CredentialVerdict.Accepted,
+                new PrincipalId(accepted.AccountId),
+                null);
+        }
+
+        private static bool TryDecodeUtf8(ReadOnlySpan<byte> bytes, out string text)
+        {
+            try
+            {
+                text = StrictUtf8.GetString(bytes);
+                return text.Length > 0;
+            }
+            catch (DecoderFallbackException)
+            {
+                text = string.Empty;
+                return false;
+            }
+        }
+    }
+
+    private sealed class AdmissionCredentialCapture
+    {
+        private readonly object gate = new();
+        private readonly Dictionary<string, string> byAccount = new(StringComparer.Ordinal);
+
+        internal void Remember(string accountId, string credential)
+        {
+            lock (gate)
+            {
+                byAccount[accountId] = credential;
+            }
+        }
+
+        internal bool TryTake(string accountId, out string credential)
+        {
+            lock (gate)
+            {
+                return byAccount.Remove(accountId, out credential!);
+            }
+        }
     }
 
     internal void Start()
@@ -427,12 +583,29 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                         }
                         else
                         {
-                            _ = sessions.HandleAuthenticatedConnectionEvent(
-                                in handshakeEvent,
-                                principal,
-                                authenticatedProductId,
-                                authenticatedGameReleaseId);
-                            sessions.PumpOnce();
+                            var connectionId = handshakeEvent.Id.Value.ToString(CultureInfo.InvariantCulture);
+                            if (capture.TryTake(principal.Value, out var admissionCredential)
+                                && !TryAdmitLiveWebsocketClient(
+                                    admission,
+                                    ProductionRoomId,
+                                    connectionId,
+                                    admissionCredential,
+                                    out _))
+                            {
+                                _ = transport.TrySend(new ConnectionCommand.Close(
+                                    handshakeEvent.Id,
+                                    handshakeEvent.Epoch,
+                                    ConnectionCloseReason.PolicyReject));
+                            }
+                            else
+                            {
+                                _ = sessions.HandleAuthenticatedConnectionEvent(
+                                    in handshakeEvent,
+                                    principal,
+                                    authenticatedProductId,
+                                    authenticatedGameReleaseId);
+                                sessions.PumpOnce();
+                            }
                         }
                     }
                     UpdateEpoch(handshakeEvent.Id);
@@ -487,6 +660,9 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                     break;
                 case ConnectionEvent.Closed closedEvent:
                     RemoveConnectionIfCurrent(closedEvent.Id, closedEvent.Epoch);
+                    _ = admission.Disconnect(
+                        ProductionRoomId,
+                        closedEvent.Id.Value.ToString(CultureInfo.InvariantCulture));
                     lock (sessionsGate)
                     {
                         _ = sessions.HandleConnectionEvent(in connectionEvent);
@@ -495,6 +671,9 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                     break;
                 case ConnectionEvent.Faulted faultedEvent:
                     RemoveConnectionIfCurrent(faultedEvent.Id, faultedEvent.Epoch);
+                    _ = admission.Disconnect(
+                        ProductionRoomId,
+                        faultedEvent.Id.Value.ToString(CultureInfo.InvariantCulture));
                     lock (sessionsGate)
                     {
                         _ = sessions.HandleConnectionEvent(in connectionEvent);
