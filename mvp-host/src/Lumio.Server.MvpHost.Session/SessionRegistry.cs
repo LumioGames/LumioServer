@@ -59,6 +59,7 @@ public sealed class SessionRegistry : IDisposable
     private readonly HashSet<string> retainedTerminalSessions = new(StringComparer.Ordinal);
     private readonly Queue<string> terminalSessionOrder = new();
     private readonly ISessionAdminPort? admin;
+    private readonly MvpAdmissionReducer reducer = new();
 
     private ulong nextAttempt;
     private ulong nextContext;
@@ -581,12 +582,19 @@ public sealed class SessionRegistry : IDisposable
     internal AckResult Enqueue(in SessionCommand command)
     {
         var result = controlInbox.TryEnqueue(in command);
-        return result.Status switch
+        if (result.Status == EnqueueStatus.Accepted)
         {
-            EnqueueStatus.Accepted => new AckResult(true, null),
-            EnqueueStatus.Full => new AckResult(false, "QueueFull"),
-            _ => new AckResult(false, "ContextClosing"),
-        };
+            return new AckResult(true, null);
+        }
+
+        if (result.Status == EnqueueStatus.Full)
+        {
+            return IsolateOnControlInboxFull(in command)
+                ? new AckResult(true, null)
+                : new AckResult(false, "QueueFull");
+        }
+
+        return new AckResult(false, "ContextClosing");
     }
 
     /// <summary>
@@ -752,15 +760,79 @@ public sealed class SessionRegistry : IDisposable
         }
     }
 
+    // Cross-thread lane of MvpSessionControlInbox: same 256 budget and onFull
+    // isolation (handshake closes; active session is isolated). Closed/Faulted
+    // must be applied rather than dropped so a live binding cannot hang.
     private AckResult EnqueueOwnerIngress(OwnerIngress ingress)
     {
         if (ownerIngress.Count >= Math.Max(1, controlInbox.Budget.MaxItems))
         {
-            return new AckResult(false, "QueueFull");
+            return IsolateOnOwnerIngressFull(ingress);
         }
 
         ownerIngress.Enqueue(ingress);
         return new AckResult(true, null);
+    }
+
+    private bool IsolateOnControlInboxFull(in SessionCommand command)
+    {
+        switch (command)
+        {
+            case SessionCommand.Kick kick:
+                ExecuteKick(kick);
+                return true;
+            case SessionCommand.TimerFired timer:
+                ExecuteTimer(timer);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private AckResult IsolateOnOwnerIngressFull(OwnerIngress ingress)
+    {
+        switch (ingress)
+        {
+            case OwnerIngress.ConnectionClosed closed:
+                return HandleDisconnected(
+                    closed.Event.Id,
+                    closed.Event.Epoch,
+                    closed.Event.Reason);
+            case OwnerIngress.ConnectionFaulted faulted:
+                return HandleDisconnected(
+                    faulted.Event.Id,
+                    faulted.Event.Epoch,
+                    ConnectionCloseReason.Fault);
+            case OwnerIngress.InboundEnvelope inbound:
+                return IsolateInboundOverflow(inbound);
+            case OwnerIngress.AuthenticatedHandshake handshake:
+                _ = transportControl.TrySend(new ConnectionCommand.Close(
+                    handshake.Event.Id,
+                    handshake.Event.Epoch,
+                    ConnectionCloseReason.PolicyReject));
+                return new AckResult(false, "QueueFull");
+            default:
+                return new AckResult(false, "QueueFull");
+        }
+    }
+
+    private AckResult IsolateInboundOverflow(OwnerIngress.InboundEnvelope inbound)
+    {
+        if (inbound.ConnectionId is { } connection
+            && connectionSessions.TryGetValue(connection.Value, out var mapped)
+            && sessions.TryGetValue(mapped, out var mappedSession)
+            && mappedSession.Binding is { } mappedBinding)
+        {
+            return IsolateEgressBackpressure(mappedSession, mappedBinding);
+        }
+
+        if (sessions.TryGetValue(inbound.Envelope.Header.SessionId, out var session)
+            && session.Binding is { } binding)
+        {
+            return IsolateEgressBackpressure(session, binding);
+        }
+
+        return new AckResult(false, "QueueFull");
     }
 
     private void ProcessOwnerIngress(OwnerIngress ingress)
@@ -869,182 +941,246 @@ public sealed class SessionRegistry : IDisposable
             return;
         }
 
-        TraceAck(AdmissionEffectKind.ReadGate, attempt, null, candidate.ConnectionEpoch);
-        if (draining || slot.Gate != AdmissionGateState.Open || auth.AdmissionMustStop)
-        {
-            Reject(attempt, candidate, "ContextClosing", close: true, traceCompensation: false);
-            return;
-        }
+        SessionCommand input = candidate;
+        var state = ServerConnectionSessionState.Admitted;
+        var busyTries = 0;
 
-        if (TryGet(sessionId, out var existing))
+        while (true)
         {
-            if (existing.State == ServerConnectionSessionState.ReconnectWindow)
+            var step = reducer.Advance(in state, in input);
+            if (step.Effect is AdmissionEffectKind.Reject)
             {
-                Reconnect(existing, candidate, attempt);
+                Reject(
+                    attempt,
+                    candidate,
+                    step.StableErrorId ?? "InvalidArgument",
+                    close: true,
+                    traceCompensation: false);
+                return;
             }
-            else
+
+            if (step.Effect is AdmissionEffectKind.Compensate)
             {
-                SendErrorAndClose(candidate, "SessionMismatch");
-                Reject(attempt, candidate, "SessionMismatch", close: false, traceCompensation: false);
+                var reason = NormalizeStableError(step.StableErrorId, "QueueFull");
+                var closeEpoch = Compensate(attempt, candidate, session: null, boundEpoch: null);
+                Reject(
+                    attempt,
+                    candidate,
+                    reason,
+                    close: reason != "ReleaseMismatch",
+                    traceCompensation: false,
+                    closeEpoch: closeEpoch);
+                return;
             }
 
-            return;
-        }
+            if (step.Effect is AdmissionEffectKind.None)
+            {
+                CompleteSuccessfulAdmission(attempt);
+                return;
+            }
 
-        if (candidate.Handshake.Header.MessageType != "Handshake"
-            || !IsHandshakeClient(candidate.Handshake))
-        {
-            TraceAck(AdmissionEffectKind.Authenticate, attempt, null, candidate.ConnectionEpoch);
-            Reject(attempt, candidate, "RoleMismatch", close: true, traceCompensation: false);
-            return;
-        }
+            var tracked = admissions[attempt.Value];
+            var slotEpoch = tracked.Reservation.Value == 0 ? (SlotEpoch?)null : tracked.SlotEpoch;
+            var connectionEpoch = step.Effect == AdmissionEffectKind.StartReplication && tracked.TransportBound
+                ? tracked.BoundEpoch
+                : candidate.ConnectionEpoch;
+            TraceAck(step.Effect, attempt, slotEpoch, connectionEpoch);
 
-        TraceAck(AdmissionEffectKind.Authenticate, attempt, null, candidate.ConnectionEpoch);
-        var authentication = Authenticate(candidate, sessionId);
-        if (!authentication.Accepted)
-        {
-            var reason = NormalizeStableError(authentication.ReasonCode, "RoleMismatch");
-            Reject(attempt, candidate, reason, close: true, traceCompensation: false);
-            return;
-        }
+            var io = ExecuteAdmissionEffect(step.Effect, attempt, candidate, sessionId);
+            if (io.Diverted)
+            {
+                return;
+            }
 
-        TraceAck(AdmissionEffectKind.MatchExactRelease, attempt, null, candidate.ConnectionEpoch);
-        if (!ExactRelease(candidate.Handshake.Header))
-        {
-            SendErrorAndClose(candidate, "ReleaseMismatch");
-            Reject(attempt, candidate, "ReleaseMismatch", close: false, traceCompensation: false);
-            return;
-        }
+            if (io.Busy)
+            {
+                busyTries++;
+                if (busyTries < config.AdmissionAttemptBudget)
+                {
+                    continue;
+                }
 
-        TraceAck(AdmissionEffectKind.ReserveSlot, attempt, null, candidate.ConnectionEpoch);
-        var allocation = ReserveSlot();
-        if (!allocation.Allocated)
-        {
-            Reject(
+                io = EffectIo.Fail("QueueFull");
+            }
+
+            input = new SessionCommand.DependencyResult(
                 attempt,
-                candidate,
-                NormalizeStableError(allocation.StableErrorId, "ContextClosing"),
-                close: true,
-                traceCompensation: true);
-            return;
+                step.Effect,
+                io.Accepted,
+                io.StableErrorId);
         }
+    }
 
-        var quota = slot.Capacity;
-        if (quota.MaxSessions > 0 && quota.BoundSessions >= quota.MaxSessions)
+    private EffectIo ExecuteAdmissionEffect(
+        AdmissionEffectKind effect,
+        AdmissionAttemptId attempt,
+        SessionCommand.ConnectionCandidate candidate,
+        ServerSessionId sessionId)
+    {
+        var tracked = admissions[attempt.Value];
+        switch (effect)
         {
-            Reject(attempt, candidate, "CapacityExceeded", close: true, traceCompensation: true);
-            return;
-        }
+            case AdmissionEffectKind.ReadGate:
+                if (draining || slot.Gate != AdmissionGateState.Open || auth.AdmissionMustStop)
+                {
+                    return EffectIo.Fail("ContextClosing");
+                }
 
-        worldSlotId = allocation.SlotId;
-        worldSlotEpoch = allocation.Epoch;
-        worldSlotAllocated = true;
-        var reservationResult = ReserveAdmission(attempt, sessionId, allocation);
-        if (!reservationResult.Reserved || reservationResult.Reservation.Value == 0)
+                if (TryGet(sessionId, out var existing))
+                {
+                    if (existing.State == ServerConnectionSessionState.ReconnectWindow)
+                    {
+                        Reconnect(existing, candidate, attempt);
+                        return EffectIo.Stop();
+                    }
+
+                    if (existing.State != ServerConnectionSessionState.Kicked)
+                    {
+                        SendErrorAndClose(candidate, "SessionMismatch");
+                        Reject(attempt, candidate, "SessionMismatch", close: false, traceCompensation: false);
+                        return EffectIo.Stop();
+                    }
+                }
+
+                return EffectIo.Ok();
+            case AdmissionEffectKind.Authenticate:
+                if (candidate.Handshake.Header.MessageType != "Handshake"
+                    || !IsHandshakeClient(candidate.Handshake))
+                {
+                    return EffectIo.Fail("RoleMismatch");
+                }
+
+                var authentication = Authenticate(candidate, sessionId);
+                if (IsTransientBusy(authentication.ReasonCode))
+                {
+                    return EffectIo.Retry();
+                }
+
+                if (!authentication.Accepted)
+                {
+                    return EffectIo.Fail(NormalizeStableError(authentication.ReasonCode, "RoleMismatch"));
+                }
+
+                tracked.Principal = authentication.Principal;
+                return EffectIo.Ok();
+            case AdmissionEffectKind.MatchExactRelease:
+                if (!ExactRelease(candidate.Handshake.Header))
+                {
+                    SendErrorAndClose(candidate, "ReleaseMismatch");
+                    return EffectIo.Fail("ReleaseMismatch");
+                }
+
+                return EffectIo.Ok();
+            case AdmissionEffectKind.ReserveSlot:
+                var allocation = ReserveSlot();
+                if (!allocation.Allocated)
+                {
+                    return IsTransientBusy(allocation.StableErrorId)
+                        ? EffectIo.Retry()
+                        : EffectIo.Fail(NormalizeStableError(allocation.StableErrorId, "ContextClosing"));
+                }
+
+                var quota = slot.Capacity;
+                if (quota.MaxSessions > 0 && quota.BoundSessions >= quota.MaxSessions)
+                {
+                    return EffectIo.Fail("CapacityExceeded");
+                }
+
+                worldSlotId = allocation.SlotId;
+                worldSlotEpoch = allocation.Epoch;
+                worldSlotAllocated = true;
+                var reservationResult = ReserveAdmission(attempt, sessionId, allocation);
+                if (!reservationResult.Reserved || reservationResult.Reservation.Value == 0)
+                {
+                    return IsTransientBusy(reservationResult.StableErrorId)
+                        ? EffectIo.Retry()
+                        : EffectIo.Fail(NormalizeStableError(reservationResult.StableErrorId, "InvalidArgument"));
+                }
+
+                if (reservationResult.Epoch != allocation.Epoch)
+                {
+                    return EffectIo.Fail("StaleEpoch");
+                }
+
+                tracked.Reservation = reservationResult.Reservation;
+                tracked.SlotEpoch = reservationResult.Epoch;
+                return EffectIo.Ok();
+            case AdmissionEffectKind.CommitSlot:
+                var commit = this.admissionPort is { } admission
+                    ? admission.BindSession(tracked.Reservation, sessionId, tracked.SlotEpoch)
+                    : new AckResult(false, "InvalidArgument");
+                if (!commit.Accepted)
+                {
+                    return EffectIo.Fail(NormalizeStableError(commit.StableErrorId, "CapacityExceeded"));
+                }
+
+                tracked.SlotCommitted = true;
+                tracked.ReleaseCommittedOnCompensation = true;
+                return EffectIo.Ok();
+            case AdmissionEffectKind.CreateSession:
+                if (sessions.ContainsKey(sessionId.Value))
+                {
+                    return EffectIo.Fail("SessionMismatch");
+                }
+
+                var session = new ServerConnectionSession(
+                    sessionId,
+                    new SessionEpoch(0),
+                    config.ProductId,
+                    config.GameReleaseId);
+                var grant = auth.Authorize(
+                    tracked.Principal,
+                    new SessionScope(sessionId, config.ProductId, config.GameReleaseId, "Client"));
+                session.SetPrincipal(tracked.Principal);
+                session.Associate(worldSlotId, tracked.SlotEpoch);
+                tracked.ReplicationContext = new ReplicationContextHandle(++nextContext);
+                var grantRef = GrantReference(grant, attempt);
+                sessions.Add(sessionId.Value, session);
+                committedReservationsBySession[sessionId.Value] = tracked.Reservation;
+                tracked.Session = session;
+                tracked.Grant = grantRef;
+                return EffectIo.Ok();
+            case AdmissionEffectKind.BindConnection:
+                var bindResult = transportControl.TrySend(new ConnectionCommand.Bind(
+                    candidate.ConnectionId,
+                    candidate.ConnectionEpoch,
+                    tracked.Grant,
+                    sessionId));
+                if (bindResult.Status != EnqueueStatus.Accepted)
+                {
+                    return EffectIo.Fail(NormalizeStableError(bindResult.StableErrorId, "StaleConnectionGeneration"));
+                }
+
+                tracked.TransportBound = true;
+                tracked.BoundEpoch = new ConnectionEpoch(candidate.ConnectionEpoch.Value + 1);
+                var activeBinding = new SessionBinding(
+                    candidate.ConnectionId,
+                    tracked.BoundEpoch,
+                    tracked.Grant,
+                    worldSlotId,
+                    tracked.SlotEpoch);
+                tracked.Session!.Bind(activeBinding, tracked.ReplicationContext);
+                connectionSessions[candidate.ConnectionId.Value] = sessionId.Value;
+                return EffectIo.Ok();
+            case AdmissionEffectKind.StartReplication:
+                var snapshot = SendFullSnapshot(tracked.Session!, tracked.Session!.Binding!.Value);
+                return snapshot.Accepted
+                    ? EffectIo.Ok()
+                    : EffectIo.Fail(NormalizeStableError(snapshot.StableErrorId, "QueueFull"));
+            default:
+                return EffectIo.Fail("InvalidArgument");
+        }
+    }
+
+    private void CompleteSuccessfulAdmission(AdmissionAttemptId attempt)
+    {
+        if (!admissions.TryGetValue(attempt.Value, out var tracked) || tracked.Session is not { } session)
         {
-            Reject(
-                attempt,
-                candidate,
-                NormalizeStableError(reservationResult.StableErrorId, "InvalidArgument"),
-                close: true,
-                traceCompensation: true);
             return;
         }
 
-        if (reservationResult.Epoch != allocation.Epoch)
-        {
-            Reject(attempt, candidate, "StaleEpoch", close: true, traceCompensation: true);
-            return;
-        }
-
-        var reservation = reservationResult.Reservation;
-        var slotEpoch = reservationResult.Epoch;
-        admissions[attempt.Value].Reservation = reservation;
-        admissions[attempt.Value].SlotEpoch = slotEpoch;
-        TraceAck(AdmissionEffectKind.CommitSlot, attempt, slotEpoch, candidate.ConnectionEpoch);
-        var commit = this.admissionPort is { } admission
-            ? admission.BindSession(reservation, sessionId, slotEpoch)
-            : new AckResult(false, "InvalidArgument");
-        if (!commit.Accepted)
-        {
-            Reject(attempt, candidate, NormalizeStableError(commit.StableErrorId, "CapacityExceeded"), close: true, traceCompensation: true);
-            return;
-        }
-
-        admissions[attempt.Value].SlotCommitted = true;
-        admissions[attempt.Value].ReleaseCommittedOnCompensation = true;
-
-        TraceAck(AdmissionEffectKind.CreateSession, attempt, slotEpoch, candidate.ConnectionEpoch);
-        if (sessions.ContainsKey(sessionId.Value))
-        {
-            Reject(attempt, candidate, "SessionMismatch", close: true, traceCompensation: true);
-            return;
-        }
-
-        var session = new ServerConnectionSession(
-            sessionId,
-            new SessionEpoch(0),
-            config.ProductId,
-            config.GameReleaseId);
-        var grant = auth.Authorize(
-            authentication.Principal,
-            new SessionScope(sessionId, config.ProductId, config.GameReleaseId, "Client"));
-        session.SetPrincipal(authentication.Principal);
-        session.Associate(worldSlotId, slotEpoch);
-        var context = new ReplicationContextHandle(++nextContext);
-        var grantRef = GrantReference(grant, attempt);
-        sessions.Add(sessionId.Value, session);
-        committedReservationsBySession[sessionId.Value] = reservation;
-        admissions[attempt.Value].Session = session;
-        admissions[attempt.Value].Reservation = reservation;
-        admissions[attempt.Value].SlotEpoch = slotEpoch;
-        admissions[attempt.Value].Grant = grantRef;
-
-        TraceAck(AdmissionEffectKind.BindConnection, attempt, slotEpoch, candidate.ConnectionEpoch);
-        var bindResult = transportControl.TrySend(new ConnectionCommand.Bind(
-            candidate.ConnectionId,
-            candidate.ConnectionEpoch,
-            grantRef,
-            sessionId));
-        if (bindResult.Status != EnqueueStatus.Accepted)
-        {
-            Reject(attempt, candidate, NormalizeStableError(bindResult.StableErrorId, "StaleConnectionGeneration"), close: true, traceCompensation: true);
-            return;
-        }
-
-        admissions[attempt.Value].TransportBound = true;
-        admissions[attempt.Value].BoundEpoch = new ConnectionEpoch(candidate.ConnectionEpoch.Value + 1);
-
-        var boundEpoch = new ConnectionEpoch(candidate.ConnectionEpoch.Value + 1);
-        var activeBinding = new SessionBinding(
-            candidate.ConnectionId,
-            boundEpoch,
-            grantRef,
-            worldSlotId,
-            slotEpoch);
-        session.Bind(activeBinding, context);
-        connectionSessions[candidate.ConnectionId.Value] = sessionId.Value;
-
-        TraceAck(AdmissionEffectKind.StartReplication, attempt, slotEpoch, boundEpoch);
         SetState(session, ServerConnectionSessionState.Syncing);
-        var snapshot = SendFullSnapshot(session, activeBinding);
-        if (!snapshot.Accepted)
-        {
-            var closeEpoch = Compensate(attempt, candidate, session, boundEpoch);
-            Reject(
-                attempt,
-                candidate,
-                NormalizeStableError(snapshot.StableErrorId, "QueueFull"),
-                close: true,
-                traceCompensation: false,
-                closeEpoch: closeEpoch);
-            return;
-        }
-
-        // The admission saga is complete once the first snapshot is queued,
-        // but replication is not active until the client confirms that exact
-        // snapshot with BaselineAck.
-        Publish(new SessionEvent.Admitted(session.SessionId, session.SessionEpoch, activeBinding));
+        Publish(new SessionEvent.Admitted(session.SessionId, session.SessionEpoch, session.Binding!.Value));
         admissions.Remove(attempt.Value);
     }
 
@@ -1226,6 +1362,11 @@ public sealed class SessionRegistry : IDisposable
             credential,
             context));
 
+        if (IsTransientBusy(outcome.StableErrorId))
+        {
+            return new AuthenticateResult(false, outcome.StableErrorId, default);
+        }
+
         if (outcome.Verdict != CredentialVerdict.Accepted || outcome.AntiReplay != AntiReplayVerdict.Ok)
         {
             var reason = outcome.AntiReplay != AntiReplayVerdict.Ok
@@ -1268,7 +1409,7 @@ public sealed class SessionRegistry : IDisposable
             return;
         }
 
-        var step = new MvpAdmissionReducer().Advance(
+        var step = reducer.Advance(
             ServerConnectionSessionState.Admitted,
             dependency);
         TraceAck(step.Effect, dependency.Attempt, null, null);
@@ -1347,8 +1488,6 @@ public sealed class SessionRegistry : IDisposable
             return;
         }
 
-        CancelDeferredReconnect(session, "SessionMismatch");
-
         if (session.Binding is { } binding)
         {
             var envelope = BuildMaintenanceKick(session, command.RegisteredReasonCode);
@@ -1357,9 +1496,18 @@ public sealed class SessionRegistry : IDisposable
                 binding.ConnectionEpoch,
                 new OutboundEnvelopeBytes(envelope),
                 ConnectionCloseReason.MaintenanceKick);
-            // The transport Closed event is the serialized fact that moves a
-            // live session into its reconnect window. Keep the binding and slot
-            // reservation until that event arrives.
+        }
+
+        FinalizeKick(session, command.RegisteredReasonCode);
+    }
+
+    private void FinalizeKick(ServerConnectionSession session, string reason)
+    {
+        if (session.State is ServerConnectionSessionState.Kicked
+            or ServerConnectionSessionState.Closed
+            or ServerConnectionSessionState.Expired)
+        {
+            DetachLiveConnection(session);
             return;
         }
 
@@ -1370,10 +1518,22 @@ public sealed class SessionRegistry : IDisposable
             session.PendingTimerToken = null;
         }
 
+        CancelDeferredReconnect(session, "SessionMismatch");
         ReleaseCommittedReservation(session);
-
+        DetachLiveConnection(session);
         SetState(session, ServerConnectionSessionState.Kicked);
-        Publish(new SessionEvent.Kicked(session.SessionId, session.SessionEpoch, command.RegisteredReasonCode));
+        Publish(new SessionEvent.Kicked(session.SessionId, session.SessionEpoch, reason));
+    }
+
+    private void DetachLiveConnection(ServerConnectionSession session)
+    {
+        if (session.Binding is not { } binding)
+        {
+            return;
+        }
+
+        connectionSessions.Remove(binding.ConnectionId.Value);
+        session.ClearConnectionBinding();
     }
 
     private void ExecuteTimer(SessionCommand.TimerFired command)
@@ -1444,10 +1604,17 @@ public sealed class SessionRegistry : IDisposable
             return new AckResult(false, "StaleConnectionGeneration");
         }
 
-        if (session.State is ServerConnectionSessionState.Kicked
-            or ServerConnectionSessionState.Closed
+        if (reason == ConnectionCloseReason.MaintenanceKick
+            || session.State == ServerConnectionSessionState.Kicked)
+        {
+            FinalizeKick(session, "MaintenanceKick");
+            return new AckResult(true, null);
+        }
+
+        if (session.State is ServerConnectionSessionState.Closed
             or ServerConnectionSessionState.Expired)
         {
+            DetachLiveConnection(session);
             return new AckResult(true, null);
         }
 
@@ -1662,6 +1829,9 @@ public sealed class SessionRegistry : IDisposable
             return false;
         }
     }
+
+    private static bool IsTransientBusy(string? error)
+        => error is "AuthBusy" or "AggregateBusy";
 
     private static string NormalizeStableError(string? error, string fallback)
         => error is "AuthBusy" or "AggregateBusy"
@@ -2373,6 +2543,8 @@ public sealed class SessionRegistry : IDisposable
         deadLetterReservationReleases.Enqueue(pending);
     }
 
+    // Faulted is retained as a modeled terminal bit but MVP never transitions
+    // here (absences.json ABS-SESSION-FAULTED-UNREACHABLE).
     private void SetState(ServerConnectionSession session, ServerConnectionSessionState state)
     {
         if (session.TryTransition(state))
@@ -2499,6 +2671,17 @@ public sealed class SessionRegistry : IDisposable
 
     private sealed record AuthenticateResult(bool Accepted, string? ReasonCode, PrincipalId Principal);
 
+    private readonly record struct EffectIo(bool Accepted, bool Busy, bool Diverted, string? StableErrorId)
+    {
+        internal static EffectIo Ok() => new(true, false, false, null);
+
+        internal static EffectIo Fail(string reason) => new(false, false, false, reason);
+
+        internal static EffectIo Retry() => new(false, true, false, null);
+
+        internal static EffectIo Stop() => new(false, false, true, null);
+    }
+
     private sealed class AdmissionAttemptState
     {
         internal AdmissionAttemptState(
@@ -2522,6 +2705,10 @@ public sealed class SessionRegistry : IDisposable
         internal SlotEpoch SlotEpoch { get; set; }
 
         internal PermissionGrantRef Grant { get; set; }
+
+        internal PrincipalId Principal { get; set; }
+
+        internal ReplicationContextHandle ReplicationContext { get; set; }
 
         internal ConnectionEpoch BoundEpoch { get; set; }
 

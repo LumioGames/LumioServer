@@ -72,6 +72,11 @@ public sealed class SessionBehaviorTests
         "Syncing", "Active", "ReconnectWindow", "Syncing", "Active",
     };
 
+    private static readonly string[] ServerOutboundMessageTypes =
+    {
+        "Handshake", "FullSnapshot", "Delta", "Error", "MaintenanceKick",
+    };
+
     [Fact]
     public void ReducerEmitsTheEightAdmissionEffectsInOrder()
     {
@@ -1422,7 +1427,7 @@ public sealed class SessionBehaviorTests
     }
 
     [Fact]
-    public void KickPublishesEnvelopeBeforeCloseAndEntersReconnectWindowOnTransportClose()
+    public void KickSendsEnvelopeBeforeCloseTest()
     {
         using var harness = new SessionHarness();
         harness.Enqueue(Candidate(1, "session-1"));
@@ -1436,8 +1441,13 @@ public sealed class SessionBehaviorTests
         Assert.True(result.Accepted);
         Assert.Equal("MaintenanceKick", ReadType(harness.Egress.Envelopes[^1].Bytes));
         Assert.Equal(ConnectionCommandKind.Close, harness.Transport.Commands[^1]);
-        Assert.Equal(0, harness.Slot.ReleaseCalls);
-        Assert.Equal(ServerConnectionSessionState.Syncing, session.State);
+        Assert.True(
+            harness.Egress.Envelopes.Count > 0
+            && harness.Transport.Commands.LastIndexOf(ConnectionCommandKind.Close)
+                >= harness.Transport.Commands.FindIndex(kind => kind == ConnectionCommandKind.Close));
+        Assert.Equal(ServerConnectionSessionState.Kicked, session.State);
+        Assert.Equal(1, harness.Slot.ReleaseCalls);
+        Assert.Null(session.PendingTimer);
 
         Assert.True(harness.Registry.HandleConnectionEvent(new ConnectionEvent.Closed(
             binding.ConnectionId,
@@ -1445,8 +1455,286 @@ public sealed class SessionBehaviorTests
             ConnectionCloseReason.MaintenanceKick)).Accepted);
         harness.Registry.PumpOnce();
 
-        Assert.Equal(ServerConnectionSessionState.ReconnectWindow, session.State);
+        Assert.Equal(ServerConnectionSessionState.Kicked, session.State);
+        Assert.DoesNotContain(
+            harness.Trace.States,
+            state => state.SessionState == nameof(ServerConnectionSessionState.ReconnectWindow));
+        Assert.Contains(harness.DrainEventsOfType<SessionEvent.Kicked>(), _ => true);
         Assert.Single(harness.ObservabilityAudit);
+    }
+
+    [Fact]
+    public void KickWithLiveBindingRefusesLaterReconnect()
+    {
+        using var harness = new SessionHarness();
+        harness.Enqueue(Candidate(1, "session-1"));
+        Assert.True(harness.Registry.TryGet(new ServerSessionId("session-1"), out var session));
+        var binding = Assert.IsType<SessionBinding>(session.Binding);
+
+        Assert.True(harness.Registry.Admin!.Kick(session.SessionId, "MaintenanceKick").Accepted);
+        harness.Registry.PumpOnce();
+        Assert.True(harness.Registry.HandleConnectionEvent(new ConnectionEvent.Closed(
+            binding.ConnectionId,
+            binding.ConnectionEpoch,
+            ConnectionCloseReason.MaintenanceKick)).Accepted);
+        harness.Registry.PumpOnce();
+
+        harness.Enqueue(Candidate(2, "session-1"));
+
+        Assert.Equal(ServerConnectionSessionState.Kicked, session.State);
+        Assert.Null(session.Binding);
+        Assert.False(
+            harness.Registry.TryGet(new ServerSessionId("session-1"), out var remaining)
+            && remaining.State is ServerConnectionSessionState.Syncing
+                or ServerConnectionSessionState.Active
+                or ServerConnectionSessionState.ReconnectWindow);
+        Assert.Contains(ConnectionCloseReason.PolicyReject, harness.Transport.CloseReasons);
+        Assert.Contains(
+            harness.DrainEventsOfType<SessionEvent.Rejected>(),
+            rejected => rejected.StableErrorId == "SessionMismatch");
+    }
+
+    [Fact]
+    public void AuthBusyRetriesWithinAdmissionAttemptBudgetThenSucceeds()
+    {
+        using var harness = new SessionHarness();
+        harness.Auth.Script(
+            BusyOutcome("AuthBusy"),
+            BusyOutcome("AuthBusy"),
+            new AuthenticateOutcome(
+                CredentialVerdict.Accepted,
+                new PrincipalId("principal-1"),
+                AntiReplayVerdict.Ok,
+                null,
+                null));
+
+        harness.Enqueue(Candidate(1, "session-1"));
+
+        Assert.True(harness.Registry.TryGet(new ServerSessionId("session-1"), out var session));
+        Assert.Equal(ServerConnectionSessionState.Syncing, session.State);
+        Assert.Equal(3, harness.Auth.AuthenticateCalls);
+        Assert.DoesNotContain(
+            harness.DrainEventsOfType<SessionEvent.Rejected>(),
+            rejected => rejected.StableErrorId is "AuthBusy" or "AggregateBusy");
+    }
+
+    [Fact]
+    public void AuthBusyExhaustsAdmissionAttemptBudgetThenStableReject()
+    {
+        using var harness = new SessionHarness();
+        harness.Auth.Script(
+            BusyOutcome("AuthBusy"),
+            BusyOutcome("AuthBusy"),
+            BusyOutcome("AuthBusy"));
+
+        harness.Enqueue(Candidate(1, "session-1"));
+
+        Assert.False(harness.Registry.TryGet(new ServerSessionId("session-1"), out _));
+        Assert.Equal(3, harness.Auth.AuthenticateCalls);
+        var rejected = Assert.Single(harness.DrainEventsOfType<SessionEvent.Rejected>());
+        Assert.Equal("QueueFull", rejected.StableErrorId);
+        Assert.DoesNotContain("AuthBusy", harness.Egress.Envelopes.Select(envelope =>
+        {
+            try
+            {
+                return ReadReasonCode(envelope.Bytes);
+            }
+            catch (Exception)
+            {
+                return ReadType(envelope.Bytes);
+            }
+        }));
+    }
+
+    [Fact]
+    public void AggregateBusyRetriesWithinAdmissionAttemptBudgetThenSucceeds()
+    {
+        using var harness = new SessionHarness();
+        var busy = new SessionReservationResult(false, default, new SlotEpoch(1), new WorldSlotId(1), "AggregateBusy");
+        var ok = new SessionReservationResult(true, new SlotReservationId(7), new SlotEpoch(1), new WorldSlotId(1), null);
+        harness.Slot.ScriptReserve(busy, busy, ok);
+
+        harness.Enqueue(Candidate(1, "session-1"));
+
+        Assert.True(harness.Registry.TryGet(new ServerSessionId("session-1"), out var session));
+        Assert.Equal(ServerConnectionSessionState.Syncing, session.State);
+        Assert.Equal(3, harness.Slot.ReserveCalls);
+        Assert.Equal(new SlotReservationId(7), harness.Slot.LastReservation);
+    }
+
+    [Fact]
+    public void AggregateBusyExhaustsAdmissionAttemptBudgetThenStableReject()
+    {
+        using var harness = new SessionHarness();
+        var busy = new SessionReservationResult(false, default, new SlotEpoch(1), new WorldSlotId(1), "AggregateBusy");
+        harness.Slot.ScriptReserve(busy, busy, busy);
+
+        harness.Enqueue(Candidate(1, "session-1"));
+
+        Assert.False(harness.Registry.TryGet(new ServerSessionId("session-1"), out _));
+        Assert.Equal(3, harness.Slot.ReserveCalls);
+        var rejected = Assert.Single(harness.DrainEventsOfType<SessionEvent.Rejected>());
+        Assert.Equal("QueueFull", rejected.StableErrorId);
+    }
+
+    [Fact]
+    public void ActiveSessionControlInboxFullIsolatesTheSession()
+    {
+        using var harness = new SessionHarness();
+        harness.Enqueue(Candidate(1, "session-1"));
+        harness.AcknowledgeBaseline("session-1");
+        Assert.True(harness.Registry.TryGet(new ServerSessionId("session-1"), out var session));
+        Assert.Equal(ServerConnectionSessionState.Active, session.State);
+
+        var inbox = harness.Registry.ControlInboxForTest;
+        SessionCommand filler = new SessionCommand.TimerFired(new TimerId(99), new ServerSessionId("missing"));
+        for (var i = 0; i < SessionProvisionalDefaults.ControlInboxMaxItems; i++)
+        {
+            Assert.Equal(EnqueueStatus.Accepted, inbox.TryEnqueue(in filler).Status);
+        }
+
+        var result = harness.Registry.Kick(session.SessionId, "MaintenanceKick");
+
+        Assert.True(result.Accepted);
+        Assert.Equal(ServerConnectionSessionState.Kicked, session.State);
+        Assert.Null(session.Binding);
+        Assert.Contains(ConnectionCloseReason.MaintenanceKick, harness.Transport.CloseReasons);
+    }
+
+    [Fact]
+    public void ActiveSessionClosedIsNotDroppedWhenOwnerIngressIsFull()
+    {
+        using var harness = new SessionHarness();
+        harness.Enqueue(Candidate(1, "session-1"));
+        harness.AcknowledgeBaseline("session-1");
+        Assert.True(harness.Registry.TryGet(new ServerSessionId("session-1"), out var session));
+        var binding = Assert.IsType<SessionBinding>(session.Binding);
+
+        for (ulong id = 1000; id < 1000 + (ulong)SessionProvisionalDefaults.ControlInboxMaxItems; id++)
+        {
+            Assert.True(harness.Registry.HandleConnectionEvent(new ConnectionEvent.Closed(
+                new TransportConnectionId(id),
+                new ConnectionEpoch(0),
+                ConnectionCloseReason.Disconnect)).Accepted);
+        }
+
+        var result = harness.Registry.HandleConnectionEvent(new ConnectionEvent.Closed(
+            binding.ConnectionId,
+            binding.ConnectionEpoch,
+            ConnectionCloseReason.Disconnect));
+
+        Assert.True(result.Accepted);
+        Assert.NotEqual("QueueFull", result.StableErrorId);
+        Assert.Equal(ServerConnectionSessionState.ReconnectWindow, session.State);
+        Assert.Null(session.Binding);
+    }
+
+    [Fact]
+    public void ActiveSessionInboundIsIsolatedWhenOwnerIngressIsFull()
+    {
+        using var harness = new SessionHarness();
+        harness.Enqueue(Candidate(1, "session-1"));
+        harness.AcknowledgeBaseline("session-1");
+        Assert.True(harness.Registry.TryGet(new ServerSessionId("session-1"), out var session));
+        var binding = Assert.IsType<SessionBinding>(session.Binding);
+
+        for (ulong id = 2000; id < 2000 + (ulong)SessionProvisionalDefaults.ControlInboxMaxItems; id++)
+        {
+            Assert.True(harness.Registry.HandleConnectionEvent(new ConnectionEvent.Closed(
+                new TransportConnectionId(id),
+                new ConnectionEpoch(0),
+                ConnectionCloseReason.Disconnect)).Accepted);
+        }
+
+        var inbound = Validated(MvpEnvelopeWriter.WriteResyncRequest(Context("session-1", 99), "gap"));
+        var result = default(AckResult);
+        var worker = new Thread(() => result = harness.Registry.HandleInbound(
+            binding.ConnectionId,
+            binding.ConnectionEpoch,
+            in inbound));
+        worker.Start();
+        Assert.True(worker.Join(TimeSpan.FromSeconds(5)));
+
+        Assert.True(result.Accepted);
+        Assert.NotEqual("QueueFull", result.StableErrorId);
+        Assert.Equal(ServerConnectionSessionState.ReconnectWindow, session.State);
+        Assert.Null(session.Binding);
+    }
+
+    [Fact]
+    public void AdmissionSagaEightStepsTest()
+    {
+        using var harness = new SessionHarness();
+        harness.Enqueue(Candidate(1, "session-1"));
+
+        Assert.Equal(
+            TracedAdmissionEffects,
+            harness.Trace.Acks.Select(ack => ack.Effect).ToArray());
+        Assert.True(harness.Trace.Acks.Select(ack => ack.AdmissionAttemptId).Distinct().Count() == 1);
+    }
+
+    [Theory]
+    [InlineData(AdmissionEffectKind.ReadGate)]
+    [InlineData(AdmissionEffectKind.Authenticate)]
+    [InlineData(AdmissionEffectKind.MatchExactRelease)]
+    [InlineData(AdmissionEffectKind.ReserveSlot)]
+    [InlineData(AdmissionEffectKind.CommitSlot)]
+    [InlineData(AdmissionEffectKind.CreateSession)]
+    [InlineData(AdmissionEffectKind.BindConnection)]
+    [InlineData(AdmissionEffectKind.StartReplication)]
+    public void ExactlyOnceCompensationTest(AdmissionEffectKind failedEffect)
+    {
+        using var harness = new SessionHarness();
+        InjectAdmissionFailure(harness, failedEffect);
+        var compensateCount = harness.Trace.Acks.Count(ack => ack.Effect == "Compensate");
+        Assert.Equal(1, compensateCount);
+        Assert.False(harness.Registry.TryGet(new ServerSessionId("session-1"), out var live)
+            && live.State is ServerConnectionSessionState.Syncing or ServerConnectionSessionState.Active);
+
+        var attemptId = harness.Trace.Acks.First(ack => ack.AdmissionAttemptId is not null).AdmissionAttemptId!.Value;
+        harness.Enqueue(new SessionCommand.DependencyResult(
+            new AdmissionAttemptId(attemptId),
+            failedEffect,
+            false,
+            "QueueFull"));
+
+        Assert.Equal(compensateCount, harness.Trace.Acks.Count(ack => ack.Effect == "Compensate"));
+    }
+
+    [Fact]
+    public void ServerOutboundMessageTypeSubsetTest()
+    {
+        using var harness = new SessionHarness();
+        harness.Enqueue(Candidate(1, "session-1"));
+        harness.AcknowledgeBaseline("session-1");
+        Assert.True(harness.Registry.NotifyAuthorityRevision(1).Accepted);
+        Assert.True(harness.Registry.TryGet(new ServerSessionId("session-1"), out var session));
+        Assert.True(harness.Registry.Admin!.Kick(session.SessionId, "MaintenanceKick").Accepted);
+        harness.Registry.PumpOnce();
+
+        var types = harness.Egress.Envelopes.Select(envelope => ReadType(envelope.Bytes)).Distinct().ToArray();
+        Assert.All(types, type => Assert.Contains(type, ServerOutboundMessageTypes));
+        Assert.DoesNotContain("BaselineAck", types);
+        Assert.DoesNotContain("DeltaAck", types);
+        Assert.DoesNotContain("ResyncRequest", types);
+    }
+
+    [Fact]
+    public void OutboundReliabilityIsReliableTest()
+    {
+        using var harness = new SessionHarness();
+        harness.Enqueue(Candidate(1, "session-1"));
+        harness.AcknowledgeBaseline("session-1");
+        Assert.True(harness.Registry.NotifyAuthorityRevision(1).Accepted);
+        Assert.True(harness.Registry.TryGet(new ServerSessionId("session-1"), out var session));
+        Assert.True(harness.Registry.Admin!.Kick(session.SessionId, "MaintenanceKick").Accepted);
+        harness.Registry.PumpOnce();
+
+        foreach (var envelope in harness.Egress.Envelopes)
+        {
+            Assert.True(MvpEnvelopeReader.TryReadHeader(envelope.Bytes.Span, out var header).Status == EnvelopeParseStatus.Ok);
+            Assert.Equal(MvpWireConstants.Reliability, header.Reliability);
+        }
     }
 
     [Fact]
@@ -1535,7 +1823,7 @@ public sealed class SessionBehaviorTests
 
         harness.Registry.PumpOnce();
 
-        Assert.Equal(ServerConnectionSessionState.ReconnectWindow, session.State);
+        Assert.Equal(ServerConnectionSessionState.Kicked, session.State);
         Assert.Null(session.Binding);
         Assert.Single(
             harness.Egress.Envelopes,
@@ -1789,6 +2077,65 @@ public sealed class SessionBehaviorTests
             harness.Registry.SessionCount <= SessionProvisionalDefaults.EventOutboxMaxItems,
             $"terminal session registry retained {harness.Registry.SessionCount} entries");
         Assert.False(harness.Registry.TryGet(new ServerSessionId("session-1"), out _));
+    }
+
+    private static AuthenticateOutcome BusyOutcome(string busyCode)
+        => new(
+            CredentialVerdict.Rejected,
+            default,
+            AntiReplayVerdict.Ok,
+            busyCode,
+            null);
+
+    private static void InjectAdmissionFailure(SessionHarness harness, AdmissionEffectKind failedEffect)
+    {
+        switch (failedEffect)
+        {
+            case AdmissionEffectKind.ReadGate:
+                harness.Slot.GateState = AdmissionGateState.Closed;
+                harness.Enqueue(Candidate(1, "session-1"));
+                break;
+            case AdmissionEffectKind.Authenticate:
+                harness.Auth.Script(new AuthenticateOutcome(
+                    CredentialVerdict.Rejected,
+                    default,
+                    AntiReplayVerdict.Ok,
+                    "RoleMismatch",
+                    null));
+                harness.Enqueue(Candidate(1, "session-1"));
+                break;
+            case AdmissionEffectKind.MatchExactRelease:
+                harness.Enqueue(Candidate(1, "session-1") with
+                {
+                    Handshake = Validated(MvpEnvelopeWriter.WriteClientHandshake(
+                        Context("session-1", 1) with { ProductId = "wrong" })),
+                });
+                break;
+            case AdmissionEffectKind.ReserveSlot:
+                harness.Slot.Reservation = default;
+                harness.Enqueue(Candidate(1, "session-1"));
+                break;
+            case AdmissionEffectKind.CommitSlot:
+                harness.Slot.BindResult = new AckResult(false, "CapacityExceeded");
+                harness.Enqueue(Candidate(1, "session-1"));
+                break;
+            case AdmissionEffectKind.CreateSession:
+                harness.Enqueue(Candidate(1, "session-1"));
+                Assert.True(harness.Registry.Admin!.Kick(new ServerSessionId("session-1"), "MaintenanceKick").Accepted);
+                harness.Registry.PumpOnce();
+                harness.Enqueue(Candidate(2, "session-1"));
+                break;
+            case AdmissionEffectKind.BindConnection:
+                harness.Transport.Script(new EnqueueResult(EnqueueStatus.Full, "QueueFull"));
+                harness.Enqueue(Candidate(1, "session-1"));
+                break;
+            case AdmissionEffectKind.StartReplication:
+                harness.Egress.Script(new EnqueueResult(EnqueueStatus.Full, "QueueFull"));
+                harness.Enqueue(Candidate(1, "session-1"));
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(failedEffect), failedEffect, "Unsupported admission effect");
+        }
     }
 
     private static SessionCommand.ConnectionCandidate Candidate(ulong connection, string session)
@@ -2079,6 +2426,21 @@ public sealed class SessionBehaviorTests
             }
         }
 
+        internal List<TEvent> DrainEventsOfType<TEvent>()
+            where TEvent : SessionEvent
+        {
+            var found = new List<TEvent>();
+            while (Registry.TryDequeueEvent(out var sessionEvent))
+            {
+                if (sessionEvent is TEvent typed)
+                {
+                    found.Add(typed);
+                }
+            }
+
+            return found;
+        }
+
         private IBoundedInbox<SessionCommand> RegistryControl
         {
             get
@@ -2166,12 +2528,26 @@ public sealed class SessionBehaviorTests
         internal int AuthorizeCalls { get; private set; }
         internal PrincipalId? LastAuthorizedPrincipal { get; private set; }
         internal PrincipalId NextPrincipal { get; set; } = new("principal-1");
+        private readonly Queue<AuthenticateOutcome> scriptedOutcomes = new();
 
         public bool AdmissionMustStop => false;
+
+        internal void Script(params AuthenticateOutcome[] outcomes)
+        {
+            foreach (var outcome in outcomes)
+            {
+                scriptedOutcomes.Enqueue(outcome);
+            }
+        }
 
         public AuthenticateOutcome Authenticate(in AuthenticateCommand command)
         {
             AuthenticateCalls++;
+            if (scriptedOutcomes.TryDequeue(out var scripted))
+            {
+                return scripted;
+            }
+
             return new AuthenticateOutcome(
                 CredentialVerdict.Accepted,
                 NextPrincipal,
@@ -2208,10 +2584,34 @@ public sealed class SessionBehaviorTests
         private Queue<AckResult> AbortResults { get; } = new();
         internal SlotReservationId Reservation { get; set; } = new(7);
         internal SlotReservationId LastReservation { get; private set; }
+        internal int ReserveCalls { get; private set; }
+        private readonly Queue<SessionReservationResult> scriptedReservations = new();
 
         public AllocateResult Allocate(in SlotBudget budget) => new(true, new WorldSlotId(1), new SlotEpoch(1), null);
+
+        internal void ScriptReserve(params SessionReservationResult[] results)
+        {
+            foreach (var result in results)
+            {
+                scriptedReservations.Enqueue(result);
+            }
+        }
+
         public SessionReservationResult ReserveAdmission(AdmissionAttemptId attempt, ServerSessionId session)
-            => new(Reservation.Value != 0, Reservation, new SlotEpoch(1), new WorldSlotId(1), Reservation.Value == 0 ? "InvalidArgument" : null);
+        {
+            ReserveCalls++;
+            if (scriptedReservations.TryDequeue(out var scripted))
+            {
+                return scripted;
+            }
+
+            return new SessionReservationResult(
+                Reservation.Value != 0,
+                Reservation,
+                new SlotEpoch(1),
+                new WorldSlotId(1),
+                Reservation.Value == 0 ? "InvalidArgument" : null);
+        }
         public AckResult AbortAdmission(SlotReservationId reservation, SlotEpoch epoch)
             => new(true, null);
 
