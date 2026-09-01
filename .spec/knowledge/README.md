@@ -27,7 +27,7 @@ metadata:
 |------|--------|
 | [`features/_TEMPLATE.md`](features/_TEMPLATE.md) | 新功能文档模板——新增功能记录时照此建,放对 领域 / 模块 |
 | [`features/account-server.md`](features/account-server.md) | 独立账号进程 login-or-register、AccountEntity 与准入凭证签发；改账号服或消费 lumio.account-port.v1 时查 |
-| [`features/room-admission.md`](features/room-admission.md) | Game Server Room 准入与 Player/Bot 绑定登记；改 verify_admission、顶号或跨 Room 隔离时查 |
+| [`features/room-admission.md`](features/room-admission.md) | Game Server Room 准入、绑定登记与五分钟重连窗；改 verify_admission、顶号、断线过期或跨 Room 隔离时查 |
 
 ## lessons(经验教训 · 复发问题暂存区)
 
