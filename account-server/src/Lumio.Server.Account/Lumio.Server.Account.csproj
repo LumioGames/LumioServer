@@ -1,6 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <!--
+      Declared so mvp-host Architecture.Tests can include this library in the
+      host build graph. Game Server (R-00346) ProjectReferences this assembly
+      for in-process verify_admission; the layer must be strictly below
+      Lumio.Server.MvpHost.Admission (5).
+    -->
+    <MvpHostLayer>3</MvpHostLayer>
     <RootNamespace>Lumio.Server.Account</RootNamespace>
     <AssemblyName>Lumio.Server.Account</AssemblyName>
   </PropertyGroup>
