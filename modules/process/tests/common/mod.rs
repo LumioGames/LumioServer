@@ -8,6 +8,7 @@ use lumio_host_runtime::{KernelError, KernelFired, KernelHandle, KernelTimer, Ti
 use lumio_server_process::entity_chat::{
     AttributeQueryOutcome, BoundEntityKind, ChatOperation, PersistRecord, QueryResult, RebindMode,
     RuntimeAdmit, RuntimeBinding, RuntimeQuery, RuntimeSurface, RuntimeTick,
+    MAX_CHAT_INPUTS_PER_TICK,
 };
 
 pub const DISPATCH_EXPIRE: u32 = 1;
@@ -401,11 +402,18 @@ impl RuntimeSurface for ScriptedRuntime {
         self.tick = tick_id;
         self.revision += 1;
         let pending = std::mem::take(&mut self.pending_chats);
-        self.events_by_tick.insert(tick_id, pending);
-        RuntimeTick {
-            applied_tick: self.tick,
-            revision: self.revision,
+        if pending.len() > MAX_CHAT_INPUTS_PER_TICK {
+            return RuntimeTick {
+                applied_tick: 0,
+                revision: self.revision,
+                ok: false,
+                event_count: 0,
+                code: Some("runtime_failure".to_owned()),
+            };
         }
+        let event_count = pending.len() as u64;
+        self.events_by_tick.insert(tick_id, pending);
+        RuntimeTick::committed(self.tick, self.revision, event_count)
     }
 
     fn build_full_snapshot(&mut self, _room_id: &str, tick_id: u64, revision: u64) -> Vec<u8> {

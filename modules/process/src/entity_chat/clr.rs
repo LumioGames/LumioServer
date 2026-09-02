@@ -285,19 +285,9 @@ impl RuntimeSurface for ClrGameplay {
     }
 
     fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick {
-        let Ok(value) = self.call(json!({ "op": "tick", "roomId": room_id, "tickId": tick_id }))
-        else {
-            return RuntimeTick {
-                applied_tick: 0,
-                revision: 0,
-            };
-        };
-        RuntimeTick {
-            applied_tick: value
-                .get("appliedTick")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            revision: value.get("revision").and_then(Value::as_u64).unwrap_or(0),
+        match self.call(json!({ "op": "tick", "roomId": room_id, "tickId": tick_id })) {
+            Ok(value) => tick_from_hostentry_json(value),
+            Err(_) => RuntimeTick::failed("runtime_failure"),
         }
     }
 
@@ -392,6 +382,33 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// HostEntry `tick` JSON: `ok:false` is a failed tick even if appliedTick >= 1.
+pub(crate) fn tick_from_hostentry_json(value: Value) -> RuntimeTick {
+    let event_count = value.get("eventCount").and_then(Value::as_u64).unwrap_or(0);
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|code| !code.is_empty())
+        .map(str::to_owned);
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return RuntimeTick {
+            applied_tick: 0,
+            revision: value.get("revision").and_then(Value::as_u64).unwrap_or(0),
+            ok: false,
+            event_count: 0,
+            code: code.or_else(|| Some("runtime_failure".to_owned())),
+        };
+    }
+    RuntimeTick::committed(
+        value
+            .get("appliedTick")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        value.get("revision").and_then(Value::as_u64).unwrap_or(0),
+        event_count,
+    )
+}
+
 /// Maps a Runtime `build_full_snapshot` JSON envelope to wire bytes.
 /// Missing/failed Runtime responses must not become a host-minted FullSnapshot.
 pub(crate) fn full_snapshot_bytes_from_runtime(response: Option<Value>) -> Vec<u8> {
@@ -430,6 +447,21 @@ mod tests {
             full_snapshot_bytes_from_runtime(Some(json!({"ok": true}))),
             Vec::<u8>::new()
         );
+    }
+
+    #[test]
+    fn budget_fault_tick_is_not_success_even_when_applied_tick_is_one() {
+        let tick = tick_from_hostentry_json(json!({
+            "ok": false,
+            "appliedTick": 1,
+            "revision": 1,
+            "eventCount": 0,
+            "code": "runtime_failure"
+        }));
+        assert!(!tick.ok);
+        assert_eq!(tick.applied_tick, 0);
+        assert_eq!(tick.event_count, 0);
+        assert_eq!(tick.code.as_deref(), Some("runtime_failure"));
     }
 
     #[test]

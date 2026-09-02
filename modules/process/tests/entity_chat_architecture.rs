@@ -117,6 +117,39 @@ fn host_entry_restore_persist_uses_readonly_memory() {
 }
 
 #[test]
+fn suite_connection_superseded_received_must_not_copy_takeover() {
+    let text =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    assert!(
+        !text.contains("\"connectionSupersededReceived\": takeover"),
+        "connectionSupersededReceived must come from old-socket recv, not host takeover"
+    );
+    assert!(
+        text.contains("RoomClient::connect") && text.contains("c-bot100"),
+        "S8 must attach c-bot100 as a RoomClient before takeover"
+    );
+    assert!(
+        text.contains("ConnectionSuperseded"),
+        "S8 must recv messageType=ConnectionSuperseded on the old socket"
+    );
+}
+
+#[test]
+fn suite_schedules_kernel_tick_every_max_chat_inputs() {
+    let text =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    assert!(
+        text.contains("pending_chats >= MAX_CHAT_INPUTS_PER_TICK"),
+        "suite must insert schedule_room_tick every 64 admits, not dump 101 into one RunTick"
+    );
+    let ticks = text.matches("schedule_room_tick").count();
+    assert!(
+        ticks >= 2,
+        "suite must schedule at least a batch tick and a remainder tick, got {ticks}"
+    );
+}
+
+#[test]
 fn owned_sources_have_no_hardcoded_dev_machine_paths() {
     let mut hits = Vec::new();
     for (path, text) in read_owned_sources() {

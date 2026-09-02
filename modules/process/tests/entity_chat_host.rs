@@ -288,3 +288,83 @@ fn batched_chat_inputs_stay_within_runtime_change_entry_budget() {
         "two ChatComponent field writes per chat.input must fit MaxChangeEntries=128"
     );
 }
+
+fn admit_n(
+    host: &EntityChatHost,
+    keys: &lumio_server_process::entity_chat::Ed25519KeyPair,
+    n: usize,
+) {
+    for i in 1..=n {
+        let name = format!("Bot{i:02}");
+        let accepted = host
+            .admit(
+                "room-main".to_owned(),
+                format!("c-{i:03}"),
+                credential(keys, &name, true),
+            )
+            .accepted;
+        assert!(accepted, "admit {name}");
+    }
+}
+
+fn enqueue_n(host: &EntityChatHost, n: usize) {
+    for i in 1..=n {
+        let admitted = host.admit_chat_input(
+            format!("c-{i:03}"),
+            InputCommand::from_chat_text(&format!("hello-{i}")),
+        );
+        assert_eq!(admitted.kind, ChatOpKind::Admitted);
+    }
+}
+
+#[test]
+fn sixty_four_chat_inputs_one_tick_emit_chat_event() {
+    let (host, keys) = host_with(SharedRuntime::new());
+    admit_n(&host, &keys, 64);
+    let mut client =
+        lumio_server_process::entity_chat::RoomClient::connect(&host.listen_uri(), "c-001")
+            .expect("connect");
+    let _ = client.recv_text();
+    enqueue_n(&host, 64);
+    let tick = host.run_tick("room-main".to_owned());
+    assert!(tick.ok, "N=64 must succeed, got {tick:?}");
+    assert_eq!(tick.event_count, 64);
+    let frame = client.recv_text().expect("delta");
+    assert!(
+        frame.contains("\"mappingId\":\"chat.event\""),
+        "N=64 must emit chat.event, got {frame}"
+    );
+}
+
+#[test]
+fn sixty_five_chat_inputs_one_tick_empty_delta_is_not_success() {
+    let (host, keys) = host_with(SharedRuntime::new());
+    admit_n(&host, &keys, 65);
+    let mut client =
+        lumio_server_process::entity_chat::RoomClient::connect(&host.listen_uri(), "c-001")
+            .expect("connect");
+    let _ = client.recv_text();
+    enqueue_n(&host, 65);
+    let tick = host.run_tick("room-main".to_owned());
+    assert!(
+        !tick.ok,
+        "N=65 must not be SUCCESS (Runtime MaxChangeEntries=128), got {tick:?}"
+    );
+    assert_eq!(tick.event_count, 0);
+    match client.recv_text() {
+        Ok(frame) => {
+            assert!(
+                !frame.contains("\"mappingId\":\"chat.event\""),
+                "N=65 must not emit chat.event, got {frame}"
+            );
+            assert!(
+                frame.contains("\"changedBlocks\":[]") || !tick.ok,
+                "N=65 empty Delta is not SUCCESS, got {frame}"
+            );
+        }
+        Err(_) => assert!(
+            !tick.ok,
+            "budget fault must not be treated as a successful tick"
+        ),
+    }
+}

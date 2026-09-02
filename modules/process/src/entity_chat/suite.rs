@@ -406,10 +406,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         let _ = client.recv_text();
     }
     let mut pending_chats = 0usize;
-    let mut tick = RuntimeTick {
-        applied_tick: 0,
-        revision: 0,
-    };
+    let mut tick = RuntimeTick::default();
     let mut received = Vec::new();
     for (connection, name) in &connections {
         let command = InputCommand::from_chat_text(&format!("hello-{name}"));
@@ -433,7 +430,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
         drain_chat_event_deltas(&mut browser_wire, &mut received);
     }
-    let timer_ok = tick.applied_tick >= 1;
+    let timer_ok = tick.ok && tick.applied_tick >= 1;
     let chat_events: Vec<String> = received
         .iter()
         .filter(|frame| is_chat_event_delta(frame))
@@ -537,6 +534,10 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let entity_a_host = previous_bot100.net_entity_id.clone();
     let previous_session = previous_bot100.session_id.clone();
     let previous_account = previous_bot100.account_id.clone();
+    let mut old_bot100 = RoomClient::connect(&host.listen_uri(), "c-bot100").ok();
+    if let Some(client) = old_bot100.as_mut() {
+        let _ = client.recv_text();
+    }
     let re_login = login_or_register(&account.uri(), "Bot100", TEST_PASSWORD, Some(&bot_claim))
         .await
         .unwrap_or_else(|_| empty_login());
@@ -560,6 +561,17 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             }
         }
     }
+    let superseded_frame = old_bot100
+        .as_mut()
+        .and_then(|client| client.recv_text().ok());
+    let connection_superseded_received = superseded_frame
+        .as_deref()
+        .is_some_and(|frame| frame.contains("\"messageType\":\"ConnectionSuperseded\""));
+    if connection_superseded_received {
+        if let Some(old) = old_bot100.as_mut() {
+            let _ = old.is_closed_after();
+        }
+    }
     let rejected = host.admit_chat_input(
         "c-bot100".to_owned(),
         InputCommand::from_chat_text("while-down"),
@@ -569,7 +581,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         InputCommand::from_chat_text("room-continues"),
     );
     let _ = host.run_tick(MAIN_ROOM.to_owned());
-    re_ok = re_ok && rejected.kind == ChatOpKind::Rejected;
+    re_ok = re_ok && rejected.kind == ChatOpKind::Rejected && connection_superseded_received;
     let reconnect_trace = json!({
         "rebound": re_ok,
         "entityA": entity_a_host,
@@ -579,13 +591,14 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         "previousSessionId": previous_session,
         "accountId": rebound_binding.as_ref().map(|binding| binding.account_id.clone()),
         "previousAccountId": previous_account,
-        "connectionSupersededReceived": takeover,
+        "takeover": takeover,
+        "connectionSupersededReceived": connection_superseded_received,
         "oldConnectionId": "c-bot100",
     });
     scenarios.insert(
         "8".to_owned(),
         json!({
-            "ok": re_ok && takeover,
+            "ok": re_ok && connection_superseded_received,
             "rebound": re_ok,
             "entityA": entity_a_host,
             "netEntityId": reconnect_trace.get("netEntityId").cloned(),
@@ -594,7 +607,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "previousSessionId": previous_session,
             "accountId": reconnect_trace.get("accountId").cloned(),
             "previousAccountId": previous_account,
-            "connectionSupersededReceived": takeover,
+            "takeover": takeover,
+            "connectionSupersededReceived": connection_superseded_received,
         }),
     );
 
