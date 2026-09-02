@@ -348,13 +348,36 @@ public static class HostEntry
         }
 
         object result = ChatType!.GetMethod("RunTick")!.Invoke(Chat, new object[] { tickId })!;
-        ulong applied = Convert.ToUInt64(result.GetType().GetProperty("AppliedTick")!.GetValue(result)!, CultureInfo.InvariantCulture);
-        ulong revision = Convert.ToUInt64(result.GetType().GetProperty("Revision")!.GetValue(result)!, CultureInfo.InvariantCulture);
+        Type tickType = result.GetType();
+        ulong applied = Convert.ToUInt64(tickType.GetProperty("AppliedTick")!.GetValue(result)!, CultureInfo.InvariantCulture);
+        ulong revision = Convert.ToUInt64(tickType.GetProperty("Revision")!.GetValue(result)!, CultureInfo.InvariantCulture);
+        int eventCount = 0;
+        if (tickType.GetProperty("Events")!.GetValue(result) is System.Collections.ICollection events)
+        {
+            eventCount = events.Count;
+        }
+
+        string? failed = null;
+        if (tickType.GetProperty("Results")!.GetValue(result) is System.Collections.IEnumerable rows)
+        {
+            foreach (object row in rows)
+            {
+                bool succeeded = Convert.ToBoolean(row.GetType().GetProperty("Succeeded")!.GetValue(row)!, CultureInfo.InvariantCulture);
+                if (!succeeded)
+                {
+                    failed = row.GetType().GetProperty("Code")!.GetValue(row) as string;
+                    break;
+                }
+            }
+        }
+
         return (EntrySuccess, Json(new Dictionary<string, object?>
         {
-            ["ok"] = true,
+            ["ok"] = failed is null,
             ["appliedTick"] = applied,
             ["revision"] = revision,
+            ["eventCount"] = eventCount,
+            ["code"] = failed,
         }));
     }
 
@@ -398,23 +421,32 @@ public static class HostEntry
 
     private static (int, byte[]) Persist(JsonElement root)
     {
-        if (Chat is null || PersistType is null)
+        if (Chat is null)
         {
             return (EntrySuccess, Fail("invalid_request"));
         }
 
         object? world = GetChatWorld();
-        if (world is null)
+        Type? persistType = PersistPipelineOf(world);
+        if (world is null || persistType is null)
+        {
+            return (EntrySuccess, Fail("runtime_failure"));
+        }
+
+        MethodInfo? capture = FindStatic(
+            persistType,
+            "CapturePersist",
+            static parameters => parameters.Length == 2 && parameters[1].ParameterType.IsByRef);
+        if (capture is null)
         {
             return (EntrySuccess, Fail("runtime_failure"));
         }
 
         object[] args = { world, null! };
-        object result = PersistType.GetMethod("CapturePersist", new[] { world.GetType(), typeof(byte[]).MakeByRefType() })!
-            .Invoke(null, args)!;
+        object result = capture.Invoke(null, args)!;
         bool accepted = Convert.ToInt32(result.GetType().GetProperty("Status")!.GetValue(result)!, CultureInfo.InvariantCulture) == 0;
         byte[]? bytes = args[1] as byte[];
-        if (!accepted || bytes is null)
+        if (!accepted || bytes is null || bytes.Length == 0)
         {
             return (EntrySuccess, Fail("runtime_failure"));
         }
@@ -428,22 +460,53 @@ public static class HostEntry
 
     private static (int, byte[]) Restore(JsonElement root)
     {
-        if (Chat is null || PersistType is null || !TryReadString(root, "bytesHex", out string? hex) || hex is null)
+        if (Chat is null || !TryReadString(root, "bytesHex", out string? hex) || hex is null)
         {
             return (EntrySuccess, Fail("invalid_request"));
         }
 
         object? world = GetChatWorld();
-        if (world is null)
+        Type? persistType = PersistPipelineOf(world);
+        if (world is null || persistType is null)
+        {
+            return (EntrySuccess, Fail("runtime_failure"));
+        }
+
+        MethodInfo? restore = FindStatic(
+            persistType,
+            "RestorePersist",
+            static parameters =>
+                parameters.Length == 2
+                && parameters[1].ParameterType.IsGenericType
+                && parameters[1].ParameterType.GetGenericTypeDefinition() == typeof(ReadOnlyMemory<>));
+        if (restore is null)
         {
             return (EntrySuccess, Fail("runtime_failure"));
         }
 
         byte[] bytes = Convert.FromHexString(hex);
-        object result = PersistType.GetMethod("RestorePersist", new[] { world.GetType(), typeof(byte[]) })!
-            .Invoke(null, new object[] { world, bytes })!;
+        ReadOnlyMemory<byte> memory = bytes;
+        object result = restore.Invoke(null, new object[] { world, memory })!;
         bool accepted = Convert.ToInt32(result.GetType().GetProperty("Status")!.GetValue(result)!, CultureInfo.InvariantCulture) == 0;
         return (EntrySuccess, accepted ? Ok() : Fail("runtime_failure"));
+    }
+
+    private static Type? PersistPipelineOf(object? world)
+    {
+        return world?.GetType().Assembly.GetType("Lumio.GameRuntime.Ecs.EcsPersistSnapshotPipeline") ?? PersistType;
+    }
+
+    private static MethodInfo? FindStatic(Type type, string name, Func<ParameterInfo[], bool> match)
+    {
+        foreach (MethodInfo method in type.GetMethods(BindingFlags.Public | BindingFlags.Static))
+        {
+            if (method.Name == name && match(method.GetParameters()))
+            {
+                return method;
+            }
+        }
+
+        return null;
     }
 
     private static object? GetChatWorld()

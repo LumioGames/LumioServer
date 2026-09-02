@@ -163,10 +163,37 @@ impl QueryResult {
 }
 
 /// Tick result used only to know which tick/revision to request on the wire.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeTick {
     pub applied_tick: u64,
     pub revision: u64,
+    pub ok: bool,
+    pub event_count: u64,
+    pub code: Option<String>,
+}
+
+impl RuntimeTick {
+    #[must_use]
+    pub fn failed(code: &str) -> Self {
+        Self {
+            applied_tick: 0,
+            revision: 0,
+            ok: false,
+            event_count: 0,
+            code: Some(code.to_owned()),
+        }
+    }
+
+    #[must_use]
+    pub fn committed(applied_tick: u64, revision: u64, event_count: u64) -> Self {
+        Self {
+            applied_tick,
+            revision,
+            ok: true,
+            event_count,
+            code: None,
+        }
+    }
 }
 
 /// Chat admit/apply outcome.

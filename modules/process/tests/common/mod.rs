@@ -8,6 +8,7 @@ use lumio_host_runtime::{KernelError, KernelFired, KernelHandle, KernelTimer, Ti
 use lumio_server_process::entity_chat::{
     AttributeQueryOutcome, BoundEntityKind, ChatOperation, PersistRecord, QueryResult, RebindMode,
     RuntimeAdmit, RuntimeBinding, RuntimeQuery, RuntimeSurface, RuntimeTick,
+    MAX_CHAT_INPUTS_PER_TICK,
 };
 
 pub const DISPATCH_EXPIRE: u32 = 1;
@@ -141,6 +142,8 @@ pub struct ScriptedRuntime {
     revision: u64,
     expire_calls: Vec<String>,
     restore_calls: usize,
+    pending_chats: Vec<(String, String)>,
+    events_by_tick: HashMap<u64, Vec<(String, String)>>,
 }
 
 impl ScriptedRuntime {
@@ -161,6 +164,8 @@ impl ScriptedRuntime {
             revision: 0,
             expire_calls: Vec::new(),
             restore_calls: 0,
+            pending_chats: Vec::new(),
+            events_by_tick: HashMap::new(),
         }
     }
 
@@ -379,12 +384,14 @@ impl RuntimeSurface for ScriptedRuntime {
 
     fn admit_input_command(
         &mut self,
-        _room_id: &str,
+        room_id: &str,
         connection: &str,
         _generation: u64,
         _envelope_json: &str,
     ) -> ChatOperation {
         if self.by_connection.contains_key(connection) {
+            self.pending_chats
+                .push((room_id.to_owned(), connection.to_owned()));
             ChatOperation::admitted()
         } else {
             ChatOperation::rejected("disconnected")
@@ -394,10 +401,19 @@ impl RuntimeSurface for ScriptedRuntime {
     fn run_tick(&mut self, _room_id: &str, tick_id: u64) -> RuntimeTick {
         self.tick = tick_id;
         self.revision += 1;
-        RuntimeTick {
-            applied_tick: self.tick,
-            revision: self.revision,
+        let pending = std::mem::take(&mut self.pending_chats);
+        if pending.len() > MAX_CHAT_INPUTS_PER_TICK {
+            return RuntimeTick {
+                applied_tick: 0,
+                revision: self.revision,
+                ok: false,
+                event_count: 0,
+                code: Some("runtime_failure".to_owned()),
+            };
         }
+        let event_count = pending.len() as u64;
+        self.events_by_tick.insert(tick_id, pending);
+        RuntimeTick::committed(self.tick, self.revision, event_count)
     }
 
     fn build_full_snapshot(&mut self, _room_id: &str, tick_id: u64, revision: u64) -> Vec<u8> {
@@ -413,14 +429,31 @@ impl RuntimeSurface for ScriptedRuntime {
         .into_bytes()
     }
 
-    fn build_delta(&mut self, _room_id: &str, tick_id: u64, revision: u64) -> Vec<Vec<u8>> {
+    fn build_delta(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<Vec<u8>> {
         if !self.planted_delta.is_empty() {
             return self.planted_delta.clone();
         }
-        vec![format!(
-            r#"{{"messageType":"Delta","tickId":{tick_id},"revision":{revision},"changedBlocks":[]}}"#
-        )
-        .into_bytes()]
+        let mut frames = Vec::new();
+        if let Some(committed) = self.events_by_tick.get(&tick_id) {
+            for (room, _) in committed {
+                if room == room_id {
+                    frames.push(
+                        format!(
+                            r#"{{"messageType":"Delta","tickId":{tick_id},"revision":{revision},"changedBlocks":[{{"mappingId":"chat.event","payload":"{tick_id}","payloadSha256":"bb"}}]}}"#
+                        )
+                        .into_bytes(),
+                    );
+                }
+            }
+        }
+        if frames.is_empty() {
+            vec![format!(
+                r#"{{"messageType":"Delta","tickId":{tick_id},"revision":{revision},"changedBlocks":[]}}"#
+            )
+            .into_bytes()]
+        } else {
+            frames
+        }
     }
 
     fn persist(&mut self, _room_id: &str) -> PersistRecord {

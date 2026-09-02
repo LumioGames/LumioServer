@@ -593,18 +593,15 @@ impl Inner {
     fn run_tick(&mut self, room_id: &str) -> RuntimeTick {
         self.tick_id = self.tick_id.saturating_add(1);
         let Ok(fired) = self.kernel.advance_tick_frame(self.tick_id) else {
-            return RuntimeTick {
-                applied_tick: 0,
-                revision: 0,
-            };
+            return RuntimeTick::failed("runtime_failure");
         };
         if !fired.iter().any(|row| row.dispatch_id == DISPATCH_TICK) {
-            return RuntimeTick {
-                applied_tick: 0,
-                revision: 0,
-            };
+            return RuntimeTick::failed("runtime_failure");
         }
         let tick = self.runtime.run_tick(room_id, self.tick_id);
+        if !tick.ok {
+            return tick;
+        }
         let frames = self
             .runtime
             .build_delta(room_id, tick.applied_tick, tick.revision);
