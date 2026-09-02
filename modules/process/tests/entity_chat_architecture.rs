@@ -301,6 +301,26 @@ fn suite_chat_burst_does_not_host_admit_bot_utterances() {
 }
 
 #[test]
+fn generated_hook_build_isolates_from_parent_directory_build_props() {
+    let bots = fs::read_to_string(process_root().join("src/entity_chat/bots.rs")).expect("bots.rs");
+    let production = bots
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production bots.rs");
+    assert!(
+        production.contains("write_hook_isolation_files")
+            && production.contains("Directory.Build.props")
+            && production.contains("TreatWarningsAsErrors")
+            && production.contains(">false<"),
+        "generated Bot.Host hook must write isolating Directory.Build.props with TreatWarningsAsErrors false"
+    );
+    assert!(
+        production.contains("hook_compile_failure_text") || production.contains("output.stdout"),
+        "hook compile BLOCKED text must include dotnet stdout, not only empty stderr"
+    );
+}
+
+#[test]
 fn owned_sources_have_no_hardcoded_dev_machine_paths() {
     let mut hits = Vec::new();
     for (path, text) in read_owned_sources() {

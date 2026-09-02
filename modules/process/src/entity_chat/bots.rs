@@ -268,6 +268,51 @@ fn hook_source() -> PathBuf {
         .join("src/entity_chat/bot_startup_hook/StartupHook.cs")
 }
 
+/// Stops parent (Game evidence) Directory.Build.props from failing the hook build.
+pub(crate) fn write_hook_isolation_files(hook_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(hook_dir).map_err(|error| error.to_string())?;
+    std::fs::write(
+        hook_dir.join("Directory.Build.props"),
+        r"<Project>
+  <PropertyGroup>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+    <AnalysisLevel>none</AnalysisLevel>
+    <ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>
+  </PropertyGroup>
+</Project>
+",
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::write(hook_dir.join("Directory.Build.targets"), "<Project />\n")
+        .map_err(|error| error.to_string())?;
+    std::fs::write(
+        hook_dir.join("Directory.Packages.props"),
+        r"<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>
+",
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn hook_compile_failure_text(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = String::from_utf8_lossy(stdout);
+    let mut text = stderr.trim().to_owned();
+    let stdout = stdout.trim();
+    if !stdout.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(stdout);
+    }
+    text
+}
+
 fn compile_startup_hook(out_dir: &Path, bot_dll: &Path, dotnet: &str) -> Result<PathBuf, String> {
     let source = hook_source();
     if !source.is_file() {
@@ -277,7 +322,7 @@ fn compile_startup_hook(out_dir: &Path, bot_dll: &Path, dotnet: &str) -> Result<
         ));
     }
     let hook_dir = out_dir.join("bot-hook");
-    std::fs::create_dir_all(&hook_dir).map_err(|error| error.to_string())?;
+    write_hook_isolation_files(&hook_dir)?;
     std::fs::copy(&source, hook_dir.join("StartupHook.cs")).map_err(|error| error.to_string())?;
     let hint = bot_dll.display().to_string().replace('\\', "/");
     let csproj = format!(
@@ -287,6 +332,8 @@ fn compile_startup_hook(out_dir: &Path, bot_dll: &Path, dotnet: &str) -> Result<
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
     <AssemblyName>Lumio.EntityChat.BotStartupHook</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
@@ -312,7 +359,7 @@ fn compile_startup_hook(out_dir: &Path, bot_dll: &Path, dotnet: &str) -> Result<
     if !output.status.success() {
         return Err(format!(
             "BLOCKED: compile Bot.Host startup hook failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            hook_compile_failure_text(&output.stdout, &output.stderr)
         ));
     }
     let dll = hook_dir
@@ -400,7 +447,9 @@ fn parse_trace(path: &Path) -> Result<ClientBotTrace, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{discover_bot_host_in, BotHostEnv};
+    use super::{
+        discover_bot_host_in, hook_compile_failure_text, write_hook_isolation_files, BotHostEnv,
+    };
     use std::collections::HashMap;
     use std::fs;
 
@@ -455,5 +504,116 @@ mod tests {
         );
         let found = discover_bot_host_in(&MapEnv(env), tmp.path()).expect("discover");
         assert_eq!(found, csproj);
+    }
+
+    const GAME_LIKE_PROPS: &str = r"<Project>
+  <PropertyGroup>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+  </PropertyGroup>
+</Project>
+";
+
+    const ANALYZER_WARN_CS: &str = r#"using System.Runtime.InteropServices;
+using System.Text.Json;
+internal static class Warn
+{
+    public static string Go(int n)
+    {
+        var options = new JsonSerializerOptions();
+        return n.ToString();
+    }
+    [DllImport("kernel32", CharSet = CharSet.Ansi)]
+    private static extern int Native(string path);
+}
+"#;
+
+    fn write_warn_csproj(dir: &std::path::Path) {
+        fs::write(
+            dir.join("Warn.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>Lumio.EntityChat.BotHookWarn</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Warn.cs" />
+  </ItemGroup>
+</Project>
+"#,
+        )
+        .expect("csproj");
+        fs::write(dir.join("Warn.cs"), ANALYZER_WARN_CS).expect("cs");
+    }
+
+    fn dotnet_build(dir: &std::path::Path) -> std::process::Output {
+        std::process::Command::new("dotnet")
+            .arg("build")
+            .arg("Warn.csproj")
+            .arg("-c")
+            .arg("Debug")
+            .arg("--nologo")
+            .current_dir(dir)
+            .output()
+            .expect("dotnet build")
+    }
+
+    #[test]
+    fn game_parent_props_turn_hook_analyzer_warnings_into_errors() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        fs::write(tmp.path().join("Directory.Build.props"), GAME_LIKE_PROPS).expect("game props");
+        let hook_dir = tmp
+            .path()
+            .join("integration/entity-chat/evidence/round-1/client-bots/bot-hook");
+        fs::create_dir_all(&hook_dir).expect("hook dir");
+        write_warn_csproj(&hook_dir);
+        let output = dotnet_build(&hook_dir);
+        assert!(
+            !output.status.success(),
+            "Game TreatWarningsAsErrors must fail an unisolated hook build"
+        );
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains("CA1869") || text.contains("CA2101") || text.contains("CA1305"),
+            "expected analyzer errors on stdout, got {text}"
+        );
+    }
+
+    #[test]
+    fn isolated_hook_dir_builds_under_game_treat_warnings_as_errors() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        fs::write(tmp.path().join("Directory.Build.props"), GAME_LIKE_PROPS).expect("game props");
+        let hook_dir = tmp
+            .path()
+            .join("integration/entity-chat/evidence/round-1/client-bots/bot-hook");
+        write_hook_isolation_files(&hook_dir).expect("isolate");
+        write_warn_csproj(&hook_dir);
+        let output = dotnet_build(&hook_dir);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "isolated hook must build under Game Directory.Build.props, got {text}"
+        );
+    }
+
+    #[test]
+    fn hook_compile_blocked_text_includes_stdout_when_stderr_empty() {
+        let text = hook_compile_failure_text(b"error CA1869: cache JsonSerializerOptions\n", b"");
+        assert!(
+            text.contains("CA1869"),
+            "BLOCKED suffix must keep analyzer text from stdout, got {text}"
+        );
     }
 }
