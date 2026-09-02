@@ -178,15 +178,6 @@ fn isolation_rejects_cross_room_query() {
 #[test]
 fn attribute_query_is_forwarded_to_runtime() {
     let runtime = SharedRuntime::new();
-    {
-        let mut guard = runtime.lock();
-        guard.plant_query(
-            "room-main",
-            "pending",
-            "EntityIdentity.restrictedFlag",
-            QueryResult::fail(AttributeQueryOutcome::Unauthorized),
-        );
-    }
     let (host, keys) = host_with(runtime.clone());
     let _ = host.admit(
         "room-main".to_owned(),
@@ -203,7 +194,7 @@ fn attribute_query_is_forwarded_to_runtime() {
     runtime.lock().plant_query(
         "room-main",
         &binding.net_entity_id,
-        "EntityIdentity.restrictedFlag",
+        "EntityIdentity.claimedMark",
         QueryResult::fail(AttributeQueryOutcome::Unauthorized),
     );
     let ok = host.query_attribute(AttributeQueryRequest {
@@ -224,7 +215,7 @@ fn attribute_query_is_forwarded_to_runtime() {
         caller_scope: AttributeQueryScope::ClientReplica,
         room_id: "room-main".to_owned(),
         net_entity_id: binding.net_entity_id.clone(),
-        attribute_id: "EntityIdentity.restrictedFlag".to_owned(),
+        attribute_id: "EntityIdentity.claimedMark".to_owned(),
         connection_generation: None,
     });
     let missing = host.query_attribute(AttributeQueryRequest {
@@ -367,4 +358,50 @@ fn sixty_five_chat_inputs_one_tick_empty_delta_is_not_success() {
             "budget fault must not be treated as a successful tick"
         ),
     }
+}
+
+#[test]
+fn claimed_mark_client_replica_is_contract_unauthorized() {
+    let (host, keys) = host_with(SharedRuntime::new());
+    let _ = host.admit(
+        "room-main".to_owned(),
+        "c-browser".to_owned(),
+        credential(&keys, "Browser01", false),
+    );
+    let binding = host.must_self("c-browser");
+    let unauthorized = host.query_attribute(AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ClientReplica,
+        room_id: "room-main".to_owned(),
+        net_entity_id: binding.net_entity_id,
+        attribute_id: "EntityIdentity.claimedMark".to_owned(),
+        connection_generation: None,
+    });
+    assert_eq!(
+        unauthorized.outcome,
+        AttributeQueryOutcome::Unauthorized,
+        "claim-scoped claimedMark without a claim is contract Unauthorized, not {:?}",
+        unauthorized.outcome
+    );
+}
+
+#[test]
+fn resolve_accepts_runtime_32_hex_and_c1_u64() {
+    let (host, keys) = host_with(SharedRuntime::new());
+    let bot = host.admit(
+        "room-main".to_owned(),
+        "c-bot01".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    let hex = bot.binding.expect("binding").net_entity_id;
+    assert_eq!(hex.len(), 32);
+    assert!(host
+        .try_resolve_by_net_entity_id("room-main".to_owned(), hex.clone())
+        .is_some());
+    let as_u64 = u64::from_str_radix(&hex, 16).expect("runtime 32-hex is a u64");
+    let resolved = host.try_resolve_by_net_entity_id("room-main".to_owned(), as_u64.to_string());
+    assert!(
+        resolved.is_some(),
+        "C-1 u64 decimal {as_u64} must resolve the Runtime 32-hex {hex}"
+    );
+    assert_eq!(resolved.expect("row").net_entity_id, hex);
 }

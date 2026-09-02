@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use crate::runtime_bridge::{BridgeError, ClrBridge, ClrStart};
 use crate::sdk_loader;
 
+use super::envelope::normalize_net_entity_id;
 use super::runtime::BoundEntityKind;
 use super::runtime::{
     ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding,
@@ -178,6 +179,7 @@ impl RuntimeSurface for ClrGameplay {
     }
 
     fn expire(&mut self, net_entity_id: &str) -> Result<(), String> {
+        let net_entity_id = normalize_net_entity_id(net_entity_id);
         let value = self.call(json!({ "op": "expire", "netEntityId": net_entity_id }))?;
         if value.get("ok").and_then(Value::as_bool) == Some(true) {
             Ok(())
@@ -201,13 +203,21 @@ impl RuntimeSurface for ClrGameplay {
         room_id: &str,
         net_entity_id: &str,
     ) -> Option<RuntimeBinding> {
-        self.call(json!({
-            "op": "resolve",
-            "roomId": room_id,
-            "netEntityId": net_entity_id
-        }))
-        .ok()
-        .and_then(|value| value.get("binding").and_then(binding_from))
+        let net_entity_id = normalize_net_entity_id(net_entity_id);
+        if let Some(binding) = self
+            .call(json!({
+                "op": "resolve",
+                "roomId": room_id,
+                "netEntityId": net_entity_id
+            }))
+            .ok()
+            .and_then(|value| value.get("binding").and_then(binding_from))
+        {
+            return Some(binding);
+        }
+        self.list_bindings(room_id)
+            .into_iter()
+            .find(|row| normalize_net_entity_id(&row.net_entity_id) == net_entity_id)
     }
 
     fn query_attribute(&mut self, request: &RuntimeQuery) -> QueryResult {
@@ -215,7 +225,7 @@ impl RuntimeSurface for ClrGameplay {
             "op": "query",
             "callerScope": request.caller_scope.as_runtime_str(),
             "roomId": request.room_id,
-            "netEntityId": request.net_entity_id,
+            "netEntityId": normalize_net_entity_id(&request.net_entity_id),
             "attributeId": request.attribute_id,
             "connectionGeneration": request.connection_generation,
         })) {

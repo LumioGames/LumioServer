@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -290,22 +291,34 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let process_name = replay_process_name();
     let census_payload = census_payload(&admits);
     let host_audit = host_audit(&process_name, &admits, MAIN_ROOM);
-    let playwright = capture_browser_login(&account.uri(), TEST_PASSWORD, out_dir);
-    let playwright_ran = playwright.playwright_ran();
-    scenarios.insert(
-        "3".to_owned(),
-        json!({
-            "ok": browser_ok && full.total == 101 && full.bot_count == 100 && full.player_count == 1 && playwright_ran,
-            "total": full.total,
-            "botCount": full.bot_count,
-            "playerCount": full.player_count,
-            "playwrightRan": playwright_ran,
-            "loginAccepted": browser_login.accepted,
-            "loginError": browser_login.error_code,
-            "verifyError": browser_verify,
-            "admitError": browser_admit_code,
-        }),
-    );
+    let listen_uri = host.listen_uri();
+    let mut browser_wire = RoomClient::connect(&listen_uri, "c-browser").ok();
+    if let Some(client) = browser_wire.as_mut() {
+        let _ = client.recv_text();
+    }
+    let before_observers = host.wire_observer_count("c-browser".to_owned());
+    let account_uri = account.uri();
+    let out_dir_pw = out_dir.to_path_buf();
+    let listen_pw = listen_uri.clone();
+    let pw_thread = super::browser::game_root().ok().map(|_| {
+        thread::spawn(move || {
+            capture_browser_login(
+                &account_uri,
+                Some(&listen_pw),
+                TEST_PASSWORD,
+                &out_dir_pw,
+                101,
+            )
+        })
+    });
+    if pw_thread.is_some() {
+        let _ = wait_for_wire_observers(
+            &host,
+            "c-browser",
+            before_observers.saturating_add(1),
+            Duration::from_secs(25),
+        );
+    }
 
     let mut resolved = 0;
     for (connection, _) in &connections {
@@ -329,6 +342,23 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
 
     let Some(browser_binding) = host.try_self_lookup("c-browser".to_owned()) else {
         blocked = blocked.or(Some("browser connection was not bound".to_owned()));
+        let playwright = match pw_thread {
+            Some(handle) => handle
+                .join()
+                .unwrap_or_else(|_| super::browser::PlaywrightCapture::failed("playwright thread")),
+            None => super::browser::PlaywrightCapture::failed("browser connection was not bound"),
+        };
+        scenarios.insert(
+            "3".to_owned(),
+            json!({
+                "ok": false,
+                "playwrightRan": playwright.playwright_ran(),
+                "loginAccepted": browser_login.accepted,
+                "loginError": browser_login.error_code,
+                "verifyError": browser_verify,
+                "admitError": browser_admit_code,
+            }),
+        );
         let evidence = json!({
             "ok": false,
             "blocked": blocked,
@@ -360,7 +390,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         caller_scope: AttributeQueryScope::ClientReplica,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: browser_binding.net_entity_id.clone(),
-        attribute_id: "EntityIdentity.restrictedFlag".to_owned(),
+        attribute_id: "EntityIdentity.claimedMark".to_owned(),
         connection_generation: None,
     });
     let missing = host.query_attribute(AttributeQueryRequest {
@@ -401,10 +431,6 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     );
 
     let mut first_envelope: Option<InputCommand> = None;
-    let mut browser_wire = RoomClient::connect(&host.listen_uri(), "c-browser").ok();
-    if let Some(client) = browser_wire.as_mut() {
-        let _ = client.recv_text();
-    }
     let mut pending_chats = 0usize;
     let mut tick = RuntimeTick::default();
     let mut received = Vec::new();
@@ -445,6 +471,28 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let first_block = first_envelope
         .as_ref()
         .and_then(|envelope| envelope.commands.first());
+    let playwright = match pw_thread {
+        Some(handle) => handle
+            .join()
+            .unwrap_or_else(|_| super::browser::PlaywrightCapture::failed("playwright thread")),
+        None => super::browser::PlaywrightCapture::failed("BLOCKED: LUMIO_GAME_ROOT is not set"),
+    };
+    let playwright_ran = playwright.playwright_ran();
+    let browser_room_observed = chat_events.len() == 101;
+    scenarios.insert(
+        "3".to_owned(),
+        json!({
+            "ok": browser_ok && full.total == 101 && full.bot_count == 100 && full.player_count == 1 && playwright_ran && browser_room_observed,
+            "total": full.total,
+            "botCount": full.bot_count,
+            "playerCount": full.player_count,
+            "playwrightRan": playwright_ran,
+            "loginAccepted": browser_login.accepted,
+            "loginError": browser_login.error_code,
+            "verifyError": browser_verify,
+            "admitError": browser_admit_code,
+        }),
+    );
     scenarios.insert(
         "6".to_owned(),
         json!({
@@ -795,6 +843,24 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     });
     write_evidence(out_dir, &evidence, &host_audit);
     evidence
+}
+
+fn wait_for_wire_observers(
+    host: &EntityChatHost,
+    connection: &str,
+    min: usize,
+    budget: Duration,
+) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if host.wire_observer_count(connection.to_owned()) >= min {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return host.wire_observer_count(connection.to_owned()) >= min;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn is_chat_event_delta(frame: &str) -> bool {

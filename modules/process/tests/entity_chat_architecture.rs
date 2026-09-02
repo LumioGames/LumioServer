@@ -135,6 +135,79 @@ fn suite_connection_superseded_received_must_not_copy_takeover() {
 }
 
 #[test]
+fn suite_attaches_c_browser_room_ws_before_chat_burst() {
+    let text =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    let browser = text
+        .find("RoomClient::connect(&listen_uri, \"c-browser\")")
+        .or_else(|| text.find("RoomClient::connect(&host.listen_uri(), \"c-browser\")"))
+        .expect("suite must attach c-browser as a RoomClient");
+    let burst = text
+        .find("for (connection, name) in &connections")
+        .expect("chat burst loop");
+    assert!(
+        browser < burst,
+        "c-browser Room WS must be attached before the 101 chat burst"
+    );
+}
+
+#[test]
+fn suite_playwright_ran_requires_browser_room_observation() {
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    let browser =
+        fs::read_to_string(process_root().join("src/entity_chat/browser.rs")).expect("browser.rs");
+    assert!(
+        browser.contains("room=") || suite.contains("room="),
+        "Playwright page URL must include the Room listen URI so the browser joins before chats"
+    );
+    assert!(
+        suite.contains("playwright_ran")
+            && (suite.contains("received_from_network")
+                || suite.contains("receivedFromNetwork")
+                || suite.contains("playwright_ran()")),
+        "S3 playwrightRan must come from Playwright Room observation, not account-login-only"
+    );
+    assert!(
+        !suite.contains("\"playwrightRan\": true"),
+        "must not hard-code playwrightRan true"
+    );
+}
+
+#[test]
+fn suite_unauthorized_query_uses_claimed_mark_not_undeclared_flag() {
+    let text =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    assert!(
+        text.contains("EntityIdentity.claimedMark"),
+        "S5 unauthorized must query Runtime claim-scoped EntityIdentity.claimedMark"
+    );
+    assert!(
+        !text.contains("EntityIdentity.restrictedFlag"),
+        "restrictedFlag is undeclared and maps to RequestError, not contract Unauthorized"
+    );
+}
+
+#[test]
+fn host_entry_resolve_forwards_ok_entity_as_binding() {
+    let path = process_root()
+        .parent()
+        .expect("modules")
+        .parent()
+        .expect("repo")
+        .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
+    let text = fs::read_to_string(&path).expect("HostEntry.cs");
+    assert!(
+        text.contains("ListBindings") && text.contains("ResolveByNetEntityId"),
+        "Resolve OkEntity has no Binding; HostEntry must attach the listed ConnectionBinding"
+    );
+    assert!(
+        text.contains("x32") || text.contains("NormalizeNetEntityId"),
+        "Resolve must accept C-1 u64 and Runtime 32-hex NetEntityId"
+    );
+}
+
+#[test]
 fn suite_schedules_kernel_tick_every_max_chat_inputs() {
     let text =
         fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");

@@ -10,7 +10,9 @@ use lumio_host_runtime::{
 };
 
 use super::admission::{is_bot_namespace, verify_admission, AdmissionPayload};
-use super::envelope::{connection_superseded_json, net_entity_id_to_u64, InputCommand};
+use super::envelope::{
+    connection_superseded_json, net_entity_id_to_u64, normalize_net_entity_id, InputCommand,
+};
 use super::runtime::BoundEntityKind;
 use super::runtime::{
     AttributeQueryScope, ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit,
@@ -136,7 +138,7 @@ struct Session {
     net_entity_id: String,
     entity_type: BoundEntityKind,
     generation: u64,
-    egress: Option<WireSender>,
+    egresses: Vec<WireSender>,
 }
 
 struct Inner {
@@ -150,7 +152,7 @@ struct Inner {
     sessions: HashMap<String, Session>,
     account_sessions: HashMap<String, String>,
     expire_watch: HashMap<KernelHandle, String>,
-    pending_egress: HashMap<String, WireSender>,
+    pending_egress: HashMap<String, Vec<WireSender>>,
     tick_id: u64,
 }
 
@@ -352,7 +354,25 @@ impl EntityChatHost {
         room_id: String,
         net_entity_id: String,
     ) -> Option<EntityResolution> {
+        let net_entity_id = normalize_net_entity_id(&net_entity_id);
         self.on_owner(move |inner| inner.try_resolve_by_net_entity_id(&room_id, &net_entity_id))
+    }
+
+    /// Count live Room WS observers for a connection (harness wait).
+    #[must_use]
+    pub fn wire_observer_count(&self, connection_id: String) -> usize {
+        self.on_owner(move |inner| {
+            inner
+                .sessions
+                .get(&connection_id)
+                .map(|session| session.egresses.len())
+                .unwrap_or(0)
+                + inner
+                    .pending_egress
+                    .get(&connection_id)
+                    .map(Vec::len)
+                    .unwrap_or(0)
+        })
     }
 
     /// C-2 attribute query forwarded to Runtime.
@@ -481,7 +501,7 @@ impl Inner {
         let new_generation = binding.connection_generation;
         let net_u64 = net_entity_id_to_u64(&binding.net_entity_id).unwrap_or(0);
         if let Some(old) = self.sessions.remove(old_id) {
-            if let Some(egress) = &old.egress {
+            for egress in &old.egresses {
                 let _ = egress.send_text(connection_superseded_json(net_u64, new_generation));
                 let _ = egress.close();
             }
@@ -509,7 +529,10 @@ impl Inner {
             return RoomAdmitResult::reject("runtime_failure");
         }
         let session_id = session_id_for(&payload.login_name, reconnected || takeover);
-        let egress = self.pending_egress.remove(connection_id);
+        let egresses = self
+            .pending_egress
+            .remove(connection_id)
+            .unwrap_or_default();
         let session = Session {
             connection_id: connection_id.to_owned(),
             session_id: session_id.clone(),
@@ -519,7 +542,7 @@ impl Inner {
             net_entity_id: runtime_binding.net_entity_id.clone(),
             entity_type: runtime_binding.entity_type,
             generation: runtime_binding.connection_generation,
-            egress,
+            egresses,
         };
         let binding = ConnectionBinding::from_runtime(runtime_binding, session_id);
         self.account_sessions
@@ -534,7 +557,7 @@ impl Inner {
             return false;
         };
         self.account_sessions.remove(&session.account_id);
-        if let Some(egress) = &session.egress {
+        for egress in &session.egresses {
             let _ = egress.close();
         }
         let _ = self.runtime.disconnect(connection_id);
@@ -609,18 +632,16 @@ impl Inner {
         tick
     }
 
-    fn broadcast(&self, room_id: &str, frames: &[Vec<u8>]) {
-        for session in self.sessions.values() {
+    fn broadcast(&mut self, room_id: &str, frames: &[Vec<u8>]) {
+        for session in self.sessions.values_mut() {
             if session.room_id != room_id {
                 continue;
             }
-            let Some(egress) = &session.egress else {
-                continue;
-            };
-            for frame in frames {
-                let text = String::from_utf8_lossy(frame).into_owned();
-                let _ = egress.send_text(text);
-            }
+            session.egresses.retain(|egress| {
+                frames
+                    .iter()
+                    .all(|frame| egress.send_text(String::from_utf8_lossy(frame).into_owned()))
+            });
         }
     }
 
@@ -629,9 +650,25 @@ impl Inner {
             return;
         };
         let room_id = session.room_id.clone();
-        let Some(egress) = session.egress.clone() else {
+        let egresses = session.egresses.clone();
+        if egresses.is_empty() {
+            return;
+        }
+        let bytes = self.runtime.build_full_snapshot(&room_id, self.tick_id, 0);
+        if bytes.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        for egress in &egresses {
+            let _ = egress.send_text(text.clone());
+        }
+    }
+
+    fn send_full_snapshot_to(&mut self, connection_id: &str, egress: &WireSender) {
+        let Some(session) = self.sessions.get(connection_id) else {
             return;
         };
+        let room_id = session.room_id.clone();
         let bytes = self.runtime.build_full_snapshot(&room_id, self.tick_id, 0);
         if bytes.is_empty() {
             return;
@@ -645,11 +682,16 @@ impl Inner {
                 connection_id,
                 egress,
             } => {
-                if let Some(session) = self.sessions.get_mut(&connection_id) {
-                    session.egress = Some(egress);
-                    self.send_full_snapshot(&connection_id);
+                if self.sessions.contains_key(&connection_id) {
+                    if let Some(session) = self.sessions.get_mut(&connection_id) {
+                        session.egresses.push(egress.clone());
+                    }
+                    self.send_full_snapshot_to(&connection_id, &egress);
                 } else {
-                    self.pending_egress.insert(connection_id, egress);
+                    self.pending_egress
+                        .entry(connection_id)
+                        .or_default()
+                        .push(egress);
                 }
             }
             WireEvent::Input {
@@ -660,10 +702,8 @@ impl Inner {
                     let _ = self.admit_chat_input(&connection_id, &envelope);
                 }
             }
-            WireEvent::Closed { connection_id } => {
-                if let Some(session) = self.sessions.get_mut(&connection_id) {
-                    session.egress = None;
-                }
+            WireEvent::Closed { .. } => {
+                // One socket close must not drop other c-browser observers (Playwright + harness).
             }
         }
     }
@@ -682,9 +722,16 @@ impl Inner {
         room_id: &str,
         net_entity_id: &str,
     ) -> Option<EntityResolution> {
+        let id = normalize_net_entity_id(net_entity_id);
         let runtime = self
             .runtime
-            .resolve_by_net_entity_id(room_id, net_entity_id)?;
+            .resolve_by_net_entity_id(room_id, &id)
+            .or_else(|| {
+                self.runtime
+                    .list_bindings(room_id)
+                    .into_iter()
+                    .find(|row| normalize_net_entity_id(&row.net_entity_id) == id)
+            })?;
         Some(EntityResolution {
             net_entity_id: runtime.net_entity_id,
             room_id: runtime.room_id,
@@ -697,7 +744,7 @@ impl Inner {
         self.runtime.query_attribute(&RuntimeQuery {
             caller_scope: request.caller_scope,
             room_id: request.room_id.clone(),
-            net_entity_id: request.net_entity_id.clone(),
+            net_entity_id: normalize_net_entity_id(&request.net_entity_id),
             attribute_id: request.attribute_id.clone(),
             connection_generation: request.connection_generation,
         })

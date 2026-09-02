@@ -37,7 +37,9 @@ pub use admission::{
 };
 pub use clr::{ClrGameplay, ClrGameplayConfig};
 pub use discover::{discover, ReplayArtifacts};
-pub use envelope::{CommandBlock, InputCommand, CHAT_INPUT_MAPPING, MESSAGE_TYPE};
+pub use envelope::{
+    normalize_net_entity_id, CommandBlock, InputCommand, CHAT_INPUT_MAPPING, MESSAGE_TYPE,
+};
 pub use host::{
     AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution,
     RoomAdmitResult, RoomCensus, DISPATCH_EXPIRE, DISPATCH_TICK,

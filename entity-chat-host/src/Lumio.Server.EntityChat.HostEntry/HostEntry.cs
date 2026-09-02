@@ -232,6 +232,7 @@ public static class HostEntry
             return (EntrySuccess, Fail("invalid_request"));
         }
 
+        id = NormalizeNetEntityId(id);
         object result = BindingType!.GetMethod("Expire", new[] { typeof(string) })!
             .Invoke(Bindings, new object[] { id })!;
         return FromBindingResult(result);
@@ -259,7 +260,10 @@ public static class HostEntry
             return (EntrySuccess, Fail("invalid_request"));
         }
 
-        object result = BindingType!.GetMethod("ResolveByNetEntityId")!
+        id = NormalizeNetEntityId(id);
+        object result = BindingType!.GetMethod(
+                "ResolveByNetEntityId",
+                new[] { typeof(string), typeof(string), typeof(ulong?), typeof(string) })!
             .Invoke(Bindings, new object?[] { room, id, null, "server-authoritative" })!;
         return FromBindingResult(result);
     }
@@ -275,7 +279,10 @@ public static class HostEntry
         object request = Activator.CreateInstance(requestType)!;
         requestType.GetProperty("CallerScope")!.SetValue(request, ReadString(root, "callerScope"));
         requestType.GetProperty("RoomId")!.SetValue(request, ReadString(root, "roomId"));
-        requestType.GetProperty("NetEntityId")!.SetValue(request, ReadString(root, "netEntityId"));
+        string? netEntityId = ReadString(root, "netEntityId");
+        requestType.GetProperty("NetEntityId")!.SetValue(
+            request,
+            string.IsNullOrEmpty(netEntityId) ? netEntityId : NormalizeNetEntityId(netEntityId));
         requestType.GetProperty("AttributeId")!.SetValue(request, ReadString(root, "attributeId"));
         if (root.TryGetProperty("connectionGeneration", out JsonElement gen) && gen.ValueKind == JsonValueKind.Number
             && gen.TryGetUInt64(out ulong generation))
@@ -539,6 +546,19 @@ public static class HostEntry
         {
             payload["binding"] = BindingDict(binding);
         }
+        else if (outcome == "ok")
+        {
+            string? netEntityId = type.GetProperty("NetEntityId")!.GetValue(result) as string;
+            string? roomId = type.GetProperty("RoomId")!.GetValue(result) as string;
+            if (!string.IsNullOrEmpty(netEntityId) && !string.IsNullOrEmpty(roomId))
+            {
+                Dictionary<string, object?>? listed = ListedBinding(roomId, netEntityId);
+                if (listed is not null)
+                {
+                    payload["binding"] = listed;
+                }
+            }
+        }
 
         if (bindings is Array array)
         {
@@ -557,6 +577,69 @@ public static class HostEntry
         }
 
         return (EntrySuccess, Json(payload));
+    }
+
+    private static Dictionary<string, object?>? ListedBinding(string roomId, string netEntityId)
+    {
+        if (Bindings is null || BindingType is null)
+        {
+            return null;
+        }
+
+        object listed = BindingType.GetMethod("ListBindings", new[] { typeof(string) })!
+            .Invoke(Bindings, new object[] { roomId })!;
+        object? rows = listed.GetType().GetProperty("Bindings")!.GetValue(listed);
+        if (rows is not Array array)
+        {
+            return null;
+        }
+
+        string want = NormalizeNetEntityId(netEntityId);
+        foreach (object row in array)
+        {
+            Dictionary<string, object?> dict = BindingDict(row);
+            if (dict["netEntityId"] is string got
+                && string.Equals(NormalizeNetEntityId(got), want, StringComparison.Ordinal))
+            {
+                return dict;
+            }
+        }
+
+        return null;
+    }
+
+    private static string NormalizeNetEntityId(string id)
+    {
+        string lower = id.Trim().ToLowerInvariant();
+        if (lower.Length == 32)
+        {
+            bool hex = true;
+            foreach (char c in lower)
+            {
+                if (!Uri.IsHexDigit(c))
+                {
+                    hex = false;
+                    break;
+                }
+            }
+
+            if (hex)
+            {
+                return lower;
+            }
+        }
+
+        if (ulong.TryParse(lower, NumberStyles.None, CultureInfo.InvariantCulture, out ulong dec))
+        {
+            return dec.ToString("x32", CultureInfo.InvariantCulture);
+        }
+
+        if (ulong.TryParse(lower, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out ulong hexValue))
+        {
+            return hexValue.ToString("x32", CultureInfo.InvariantCulture);
+        }
+
+        return lower;
     }
 
     private static Dictionary<string, object?> BindingDict(object binding)

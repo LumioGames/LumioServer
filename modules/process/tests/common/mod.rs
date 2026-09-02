@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use lumio_host_runtime::{KernelError, KernelFired, KernelHandle, KernelTimer, TimerMode};
 use lumio_server_process::entity_chat::{
-    AttributeQueryOutcome, BoundEntityKind, ChatOperation, PersistRecord, QueryResult, RebindMode,
-    RuntimeAdmit, RuntimeBinding, RuntimeQuery, RuntimeSurface, RuntimeTick,
-    MAX_CHAT_INPUTS_PER_TICK,
+    normalize_net_entity_id, AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind,
+    ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding,
+    RuntimeQuery, RuntimeSurface, RuntimeTick, MAX_CHAT_INPUTS_PER_TICK,
 };
 
 pub const DISPATCH_EXPIRE: u32 = 1;
@@ -316,10 +316,11 @@ impl RuntimeSurface for ScriptedRuntime {
     }
 
     fn expire(&mut self, net_entity_id: &str) -> Result<(), String> {
-        self.expire_calls.push(net_entity_id.to_owned());
-        if let Some(occupancy) = self.entities.remove(net_entity_id) {
+        let net_entity_id = normalize_net_entity_id(net_entity_id);
+        self.expire_calls.push(net_entity_id.clone());
+        if let Some(occupancy) = self.entities.remove(&net_entity_id) {
             self.tombstoned
-                .insert(net_entity_id.to_owned(), occupancy.binding.room_id);
+                .insert(net_entity_id.clone(), occupancy.binding.room_id);
             self.retained
                 .retain(|_, row| row.binding.net_entity_id != net_entity_id);
         }
@@ -335,7 +336,8 @@ impl RuntimeSurface for ScriptedRuntime {
         room_id: &str,
         net_entity_id: &str,
     ) -> Option<RuntimeBinding> {
-        let occupancy = self.entities.get(net_entity_id)?;
+        let net_entity_id = normalize_net_entity_id(net_entity_id);
+        let occupancy = self.entities.get(&net_entity_id)?;
         if occupancy.binding.room_id != room_id {
             return None;
         }
@@ -343,20 +345,21 @@ impl RuntimeSurface for ScriptedRuntime {
     }
 
     fn query_attribute(&mut self, request: &RuntimeQuery) -> QueryResult {
+        let net_entity_id = normalize_net_entity_id(&request.net_entity_id);
         if let Some(planted) = self.planted_query.get(&(
             request.room_id.clone(),
-            request.net_entity_id.clone(),
+            net_entity_id.clone(),
             request.attribute_id.clone(),
         )) {
             return planted.clone();
         }
-        if let Some(room) = self.tombstoned.get(&request.net_entity_id) {
+        if let Some(room) = self.tombstoned.get(&net_entity_id) {
             if room != &request.room_id {
                 return QueryResult::request_error("cross_room_reference");
             }
             return QueryResult::fail(AttributeQueryOutcome::Tombstoned);
         }
-        let Some(occupancy) = self.entities.get(&request.net_entity_id) else {
+        let Some(occupancy) = self.entities.get(&net_entity_id) else {
             return QueryResult::fail(AttributeQueryOutcome::NonExistent);
         };
         if occupancy.binding.room_id != request.room_id {
@@ -366,6 +369,11 @@ impl RuntimeSurface for ScriptedRuntime {
             if generation < occupancy.binding.connection_generation {
                 return QueryResult::fail(AttributeQueryOutcome::StaleGeneration);
             }
+        }
+        if request.caller_scope == AttributeQueryScope::ClientReplica
+            && request.attribute_id == "EntityIdentity.claimedMark"
+        {
+            return QueryResult::fail(AttributeQueryOutcome::Unauthorized);
         }
         QueryResult::ok(occupancy.binding.entity_type.as_str().to_owned(), 0, 0)
     }
