@@ -134,6 +134,7 @@ pub struct ScriptedRuntime {
     tombstoned: HashMap<String, String>,
     planted_query: HashMap<(String, String, String), QueryResult>,
     planted_snapshot: Option<Vec<u8>>,
+    snapshot_failed: bool,
     planted_delta: Vec<Vec<u8>>,
     persist_bytes: Vec<u8>,
     tick: u64,
@@ -153,6 +154,7 @@ impl ScriptedRuntime {
             tombstoned: HashMap::new(),
             planted_query: HashMap::new(),
             planted_snapshot: None,
+            snapshot_failed: false,
             planted_delta: Vec::new(),
             persist_bytes: b"persist".to_vec(),
             tick: 0,
@@ -168,7 +170,13 @@ impl ScriptedRuntime {
     }
 
     pub fn plant_snapshot(&mut self, json: &str) {
+        self.snapshot_failed = false;
         self.planted_snapshot = Some(json.as_bytes().to_vec());
+    }
+
+    pub fn fail_snapshot(&mut self) {
+        self.snapshot_failed = true;
+        self.planted_snapshot = None;
     }
 
     pub fn plant_delta(&mut self, frames: Vec<String>) {
@@ -393,6 +401,9 @@ impl RuntimeSurface for ScriptedRuntime {
     }
 
     fn build_full_snapshot(&mut self, _room_id: &str, tick_id: u64, revision: u64) -> Vec<u8> {
+        if self.snapshot_failed {
+            return Vec::new();
+        }
         if let Some(planted) = &self.planted_snapshot {
             return planted.clone();
         }

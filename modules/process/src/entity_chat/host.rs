@@ -636,6 +636,9 @@ impl Inner {
             return;
         };
         let bytes = self.runtime.build_full_snapshot(&room_id, self.tick_id, 0);
+        if bytes.is_empty() {
+            return;
+        }
         let _ = egress.send_text(String::from_utf8_lossy(&bytes).into_owned());
     }
 

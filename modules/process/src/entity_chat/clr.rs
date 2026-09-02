@@ -302,23 +302,15 @@ impl RuntimeSurface for ClrGameplay {
     }
 
     fn build_full_snapshot(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<u8> {
-        self.call(json!({
-            "op": "build_full_snapshot",
-            "roomId": room_id,
-            "tickId": tick_id,
-            "revision": revision
-        }))
-        .ok()
-        .and_then(|value| {
-            value
-                .get("json")
-                .and_then(Value::as_str)
-                .map(|text| text.as_bytes().to_vec())
-        })
-        .unwrap_or_else(|| {
-            b"{\"messageType\":\"FullSnapshot\",\"tickId\":0,\"revision\":0,\"stateBlocks\":[]}"
-                .to_vec()
-        })
+        full_snapshot_bytes_from_runtime(
+            self.call(json!({
+                "op": "build_full_snapshot",
+                "roomId": room_id,
+                "tickId": tick_id,
+                "revision": revision
+            }))
+            .ok(),
+        )
     }
 
     fn build_delta(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<Vec<u8>> {
@@ -398,4 +390,53 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(char::from(HEX[(byte & 0x0f) as usize]));
     }
     out
+}
+
+/// Maps a Runtime `build_full_snapshot` JSON envelope to wire bytes.
+/// Missing/failed Runtime responses must not become a host-minted FullSnapshot.
+pub(crate) fn full_snapshot_bytes_from_runtime(response: Option<Value>) -> Vec<u8> {
+    response
+        .and_then(|value| {
+            value
+                .get("json")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| text.as_bytes().to_vec())
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const HOST_MINTED_EMPTY: &[u8] =
+        br#"{"messageType":"FullSnapshot","tickId":0,"revision":0,"stateBlocks":[]}"#;
+
+    #[test]
+    fn runtime_failure_does_not_mint_empty_full_snapshot() {
+        assert_eq!(full_snapshot_bytes_from_runtime(None), Vec::<u8>::new());
+        assert_ne!(full_snapshot_bytes_from_runtime(None), HOST_MINTED_EMPTY);
+        assert_eq!(
+            full_snapshot_bytes_from_runtime(Some(json!({"ok": false, "code": "runtime_failure"}))),
+            Vec::<u8>::new()
+        );
+        assert_ne!(
+            full_snapshot_bytes_from_runtime(Some(json!({"ok": false, "code": "runtime_failure"}))),
+            HOST_MINTED_EMPTY
+        );
+        assert_eq!(
+            full_snapshot_bytes_from_runtime(Some(json!({"ok": true}))),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn runtime_json_is_forwarded_unchanged() {
+        let runtime = r#"{"messageType":"FullSnapshot","tickId":1,"revision":1,"stateBlocks":[{"mappingId":"entity.identity","payload":"aa","payloadSha256":"bb"}]}"#;
+        let bytes = full_snapshot_bytes_from_runtime(Some(json!({ "ok": true, "json": runtime })));
+        assert_eq!(bytes, runtime.as_bytes());
+        assert!(String::from_utf8_lossy(&bytes).contains("\"mappingId\":\"entity.identity\""));
+    }
 }

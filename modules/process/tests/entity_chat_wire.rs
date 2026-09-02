@@ -59,6 +59,10 @@ fn admit_sends_full_snapshot_with_state_blocks_to_the_client() {
         frame.contains("\"stateBlocks\""),
         "FullSnapshot must include stateBlocks, got {frame}"
     );
+    assert!(
+        frame.contains("\"mappingId\":\"entity.identity\""),
+        "FullSnapshot must carry Runtime entity.identity, got {frame}"
+    );
 }
 
 #[test]
@@ -122,4 +126,44 @@ fn takeover_sends_connection_superseded_before_close() {
     let mut new_client = RoomClient::connect(&host.listen_uri(), "c-new").expect("new");
     let snapshot = new_client.recv_text().expect("new snapshot");
     assert!(snapshot.contains("stateBlocks"));
+    assert!(snapshot.contains("\"mappingId\":\"entity.identity\""));
+}
+
+const HOST_MINTED_EMPTY: &str =
+    r#"{"messageType":"FullSnapshot","tickId":0,"revision":0,"stateBlocks":[]}"#;
+
+#[test]
+fn runtime_snapshot_failure_does_not_send_host_minted_empty_full_snapshot() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().fail_snapshot();
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(runtime),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    let admit = host.admit(
+        "room-main".to_owned(),
+        "c-bot01".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(admit.accepted);
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
+    let frame = client.recv_text();
+    assert!(
+        frame.as_ref().is_err() || frame.as_ref().is_ok_and(|text| text != HOST_MINTED_EMPTY),
+        "client must not receive a host-minted empty FullSnapshot, got {frame:?}"
+    );
+    assert!(
+        client
+            .received
+            .iter()
+            .all(|text| text != HOST_MINTED_EMPTY && !text.contains("\"stateBlocks\":[]")),
+        "no host-invented empty FullSnapshot on the wire, got {:?}",
+        client.received
+    );
 }
