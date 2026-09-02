@@ -82,7 +82,7 @@ public sealed class RoomAdmissionRegistry
         lock (gate)
         {
             DrainExpiryLocked();
-            return AdmitLocked(roomId, connectionId, accepted.AccountId, kind);
+            return AdmitLocked(roomId, connectionId, accepted.AccountId, accepted.LoginName, kind);
         }
     }
 
@@ -224,32 +224,59 @@ public sealed class RoomAdmissionRegistry
         lock (gate)
         {
             DrainExpiryLocked();
+            return ResolveLocked(roomId, netEntityId, connectionGeneration);
+        }
+    }
+
+    public BindingResolveOutcome ResolveAnywhere(string netEntityId, ulong? connectionGeneration = null)
+    {
+        ArgumentNullException.ThrowIfNull(netEntityId);
+        lock (gate)
+        {
+            DrainExpiryLocked();
             if (!netEntityHomeRoom.TryGetValue(netEntityId, out var homeRoom))
             {
                 return new BindingResolveOutcome.Rejected(EntityBindingPort.NonExistent);
             }
 
-            if (!string.Equals(homeRoom, roomId, StringComparison.Ordinal))
-            {
-                return new BindingResolveOutcome.Rejected(EntityBindingPort.CrossRoomReference);
-            }
+            return ResolveLocked(homeRoom, netEntityId, connectionGeneration);
+        }
+    }
 
+    public bool TryTombstone(string netEntityId)
+    {
+        ArgumentNullException.ThrowIfNull(netEntityId);
+        lock (gate)
+        {
+            DrainExpiryLocked();
             if (tombstones.Contains(netEntityId))
             {
-                return new BindingResolveOutcome.Rejected(EntityBindingPort.Tombstoned);
+                return true;
             }
 
-            if (!byNetEntity.TryGetValue((roomId, netEntityId), out var live))
+            if (!netEntityHomeRoom.TryGetValue(netEntityId, out var homeRoom)
+                || !byNetEntity.TryGetValue((homeRoom, netEntityId), out var live))
             {
-                return new BindingResolveOutcome.Rejected(EntityBindingPort.NonExistent);
+                return false;
             }
 
-            if (connectionGeneration is { } generation && generation != live.ConnectionGeneration)
+            TombstoneLocked(live);
+            return true;
+        }
+    }
+
+    public IReadOnlyList<BindingCensusRow> ListAllBindings()
+    {
+        lock (gate)
+        {
+            DrainExpiryLocked();
+            var result = new List<BindingCensusRow>();
+            foreach (var live in byNetEntity.Values)
             {
-                return new BindingResolveOutcome.Rejected(EntityBindingPort.StaleGeneration);
+                result.Add(live.ToCensus());
             }
 
-            return new BindingResolveOutcome.Found(live.ToBinding());
+            return result;
         }
     }
 
@@ -291,10 +318,44 @@ public sealed class RoomAdmissionRegistry
         }
     }
 
+    private BindingResolveOutcome ResolveLocked(
+        string roomId,
+        string netEntityId,
+        ulong? connectionGeneration)
+    {
+        if (!netEntityHomeRoom.TryGetValue(netEntityId, out var homeRoom))
+        {
+            return new BindingResolveOutcome.Rejected(EntityBindingPort.NonExistent);
+        }
+
+        if (!string.Equals(homeRoom, roomId, StringComparison.Ordinal))
+        {
+            return new BindingResolveOutcome.Rejected(EntityBindingPort.CrossRoomReference);
+        }
+
+        if (tombstones.Contains(netEntityId))
+        {
+            return new BindingResolveOutcome.Rejected(EntityBindingPort.Tombstoned);
+        }
+
+        if (!byNetEntity.TryGetValue((roomId, netEntityId), out var live))
+        {
+            return new BindingResolveOutcome.Rejected(EntityBindingPort.NonExistent);
+        }
+
+        if (connectionGeneration is { } generation && generation != live.ConnectionGeneration)
+        {
+            return new BindingResolveOutcome.Rejected(EntityBindingPort.StaleGeneration);
+        }
+
+        return new BindingResolveOutcome.Found(live.ToBinding());
+    }
+
     private RoomAdmitOutcome AdmitLocked(
         string roomId,
         string connectionId,
         string accountId,
+        string loginName,
         BoundEntityKind kind)
     {
         if (byConnection.TryGetValue((roomId, connectionId), out var occupant)
@@ -338,6 +399,7 @@ public sealed class RoomAdmissionRegistry
             ConnectionGeneration = 1,
             ConnectionId = connectionId,
             Presence = BindingPresence.Active,
+            LoginName = loginName,
         };
         Attach(created);
         return new RoomAdmitOutcome.Accepted(created.ToBinding(), null, null);
@@ -467,11 +529,24 @@ public sealed class RoomAdmissionRegistry
 
         public BindingPresence Presence { get; set; }
 
+        public required string LoginName { get; init; }
+
         public ulong ExpiryToken { get; set; }
 
         public TimerId? ExpiryTimer { get; set; }
 
         public ConnectionBinding ToBinding()
             => new(AccountId, RoomId, NetEntityId, EntityType, ConnectionGeneration);
+
+        public BindingCensusRow ToCensus()
+            => new(
+                AccountId,
+                RoomId,
+                NetEntityId,
+                EntityType,
+                ConnectionGeneration,
+                ConnectionId,
+                Presence,
+                LoginName);
     }
 }

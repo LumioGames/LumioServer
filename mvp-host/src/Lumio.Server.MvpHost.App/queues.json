@@ -9,6 +9,16 @@
       "budget": "1 item / 128 bytes (provisional)",
       "onFull": "timer retains and retries; no catch-up permit is accumulated",
       "onClose": "reject timer delivery with ContextClosing"
+    },
+    {
+      "name": "GameplayTickInbox",
+      "owner": "Lumio.Server.MvpHost.App live-eleven host",
+      "producer": "platform monotonic timer",
+      "consumer": "ChatRoomWorld RunTick on owner thread",
+      "ordering": "FIFO by schedule",
+      "budget": "8 items / 4 KiB (provisional)",
+      "onFull": "reject tick request with QueueFull",
+      "onClose": "reject timer delivery with ContextClosing"
     }
   ],
   "note": "App pacing is a private bootstrap adapter; timing remains provisional and does not define a public SLA."

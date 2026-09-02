@@ -12,7 +12,7 @@ metadata:
 
 ## 背景 / 目标
 
-Owner 要求看到 Rust 真行为，且双轨只覆盖这一切片。合约保持宿主无关；C# MVP host 在复跑通过后冻结为 reference。
+Owner 要求看到 Rust 真行为，且双轨只覆盖这一切片。合约保持宿主无关；C# MVP 在 11 场景 live-green 之前不冻结（[0005](../../decisions/0005-csharp-mvp-host-unfrozen-until-live-11.md)），Rust 仍是 C-5 复跑目标。
 
 ## 设计
 
@@ -31,7 +31,7 @@ Owner 要求看到 Rust 真行为，且双轨只覆盖这一切片。合约保�
 
 ## 相关
 
-- 决策：[`../../decisions/0004-csharp-mvp-host-frozen-reference.md`](../../decisions/0004-csharp-mvp-host-frozen-reference.md)
+- 决策：[`../../decisions/0005-csharp-mvp-host-unfrozen-until-live-11.md`](../../decisions/0005-csharp-mvp-host-unfrozen-until-live-11.md)（取代 0004）
 - 实现：[`../../../modules/process/src/entity_chat/`](../../../modules/process/src/entity_chat/)
 - 托管入口：[`../../../entity-chat-host/`](../../../entity-chat-host/)
 - 本仓对账器：[`../../../modules/process/tests/verify_rust_evidence.mjs`](../../../modules/process/tests/verify_rust_evidence.mjs)

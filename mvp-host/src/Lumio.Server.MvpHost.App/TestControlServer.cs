@@ -31,10 +31,18 @@ public sealed class TestControlServer : IAsyncDisposable
 
     public string BoundUri { get; }
 
-    public static async ValueTask<TestControlServer> StartAsync(
+    public static ValueTask<TestControlServer> StartAsync(
         string listenUri,
         Func<ISessionAdminPort?> adminProvider,
         IMonotonicClock clock,
+        CancellationToken cancellationToken)
+        => StartAsync(listenUri, adminProvider, clock, liveEleven: null, cancellationToken);
+
+    internal static async ValueTask<TestControlServer> StartAsync(
+        string listenUri,
+        Func<ISessionAdminPort?> adminProvider,
+        IMonotonicClock clock,
+        LiveElevenHost? liveEleven,
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(listenUri);
@@ -56,7 +64,7 @@ public sealed class TestControlServer : IAsyncDisposable
         builder.WebHost.UseUrls(listenUri);
 
         var application = builder.Build();
-        var server = new TestControlRouteState(adminProvider, clock);
+        var server = new TestControlRouteState(adminProvider, clock, liveEleven);
 
         application.MapPost(
             "/test-control/begin-drain",
@@ -67,6 +75,30 @@ public sealed class TestControlServer : IAsyncDisposable
         application.MapPost(
             "/test-control/inject-world-mutation",
             context => HandleInjectMutationAsync(context, server));
+        application.MapGet(
+            "/test-control/bindings",
+            context => HandleBindingsAsync(context, server));
+        application.MapPost(
+            "/test-control/query",
+            context => HandleQueryAsync(context, server));
+        application.MapPost(
+            "/test-control/chat",
+            context => HandleChatAsync(context, server));
+        application.MapPost(
+            "/test-control/tick",
+            context => HandleTickAsync(context, server));
+        application.MapPost(
+            "/test-control/expire",
+            context => HandleExpireAsync(context, server));
+        application.MapPost(
+            "/test-control/snapshot",
+            context => HandleSnapshotAsync(context, server));
+        application.MapPost(
+            "/test-control/restore",
+            context => HandleRestoreAsync(context, server));
+        application.MapPost(
+            "/test-control/room-admit",
+            context => HandleRoomAdmitAsync(context, server));
 
         await application.StartAsync(cancellationToken).ConfigureAwait(false);
 
@@ -178,6 +210,141 @@ public sealed class TestControlServer : IAsyncDisposable
         }
     }
 
+    private static async Task HandleBindingsAsync(HttpContext context, TestControlRouteState state)
+    {
+        var body = state.LiveEleven is null
+            ? new JsonObject { ["bindings"] = new JsonArray() }
+            : state.LiveEleven.ListBindings();
+        await WriteJsonAsync(context, body).ConfigureAwait(false);
+    }
+
+    private static async Task HandleQueryAsync(HttpContext context, TestControlRouteState state)
+    {
+        var body = await ReadObjectAsync(context).ConfigureAwait(false);
+        if (state.LiveEleven is null
+            || body is null
+            || !TryReadString(body, "requesterNetEntityId", out var requester)
+            || !TryReadString(body, "targetNetEntityId", out var target)
+            || !TryReadString(body, "attributeId", out var attributeId))
+        {
+            await WriteJsonAsync(context, new JsonObject { ["outcome"] = "non_existent" }).ConfigureAwait(false);
+            return;
+        }
+
+        ulong? generation = null;
+        if (body["connectionGeneration"] is JsonValue genNode && genNode.TryGetValue<ulong>(out var parsed))
+        {
+            generation = parsed;
+        }
+
+        await WriteJsonAsync(context, state.LiveEleven.Query(requester, target, attributeId, generation))
+            .ConfigureAwait(false);
+    }
+
+    private static async Task HandleChatAsync(HttpContext context, TestControlRouteState state)
+    {
+        var body = await ReadObjectAsync(context).ConfigureAwait(false);
+        if (state.LiveEleven is null
+            || body is null
+            || !TryReadString(body, "connectionId", out var connectionId)
+            || !TryReadString(body, "mappingId", out var mappingId)
+            || !TryReadString(body, "payload", out var payload)
+            || !TryReadString(body, "payloadSha256", out var payloadSha256))
+        {
+            await WriteJsonAsync(context, new JsonObject { ["ok"] = false, ["kind"] = "Rejected" }).ConfigureAwait(false);
+            return;
+        }
+
+        await WriteJsonAsync(context, state.LiveEleven.Chat(connectionId, mappingId, payload, payloadSha256))
+            .ConfigureAwait(false);
+    }
+
+    private static async Task HandleTickAsync(HttpContext context, TestControlRouteState state)
+    {
+        var body = await ReadObjectAsync(context).ConfigureAwait(false);
+        string? roomId = null;
+        if (body is not null && TryReadString(body, "roomId", out var parsedRoom))
+        {
+            roomId = parsedRoom;
+        }
+
+        if (state.LiveEleven is null)
+        {
+            await WriteJsonAsync(context, new JsonObject { ["ok"] = false }).ConfigureAwait(false);
+            return;
+        }
+
+        var result = await state.LiveEleven.TickAsync(roomId, context.RequestAborted).ConfigureAwait(false);
+        await WriteJsonAsync(context, result).ConfigureAwait(false);
+    }
+
+    private static async Task HandleExpireAsync(HttpContext context, TestControlRouteState state)
+    {
+        var body = await ReadObjectAsync(context).ConfigureAwait(false);
+        if (state.LiveEleven is null || body is null || !TryReadString(body, "netEntityId", out var netEntityId))
+        {
+            await WriteJsonAsync(context, new JsonObject { ["ok"] = false }).ConfigureAwait(false);
+            return;
+        }
+
+        await WriteJsonAsync(context, state.LiveEleven.Expire(netEntityId)).ConfigureAwait(false);
+    }
+
+    private static async Task HandleSnapshotAsync(HttpContext context, TestControlRouteState state)
+    {
+        var body = await ReadObjectAsync(context).ConfigureAwait(false);
+        var roomId = "room-main";
+        if (body is not null && TryReadString(body, "roomId", out var parsedRoom))
+        {
+            roomId = parsedRoom;
+        }
+
+        if (state.LiveEleven is null)
+        {
+            await WriteJsonAsync(context, new JsonObject { ["ok"] = false }).ConfigureAwait(false);
+            return;
+        }
+
+        await WriteJsonAsync(context, state.LiveEleven.Snapshot(roomId)).ConfigureAwait(false);
+    }
+
+    private static async Task HandleRestoreAsync(HttpContext context, TestControlRouteState state)
+    {
+        var body = await ReadObjectAsync(context).ConfigureAwait(false);
+        if (state.LiveEleven is null || body is null)
+        {
+            await WriteJsonAsync(context, new JsonObject { ["ok"] = false }).ConfigureAwait(false);
+            return;
+        }
+
+        await WriteJsonAsync(context, state.LiveEleven.Restore(body)).ConfigureAwait(false);
+    }
+
+    private static async Task HandleRoomAdmitAsync(HttpContext context, TestControlRouteState state)
+    {
+        var body = await ReadObjectAsync(context).ConfigureAwait(false);
+        if (state.LiveEleven is null
+            || body is null
+            || !TryReadString(body, "roomId", out var roomId)
+            || !TryReadString(body, "connectionId", out var connectionId)
+            || !TryReadString(body, "admissionCredential", out var credential))
+        {
+            await WriteJsonAsync(context, new JsonObject { ["accepted"] = false, ["code"] = "invalid_request" })
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await WriteJsonAsync(context, state.LiveEleven.RoomAdmit(roomId, connectionId, credential))
+            .ConfigureAwait(false);
+    }
+
+    private static async ValueTask WriteJsonAsync(HttpContext context, JsonObject body)
+    {
+        context.Response.ContentType = "application/json";
+        context.Response.StatusCode = StatusCodes.Status200OK;
+        await context.Response.WriteAsync(body.ToJsonString()).ConfigureAwait(false);
+    }
+
     private static async ValueTask WriteResultAsync(HttpContext context, AckResult result)
     {
         context.Response.ContentType = "application/json";
@@ -232,5 +399,8 @@ public sealed class TestControlServer : IAsyncDisposable
             || normalized.Equals("::1", StringComparison.OrdinalIgnoreCase);
     }
 
-    private sealed record TestControlRouteState(Func<ISessionAdminPort?> AdminProvider, IMonotonicClock Clock);
+    private sealed record TestControlRouteState(
+        Func<ISessionAdminPort?> AdminProvider,
+        IMonotonicClock Clock,
+        LiveElevenHost? LiveEleven);
 }
