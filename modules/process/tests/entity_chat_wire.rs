@@ -5,8 +5,9 @@ mod common;
 use common::{delta_frame, snapshot_with_state_blocks, SharedRuntime, TestKernel};
 use lumio_host_runtime::SharedClock;
 use lumio_server_process::entity_chat::{
-    generate_keys, issue_admission_credential, ChatOpKind, EntityChatHost, InputCommand,
-    RoomClient, ADMISSION_KEY_ID, RECONNECT_WINDOW_MS,
+    apply_pending_chat_ticks, drain_chat_event_deltas, generate_keys, issue_admission_credential,
+    ChatOpKind, EntityChatHost, InputCommand, RoomClient, ADMISSION_KEY_ID,
+    MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS,
 };
 
 fn credential(
@@ -280,6 +281,106 @@ fn runtime_snapshot_failure_does_not_send_host_minted_empty_full_snapshot() {
             .all(|text| text != HOST_MINTED_EMPTY && !text.contains("\"stateBlocks\":[]")),
         "no host-invented empty FullSnapshot on the wire, got {:?}",
         client.received
+    );
+}
+
+fn wait_pending(host: &EntityChatHost, want: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while host.pending_wire_chat_inputs() < want && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        host.pending_wire_chat_inputs(),
+        want,
+        "expected {want} Room-observed chat.input frames"
+    );
+}
+
+fn send_n_wire_chats(client: &mut RoomClient, n: usize) {
+    for i in 0..n {
+        client
+            .send_text(&InputCommand::from_chat_text(&format!("hello-{i}")).to_json())
+            .expect("wire chat.input");
+    }
+}
+
+#[test]
+fn drain_chat_event_deltas_returns_before_deadline_when_idle() {
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(SharedRuntime::new()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    let admit = host.admit(
+        "room-main".to_owned(),
+        "c-browser".to_owned(),
+        credential(&keys, "Browser01", false),
+    );
+    assert!(admit.accepted);
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-browser").expect("connect");
+    let _ = client.recv_text();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut received = Vec::new();
+        let mut wire = Some(client);
+        drain_chat_event_deltas(&mut wire, &mut received);
+        let _ = tx.send(received.len());
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(800))
+        .expect("drain_chat_event_deltas must not block past a deadline on a live idle socket");
+}
+
+#[test]
+fn apply_pending_chat_ticks_returns_when_over_budget_pending_does_not_fall() {
+    let runtime = SharedRuntime::new();
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(runtime.clone()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    let admit = host.admit(
+        "room-main".to_owned(),
+        "c-bot01".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(admit.accepted);
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
+    let _ = client.recv_text();
+    send_n_wire_chats(&mut client, MAX_CHAT_INPUTS_PER_TICK + 1);
+    wait_pending(&host, MAX_CHAT_INPUTS_PER_TICK + 1);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut tick = lumio_server_process::entity_chat::RuntimeTick::default();
+        let mut received = Vec::new();
+        let mut wire = Some(client);
+        apply_pending_chat_ticks(&host, &mut tick, &mut wire, &mut received);
+        let counts = runtime.lock().run_tick_input_counts().to_vec();
+        let _ = tx.send((tick, host.pending_wire_chat_inputs(), counts));
+    });
+    let (tick, pending, counts) = rx
+        .recv_timeout(std::time::Duration::from_millis(800))
+        .expect("apply_pending_chat_ticks must return when pending does not fall");
+    assert!(
+        !tick.ok,
+        "65+ one-tick budget fault must not be SUCCESS, got {tick:?}"
+    );
+    assert!(
+        pending >= MAX_CHAT_INPUTS_PER_TICK,
+        "over-budget pending must remain, got {pending}"
+    );
+    assert!(
+        counts.iter().all(|n| *n <= MAX_CHAT_INPUTS_PER_TICK),
+        "production must not RunTick more than {MAX_CHAT_INPUTS_PER_TICK} chat.inputs, got {counts:?}"
     );
 }
 

@@ -241,6 +241,48 @@ impl RoomClient {
         }
     }
 
+    /// Non-blocking text read. `Ok(None)` means no frame is queued (WouldBlock / timeout).
+    ///
+    /// # Errors
+    ///
+    /// Returns when the socket closes or the read fails for a non-idle reason.
+    pub fn try_recv_text(&mut self) -> Result<Option<String>, String> {
+        self.set_nonblocking(true)?;
+        let result = loop {
+            match self.ws.read() {
+                Ok(Message::Text(text)) => {
+                    let owned = text.to_string();
+                    self.received.push(owned.clone());
+                    break Ok(Some(owned));
+                }
+                Ok(Message::Close(_)) => break Err("closed".to_owned()),
+                Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
+                Ok(other) => break Err(format!("unexpected {other}")),
+                Err(error) if is_would_block(&error) => break Ok(None),
+                Err(error) => break Err(error.to_string()),
+            }
+        };
+        let _ = self.set_nonblocking(false);
+        result
+    }
+
+    fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), String> {
+        match self.ws.get_mut() {
+            MaybeTlsStream::Plain(stream) => {
+                stream
+                    .set_nonblocking(nonblocking)
+                    .map_err(|error| format!("room client nonblocking: {error}"))?;
+                if !nonblocking {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .map_err(|error| format!("room client timeout: {error}"))?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Sends a C-1 InputCommand (or other JSON) text frame.
     ///
     /// # Errors

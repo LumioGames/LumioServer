@@ -144,6 +144,7 @@ pub struct ScriptedRuntime {
     restore_calls: usize,
     pending_chats: Vec<(String, String)>,
     events_by_tick: HashMap<u64, Vec<(String, String)>>,
+    run_tick_input_counts: Vec<usize>,
 }
 
 impl ScriptedRuntime {
@@ -166,7 +167,13 @@ impl ScriptedRuntime {
             restore_calls: 0,
             pending_chats: Vec::new(),
             events_by_tick: HashMap::new(),
+            run_tick_input_counts: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn run_tick_input_counts(&self) -> &[usize] {
+        &self.run_tick_input_counts
     }
 
     pub fn plant_query(&mut self, room: &str, net: &str, attr: &str, result: QueryResult) {
@@ -410,6 +417,7 @@ impl RuntimeSurface for ScriptedRuntime {
         self.tick = tick_id;
         self.revision += 1;
         let pending = std::mem::take(&mut self.pending_chats);
+        self.run_tick_input_counts.push(pending.len());
         if pending.len() > MAX_CHAT_INPUTS_PER_TICK {
             return RuntimeTick {
                 applied_tick: 0,

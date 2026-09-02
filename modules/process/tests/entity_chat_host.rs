@@ -7,7 +7,7 @@ use lumio_host_runtime::{HostClock, SharedClock};
 use lumio_server_process::entity_chat::{
     generate_keys, issue_admission_credential, AttributeQueryOutcome, AttributeQueryRequest,
     AttributeQueryScope, BoundEntityKind, ChatOpKind, EntityChatHost, InputCommand, QueryResult,
-    ADMISSION_KEY_ID, RECONNECT_WINDOW_MS,
+    ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS,
 };
 
 fn host_with(
@@ -324,6 +324,46 @@ fn sixty_four_chat_inputs_one_tick_emit_chat_event() {
     assert!(
         frame.contains("\"mappingId\":\"chat.event\""),
         "N=64 must emit chat.event, got {frame}"
+    );
+}
+
+#[test]
+fn host_run_tick_must_not_runtick_more_than_max_chat_inputs() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    let _ = host.admit(
+        "room-main".to_owned(),
+        "c-bot01".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    let mut client =
+        lumio_server_process::entity_chat::RoomClient::connect(&host.listen_uri(), "c-bot01")
+            .expect("connect");
+    let _ = client.recv_text();
+    for i in 0..=MAX_CHAT_INPUTS_PER_TICK {
+        client
+            .send_text(&InputCommand::from_chat_text(&format!("hello-{i}")).to_json())
+            .expect("wire chat.input");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while host.pending_wire_chat_inputs() < MAX_CHAT_INPUTS_PER_TICK + 1
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        host.pending_wire_chat_inputs(),
+        MAX_CHAT_INPUTS_PER_TICK + 1
+    );
+    let tick = host.run_tick("room-main".to_owned());
+    assert!(
+        !tick.ok,
+        "RunTick of more than {MAX_CHAT_INPUTS_PER_TICK} chat.inputs is not SUCCESS, got {tick:?}"
+    );
+    let counts = runtime.lock().run_tick_input_counts().to_vec();
+    assert!(
+        counts.iter().all(|n| *n <= MAX_CHAT_INPUTS_PER_TICK),
+        "host must not forward more than {MAX_CHAT_INPUTS_PER_TICK} chat.inputs to Runtime RunTick, got {counts:?}"
     );
 }
 
