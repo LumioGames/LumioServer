@@ -1,4 +1,4 @@
-//! CoreCLR host of Lumio.Game.ServerGameplay.ChatRoomWorld.
+//! CoreCLR host of Runtime EntityBindingQuery + ChatCommandRuntime + Persist.
 
 use std::path::PathBuf;
 
@@ -7,9 +7,13 @@ use serde_json::{json, Value};
 use crate::runtime_bridge::{BridgeError, ClrBridge, ClrStart};
 use crate::sdk_loader;
 
-use super::gameplay::{ChatMessageEvent, ChatOperation, ChatTickResult, GameplayWorld};
+use super::runtime::BoundEntityKind;
+use super::runtime::{
+    ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding,
+    RuntimeQuery, RuntimeSurface, RuntimeTick,
+};
 
-/// Files needed to create the CoreCLR gameplay host.
+/// Files needed to create the CoreCLR Runtime consume host.
 #[derive(Debug, Clone)]
 pub struct ClrGameplayConfig {
     pub engine_native: PathBuf,
@@ -18,13 +22,15 @@ pub struct ClrGameplayConfig {
     pub assembly: PathBuf,
     pub entry_type: String,
     pub entry_method: String,
-    pub gameplay_assembly: PathBuf,
+    pub replication_assembly: PathBuf,
+    pub ecs_assembly: PathBuf,
 }
 
-/// CoreCLR-backed [`GameplayWorld`].
+/// CoreCLR-backed [`RuntimeSurface`].
 pub struct ClrGameplay {
     bridge: ClrBridge,
-    gameplay_assembly: String,
+    replication_assembly: String,
+    ecs_assembly: String,
     booted: bool,
 }
 
@@ -46,7 +52,8 @@ impl ClrGameplay {
         let bridge = ClrBridge::start(lease, &start)?;
         Ok(Self {
             bridge,
-            gameplay_assembly: config.gameplay_assembly.to_string_lossy().into_owned(),
+            replication_assembly: config.replication_assembly.to_string_lossy().into_owned(),
+            ecs_assembly: config.ecs_assembly.to_string_lossy().into_owned(),
             booted: false,
         })
     }
@@ -55,7 +62,8 @@ impl ClrGameplay {
         if !self.booted {
             let boot = json!({
                 "op": "boot",
-                "gameplayAssembly": self.gameplay_assembly,
+                "replicationAssembly": self.replication_assembly,
+                "ecsAssembly": self.ecs_assembly,
             });
             let body = self
                 .bridge
@@ -76,7 +84,7 @@ impl ClrGameplay {
             .bridge
             .invoke_json(&request.to_string())
             .map_err(bridge_err)?;
-        serde_json::from_str(&body).map_err(|_| "gameplay response is not JSON".to_owned())
+        serde_json::from_str(&body).map_err(|_| "runtime response is not JSON".to_owned())
     }
 }
 
@@ -87,39 +95,181 @@ fn bridge_err(error: BridgeError) -> String {
     }
 }
 
-impl GameplayWorld for ClrGameplay {
-    fn create_room(&mut self, room_id: &str) {
-        let _ = self.call(json!({ "op": "create_room", "roomId": room_id }));
+fn kind_from(value: Option<&str>) -> BoundEntityKind {
+    match value {
+        Some("bot") => BoundEntityKind::Bot,
+        _ => BoundEntityKind::Player,
     }
+}
 
-    fn create_entity(&mut self, room_id: &str, net_entity_id: u64) -> bool {
-        self.call(json!({
-            "op": "create_entity",
-            "roomId": room_id,
-            "netEntityId": net_entity_id
-        }))
-        .ok()
-        .and_then(|value| value.get("ok").and_then(Value::as_bool))
-        .unwrap_or(false)
+fn binding_from(value: &Value) -> Option<RuntimeBinding> {
+    Some(RuntimeBinding {
+        account_id: value.get("accountId")?.as_str()?.to_owned(),
+        room_id: value.get("roomId")?.as_str()?.to_owned(),
+        net_entity_id: value.get("netEntityId")?.as_str()?.to_owned(),
+        entity_type: kind_from(value.get("entityType").and_then(Value::as_str)),
+        connection_generation: value.get("connectionGeneration")?.as_u64()?,
+    })
+}
+
+fn admit_from(value: Value) -> RuntimeAdmit {
+    if value.get("ok").and_then(Value::as_bool) == Some(true) {
+        if let Some(binding) = value.get("binding").and_then(binding_from) {
+            return RuntimeAdmit::ok(binding);
+        }
     }
+    RuntimeAdmit::reject(
+        value
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("invalid_request"),
+    )
+}
 
-    fn destroy_entity(&mut self, room_id: &str, net_entity_id: u64) -> bool {
-        self.call(json!({
-            "op": "destroy_entity",
-            "roomId": room_id,
-            "netEntityId": net_entity_id
-        }))
-        .ok()
-        .and_then(|value| value.get("ok").and_then(Value::as_bool))
-        .unwrap_or(false)
-    }
-
-    fn admit_chat(&mut self, room_id: &str, sender: u64, text: &str) -> ChatOperation {
+impl RuntimeSurface for ClrGameplay {
+    fn admit(
+        &mut self,
+        connection: &str,
+        account_id: &str,
+        room_id: &str,
+        entity_type: BoundEntityKind,
+    ) -> RuntimeAdmit {
         match self.call(json!({
-            "op": "admit_chat",
+            "op": "admit",
+            "connection": connection,
+            "accountId": account_id,
             "roomId": room_id,
-            "senderNetEntityId": sender,
-            "text": text
+            "entityType": entity_type.as_str(),
+        })) {
+            Ok(value) => admit_from(value),
+            Err(_) => RuntimeAdmit::reject("runtime_failure"),
+        }
+    }
+
+    fn disconnect(&mut self, connection: &str) -> Result<RuntimeBinding, String> {
+        let value = self.call(json!({ "op": "disconnect", "connection": connection }))?;
+        value
+            .get("binding")
+            .and_then(binding_from)
+            .ok_or_else(|| "binding_not_found".to_owned())
+    }
+
+    fn rebind(
+        &mut self,
+        connection: &str,
+        account_id: &str,
+        room_id: &str,
+        mode: RebindMode,
+    ) -> RuntimeAdmit {
+        let mode = match mode {
+            RebindMode::Reconnect => "reconnect",
+            RebindMode::Takeover => "takeover",
+        };
+        match self.call(json!({
+            "op": "rebind",
+            "connection": connection,
+            "accountId": account_id,
+            "roomId": room_id,
+            "mode": mode,
+        })) {
+            Ok(value) => admit_from(value),
+            Err(_) => RuntimeAdmit::reject("runtime_failure"),
+        }
+    }
+
+    fn expire(&mut self, net_entity_id: &str) -> Result<(), String> {
+        let value = self.call(json!({ "op": "expire", "netEntityId": net_entity_id }))?;
+        if value.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err(value
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("invalid_request")
+                .to_owned())
+        }
+    }
+
+    fn self_lookup(&mut self, connection: &str) -> Option<RuntimeBinding> {
+        self.call(json!({ "op": "self_lookup", "connection": connection }))
+            .ok()
+            .and_then(|value| value.get("binding").and_then(binding_from))
+    }
+
+    fn resolve_by_net_entity_id(
+        &mut self,
+        room_id: &str,
+        net_entity_id: &str,
+    ) -> Option<RuntimeBinding> {
+        self.call(json!({
+            "op": "resolve",
+            "roomId": room_id,
+            "netEntityId": net_entity_id
+        }))
+        .ok()
+        .and_then(|value| value.get("binding").and_then(binding_from))
+    }
+
+    fn query_attribute(&mut self, request: &RuntimeQuery) -> QueryResult {
+        match self.call(json!({
+            "op": "query",
+            "callerScope": request.caller_scope.as_runtime_str(),
+            "roomId": request.room_id,
+            "netEntityId": request.net_entity_id,
+            "attributeId": request.attribute_id,
+            "connectionGeneration": request.connection_generation,
+        })) {
+            Ok(value) => QueryResult::from_runtime(
+                value
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .unwrap_or("request_error"),
+                value.get("code").and_then(Value::as_str),
+                value
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ),
+            Err(_) => QueryResult::request_error("runtime_failure"),
+        }
+    }
+
+    fn list_bindings(&mut self, room_id: &str) -> Vec<RuntimeBinding> {
+        self.call(json!({ "op": "list_bindings", "roomId": room_id }))
+            .ok()
+            .and_then(|value| value.get("bindings").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(binding_from)
+            .collect()
+    }
+
+    fn attach_member(&mut self, room_id: &str, connection: &str) -> Result<(), String> {
+        let value = self.call(json!({
+            "op": "attach_member",
+            "roomId": room_id,
+            "connection": connection
+        }))?;
+        if value.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err("runtime_failure".to_owned())
+        }
+    }
+
+    fn admit_input_command(
+        &mut self,
+        room_id: &str,
+        connection: &str,
+        generation: u64,
+        envelope_json: &str,
+    ) -> ChatOperation {
+        match self.call(json!({
+            "op": "admit_input",
+            "roomId": room_id,
+            "connection": connection,
+            "connectionGeneration": generation,
+            "envelope": envelope_json,
         })) {
             Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
                 ChatOperation::admitted()
@@ -134,107 +284,118 @@ impl GameplayWorld for ClrGameplay {
         }
     }
 
-    fn run_tick(&mut self, room_id: &str) -> ChatTickResult {
-        let Ok(value) = self.call(json!({ "op": "tick", "roomId": room_id })) else {
-            return ChatTickResult {
+    fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick {
+        let Ok(value) = self.call(json!({ "op": "tick", "roomId": room_id, "tickId": tick_id }))
+        else {
+            return RuntimeTick {
                 applied_tick: 0,
-                events: Vec::new(),
+                revision: 0,
             };
         };
-        let applied_tick = value
-            .get("appliedTick")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let events = value
-            .get("events")
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| {
-                        Some(ChatMessageEvent {
-                            message_id: row.get("messageId").and_then(Value::as_u64)?,
-                            room_sequence: row.get("roomSequence").and_then(Value::as_u64)?,
-                            sender_net_entity_id: row
-                                .get("senderNetEntityId")
-                                .and_then(Value::as_u64)?,
-                            text: row.get("text").and_then(Value::as_str)?.to_owned(),
-                            applied_tick: row.get("appliedTick").and_then(Value::as_u64)?,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        ChatTickResult {
-            applied_tick,
-            events,
+        RuntimeTick {
+            applied_tick: value
+                .get("appliedTick")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            revision: value.get("revision").and_then(Value::as_u64).unwrap_or(0),
         }
     }
 
-    fn last_message(&mut self, room_id: &str, net_entity_id: u64) -> Option<(String, u64)> {
-        let value = self
-            .call(json!({
-                "op": "get_component",
-                "roomId": room_id,
-                "netEntityId": net_entity_id
-            }))
-            .ok()?;
-        if value.get("ok").and_then(Value::as_bool) != Some(true) {
-            return None;
-        }
-        let text = value
-            .get("lastMessageText")
-            .and_then(Value::as_str)?
-            .to_owned();
-        let tick = value.get("lastMessageTick").and_then(Value::as_u64)?;
-        Some((text, tick))
-    }
-
-    fn capture_persist(&mut self, room_id: &str) -> Vec<(u64, String, u64)> {
-        let Ok(value) = self.call(json!({ "op": "persist", "roomId": room_id })) else {
-            return Vec::new();
-        };
-        value
-            .get("entities")
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| {
-                        Some((
-                            row.get("netEntityId").and_then(Value::as_u64)?,
-                            row.get("lastMessageText")
-                                .and_then(Value::as_str)?
-                                .to_owned(),
-                            row.get("lastMessageTick").and_then(Value::as_u64)?,
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn restore_last_message(
-        &mut self,
-        room_id: &str,
-        net_entity_id: u64,
-        text: &str,
-        tick: u64,
-    ) -> bool {
+    fn build_full_snapshot(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<u8> {
         self.call(json!({
-            "op": "restore",
+            "op": "build_full_snapshot",
             "roomId": room_id,
-            "netEntityId": net_entity_id,
-            "text": text,
-            "lastMessageTick": tick
+            "tickId": tick_id,
+            "revision": revision
         }))
         .ok()
-        .and_then(|value| value.get("ok").and_then(Value::as_bool))
-        .unwrap_or(false)
+        .and_then(|value| {
+            value
+                .get("json")
+                .and_then(Value::as_str)
+                .map(|text| text.as_bytes().to_vec())
+        })
+        .unwrap_or_else(|| {
+            b"{\"messageType\":\"FullSnapshot\",\"tickId\":0,\"revision\":0,\"stateBlocks\":[]}"
+                .to_vec()
+        })
     }
 
-    fn current_tick(&mut self, room_id: &str) -> u64 {
-        self.call(json!({ "op": "current_tick", "roomId": room_id }))
-            .ok()
-            .and_then(|value| value.get("tick").and_then(Value::as_u64))
-            .unwrap_or(0)
+    fn build_delta(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<Vec<u8>> {
+        self.call(json!({
+            "op": "build_delta",
+            "roomId": room_id,
+            "tickId": tick_id,
+            "revision": revision
+        }))
+        .ok()
+        .and_then(|value| value.get("frames").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| row.as_str().map(|text| text.as_bytes().to_vec()))
+        .collect()
     }
+
+    fn persist(&mut self, room_id: &str) -> PersistRecord {
+        let hex = self
+            .call(json!({ "op": "persist", "roomId": room_id }))
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("bytesHex")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        PersistRecord {
+            bytes: decode_hex(&hex).unwrap_or_default(),
+        }
+    }
+
+    fn restore(&mut self, room_id: &str, bytes: &[u8]) -> Result<(), String> {
+        let value = self.call(json!({
+            "op": "restore",
+            "roomId": room_id,
+            "bytesHex": hex_lower(bytes),
+        }))?;
+        if value.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err("restore_failed".to_owned())
+        }
+    }
+}
+
+fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = from_nibble(bytes[i])?;
+        let lo = from_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn from_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(HEX[(byte >> 4) as usize]));
+        out.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    out
 }

@@ -1,29 +1,27 @@
-//! Room world-slot: admission, binding, reconnect, query, chat delivery.
+//! Consume-only Room host: session table + Runtime forward + NativeCore timers + wire.
 
 use std::collections::HashMap;
 use std::thread;
 use std::thread::ThreadId;
-use std::time::Duration;
 
 use lumio_host_runtime::{
-    bounded_channel, spawn_supervised, HostClock, HostTimer, RecvError, SharedClock, SupervisedTask,
+    bounded_channel, spawn_supervised, HostClock, KernelHandle, KernelTimer, Sender, SharedClock,
+    SupervisedTask, TimerMode,
 };
 
-use super::admission::{
-    classify_entity_kind, is_bot_namespace, verify_admission, AdmissionPayload,
+use super::admission::{is_bot_namespace, verify_admission, AdmissionPayload};
+use super::envelope::{connection_superseded_json, net_entity_id_to_u64, InputCommand};
+use super::runtime::BoundEntityKind;
+use super::runtime::{
+    AttributeQueryScope, ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit,
+    RuntimeBinding, RuntimeQuery, RuntimeSurface, RuntimeTick,
 };
-use super::crypto::fill_random;
-use super::envelope::InputCommand;
-use super::gameplay::{
-    ChatMessageEvent, ChatOperation, ChatPersistEntity, ChatPersistSnapshot, ChatTickResult,
-    GameplayWorld,
-};
+use super::wire::{RoomListener, WireEvent, WireSender};
 
-/// Host NetEntityId wire form: `nent_` + 16-hex instance + 16-hex seq.
-#[must_use]
-pub fn format_host_net_entity_id(instance_key: u64, seq: u64) -> String {
-    format!("nent_{instance_key:016x}{seq:016x}")
-}
+/// WallClock expire dispatch id (NativeCore slot).
+pub const DISPATCH_EXPIRE: u32 = 1;
+/// TickFrame room tick dispatch id (NativeCore slot).
+pub const DISPATCH_TICK: u32 = 2;
 
 fn session_id_for(login_name: &str, reconnected: bool) -> String {
     if reconnected {
@@ -33,39 +31,28 @@ fn session_id_for(login_name: &str, reconnected: bool) -> String {
     }
 }
 
-fn new_instance_key() -> u64 {
-    let mut bytes = [0_u8; 8];
-    fill_random(&mut bytes);
-    u64::from_le_bytes(bytes)
-}
-
-/// Player or Bot, classified from login name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BoundEntityKind {
-    Player,
-    Bot,
-}
-
-impl BoundEntityKind {
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Player => "player",
-            Self::Bot => "bot",
-        }
-    }
-}
-
-/// Binding five-tuple plus host projections used by evidence.
+/// Binding five-tuple plus the host session id (not a Runtime binding field).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionBinding {
     pub account_id: String,
     pub room_id: String,
-    pub net_entity_id: u64,
-    pub host_net_entity_id: String,
+    pub net_entity_id: String,
     pub session_id: String,
     pub entity_type: BoundEntityKind,
     pub connection_generation: u64,
+}
+
+impl ConnectionBinding {
+    fn from_runtime(binding: RuntimeBinding, session_id: String) -> Self {
+        Self {
+            account_id: binding.account_id,
+            room_id: binding.room_id,
+            net_entity_id: binding.net_entity_id,
+            session_id,
+            entity_type: binding.entity_type,
+            connection_generation: binding.connection_generation,
+        }
+    }
 }
 
 /// One live admit row for host-audit / census.
@@ -73,8 +60,7 @@ pub struct ConnectionBinding {
 pub struct AdmitTrace {
     pub connection_id: String,
     pub session_id: String,
-    pub host_net_entity_id: String,
-    pub net_entity_id: u64,
+    pub net_entity_id: String,
     pub entity_type: BoundEntityKind,
     pub account_id: String,
     pub login_name: String,
@@ -83,7 +69,7 @@ pub struct AdmitTrace {
 /// Server resolution of a live entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityResolution {
-    pub net_entity_id: u64,
+    pub net_entity_id: String,
     pub room_id: String,
     pub entity_type: BoundEntityKind,
     pub account_id: String,
@@ -127,123 +113,30 @@ pub struct RoomCensus {
     pub bot_count: usize,
     pub player_count: usize,
     pub total: usize,
-    pub net_entity_ids: Vec<u64>,
+    pub net_entity_ids: Vec<String>,
     pub entity_types: Vec<BoundEntityKind>,
 }
 
-/// Attribute query caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttributeQueryScope {
-    ServerAuthoritative,
-    ClientReplica,
-}
-
-/// Five-outcome plus request-error query result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttributeQueryOutcome {
-    Ok,
-    RequestError,
-    NonExistent,
-    StaleGeneration,
-    Invisible,
-    Unauthorized,
-    Tombstoned,
-}
-
-/// Attribute query request.
+/// Attribute query request forwarded to Runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeQueryRequest {
     pub caller_scope: AttributeQueryScope,
     pub room_id: String,
-    pub net_entity_id: u64,
+    pub net_entity_id: String,
     pub attribute_id: String,
     pub connection_generation: Option<u64>,
 }
 
-/// Attribute query result. Failures never alias another entity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryResult {
-    pub outcome: AttributeQueryOutcome,
-    pub value: Option<String>,
-    pub error_code: Option<String>,
-    pub observed_tick: u64,
-    pub observed_revision: u64,
-}
-
-impl QueryResult {
-    fn ok(value: String, tick: u64, revision: u64) -> Self {
-        Self {
-            outcome: AttributeQueryOutcome::Ok,
-            value: Some(value),
-            error_code: None,
-            observed_tick: tick,
-            observed_revision: revision,
-        }
-    }
-
-    fn fail(outcome: AttributeQueryOutcome) -> Self {
-        Self {
-            outcome,
-            value: None,
-            error_code: None,
-            observed_tick: 0,
-            observed_revision: 0,
-        }
-    }
-
-    fn request_error(code: &str) -> Self {
-        Self {
-            outcome: AttributeQueryOutcome::RequestError,
-            value: None,
-            error_code: Some(code.to_owned()),
-            observed_tick: 0,
-            observed_revision: 0,
-        }
-    }
-}
-
-enum BindingPresence {
-    Active,
-    Disconnected,
-}
-
-struct LiveEntity {
+struct Session {
+    connection_id: String,
+    session_id: String,
     account_id: String,
     login_name: String,
     room_id: String,
-    net_entity_id: u64,
-    host_net_entity_id: String,
-    session_id: String,
+    net_entity_id: String,
     entity_type: BoundEntityKind,
     generation: u64,
-    presence: BindingPresence,
-    connection_id: Option<String>,
-    disconnected_at_ms: Option<u64>,
-    window: Vec<ChatMessageEvent>,
-}
-
-impl LiveEntity {
-    fn binding(&self) -> ConnectionBinding {
-        ConnectionBinding {
-            account_id: self.account_id.clone(),
-            room_id: self.room_id.clone(),
-            net_entity_id: self.net_entity_id,
-            host_net_entity_id: self.host_net_entity_id.clone(),
-            session_id: self.session_id.clone(),
-            entity_type: self.entity_type,
-            connection_generation: self.generation,
-        }
-    }
-}
-
-struct Tombstone {
-    room_id: String,
-    _account_id: String,
-}
-
-struct RoomState {
-    revision: u64,
-    entities: HashMap<u64, String>,
+    egress: Option<WireSender>,
 }
 
 struct Inner {
@@ -252,70 +145,97 @@ struct Inner {
     admission_key_id: u8,
     admission_public: Vec<u8>,
     unix_seconds: u64,
-    gameplay: Box<dyn GameplayWorld>,
-    rooms: HashMap<String, RoomState>,
-    by_account: HashMap<String, LiveEntity>,
-    by_connection: HashMap<String, String>,
-    tombstones: HashMap<u64, Tombstone>,
-    next_net_entity_id: u64,
-    instance_key: u64,
+    runtime: Box<dyn RuntimeSurface>,
+    kernel: Box<dyn KernelTimer>,
+    sessions: HashMap<String, Session>,
+    account_sessions: HashMap<String, String>,
+    expire_watch: HashMap<KernelHandle, String>,
+    pending_egress: HashMap<String, WireSender>,
+    tick_id: u64,
 }
 
 enum OwnerWork {
     Run(Box<dyn FnOnce(&mut Inner) + Send>),
+    Wire(WireEvent),
 }
 
 /// Slice-scoped Room host. All authoritative work runs on one owner thread.
 pub struct EntityChatHost {
-    owner_id: ThreadId,
-    tx: lumio_host_runtime::Sender<OwnerWork>,
+    tx: Sender<OwnerWork>,
+    _listener: RoomListener,
+    _forward: SupervisedTask,
     _owner: SupervisedTask,
-    timer: HostTimer,
+    owner_id: ThreadId,
+    listen_uri: String,
+    clock: SharedClock,
 }
 
 impl EntityChatHost {
-    /// Builds a host that verifies credentials with `admission_public`.
+    /// Builds a consume-only host. Kernel due-decision stays in NativeCore ABI.
     #[must_use]
     pub fn new(
         reconnect_window_ms: u64,
         clock: SharedClock,
-        gameplay: Box<dyn GameplayWorld>,
+        runtime: Box<dyn RuntimeSurface>,
+        kernel: Box<dyn KernelTimer>,
         admission_key_id: u8,
         admission_public: Vec<u8>,
         unix_seconds: u64,
     ) -> Self {
-        let timer = HostTimer::new(clock.clone());
         let (tx, rx) = bounded_channel(256);
+        let (wire_tx, wire_rx) = bounded_channel(256);
         let (id_tx, id_rx) = bounded_channel(1);
+        let listener = RoomListener::bind(wire_tx).expect("room wire bind");
+        let listen_uri = listener.uri();
+        let forward_tx = tx.clone();
+        let forward = spawn_supervised("lumio-entity-chat-wire-fwd", move |_| {
+            while let Ok(event) = wire_rx.recv() {
+                if forward_tx.send(OwnerWork::Wire(event)).is_err() {
+                    break;
+                }
+            }
+        });
+        let owner_clock = clock.clone();
         let owner = spawn_supervised("lumio-entity-chat-owner", move |_cancel| {
             let _ = id_tx.send(thread::current().id());
             let mut inner = Inner {
-                clock,
+                clock: owner_clock,
                 reconnect_window_ms,
                 admission_key_id,
                 admission_public,
                 unix_seconds,
-                gameplay,
-                rooms: HashMap::new(),
-                by_account: HashMap::new(),
-                by_connection: HashMap::new(),
-                tombstones: HashMap::new(),
-                next_net_entity_id: 1,
-                instance_key: new_instance_key(),
+                runtime,
+                kernel,
+                sessions: HashMap::new(),
+                account_sessions: HashMap::new(),
+                expire_watch: HashMap::new(),
+                pending_egress: HashMap::new(),
+                tick_id: 0,
             };
+            if inner
+                .kernel
+                .schedule_repeating(TimerMode::TickFrame, 1, 1, DISPATCH_TICK)
+                .is_err()
+            {
+                return;
+            }
             loop {
                 match rx.recv() {
                     Ok(OwnerWork::Run(work)) => work(&mut inner),
+                    Ok(OwnerWork::Wire(event)) => inner.on_wire(event),
                     Err(_) => break,
                 }
             }
         });
         let owner_id = id_rx.recv().expect("owner thread id");
         Self {
-            owner_id,
             tx,
+            _listener: listener,
+            _forward: forward,
             _owner: owner,
-            timer,
+            owner_id,
+            listen_uri,
+            clock,
         }
     }
 
@@ -331,6 +251,12 @@ impl EntityChatHost {
             })))
             .unwrap_or_else(|_| panic!("entity-chat owner thread closed"));
         rx.recv().expect("entity-chat owner result")
+    }
+
+    /// Loopback Room wire URI.
+    #[must_use]
+    pub fn listen_uri(&self) -> String {
+        self.listen_uri.clone()
     }
 
     /// Game Server never accepts username/password in place of admission.
@@ -367,22 +293,21 @@ impl EntityChatHost {
         self.on_owner(move |inner| inner.admit_verified(&room_id, &connection_id, &payload))
     }
 
-    /// Disconnects a live connection and starts the reconnect window.
+    /// Disconnects a live connection and schedules the NativeCore wallClock expire.
     #[must_use]
     pub fn disconnect(&self, connection_id: String) -> bool {
         self.on_owner(move |inner| inner.disconnect(&connection_id))
     }
 
-    /// Advances the host monotonic clock and pumps due host timers.
-    pub fn advance_monotonic(&self, delta_ms: u64) {
-        self.on_owner(move |inner| inner.clock.advance_ms(delta_ms));
-        self.timer.pump_due();
+    /// Pumps NativeCore wallClock at the host monotonic reading.
+    pub fn drive_kernel(&self) {
+        self.on_owner(Inner::drive_wall);
     }
 
-    /// Destroys disconnected entities whose window has elapsed.
+    /// Test/suite clock handle. Expiry still fires only via kernel pump.
     #[must_use]
-    pub fn expire_due(&self) -> usize {
-        self.on_owner(Inner::expire_due)
+    pub fn clock(&self) -> SharedClock {
+        self.clock.clone()
     }
 
     /// Decodes a frozen InputCommand (chat.input) envelope, then queues ChatInput.
@@ -391,34 +316,19 @@ impl EntityChatHost {
         self.on_owner(move |inner| inner.admit_chat_input(&connection_id, &envelope))
     }
 
-    /// Runs one fixed tick in `room_id`.
+    /// Advances kernel tickFrame and broadcasts Runtime BuildDelta bytes.
     #[must_use]
-    pub fn run_tick(&self, room_id: String) -> ChatTickResult {
+    pub fn run_tick(&self, room_id: String) -> RuntimeTick {
         self.on_owner(move |inner| inner.run_tick(&room_id))
     }
 
-    /// Schedules `run_tick` as a host-timer callback. Not a caller for-loop.
+    /// Tick cadence is kernel tickFrame, not a caller for-loop.
     #[must_use]
-    pub fn schedule_room_tick(&self, room_id: String, delay_ms: u64) -> ChatTickResult {
-        let (done_tx, done_rx) = bounded_channel(1);
-        let work_tx = self.tx.clone();
-        let _timer_id = self.timer.schedule_one_shot(delay_ms, move || {
-            let _ = work_tx.send(OwnerWork::Run(Box::new(move |inner| {
-                let tick = inner.run_tick(&room_id);
-                let _ = done_tx.send(tick);
-            })));
-        });
-        self.timer.pump_due();
-        match done_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(tick) => tick,
-            Err(RecvError::Empty | RecvError::Closed) => ChatTickResult {
-                applied_tick: 0,
-                events: Vec::new(),
-            },
-        }
+    pub fn schedule_room_tick(&self, room_id: String, _delay_ms: u64) -> RuntimeTick {
+        self.run_tick(room_id)
     }
 
-    /// Client self-lookup.
+    /// Client self-lookup via Runtime, joined with the host session id.
     #[must_use]
     pub fn try_self_lookup(&self, connection_id: String) -> Option<ConnectionBinding> {
         self.on_owner(move |inner| inner.try_self_lookup(&connection_id))
@@ -435,55 +345,45 @@ impl EntityChatHost {
             .unwrap_or_else(|| panic!("connection is not bound: {connection_id}"))
     }
 
-    /// Resolve a NetEntityId in a room.
+    /// Resolve a NetEntityId in a room via Runtime.
     #[must_use]
     pub fn try_resolve_by_net_entity_id(
         &self,
         room_id: String,
-        net_entity_id: u64,
+        net_entity_id: String,
     ) -> Option<EntityResolution> {
-        self.on_owner(move |inner| inner.try_resolve_by_net_entity_id(&room_id, net_entity_id))
+        self.on_owner(move |inner| inner.try_resolve_by_net_entity_id(&room_id, &net_entity_id))
     }
 
-    /// C-2 attribute query.
+    /// C-2 attribute query forwarded to Runtime.
     #[must_use]
     pub fn query_attribute(&self, request: AttributeQueryRequest) -> QueryResult {
         self.on_owner(move |inner| inner.query_attribute(&request))
     }
 
-    /// Persist-only last-message snapshot.
+    /// Runtime persist bytes. Restore must not create Active bindings.
     #[must_use]
-    pub fn capture_persist_snapshot(&self, room_id: String) -> ChatPersistSnapshot {
-        self.on_owner(move |inner| inner.capture_persist_snapshot(&room_id))
+    pub fn capture_persist_snapshot(&self, room_id: String) -> PersistRecord {
+        self.on_owner(move |inner| inner.runtime.persist(&room_id))
     }
 
-    /// Restores persist-only fields. Chat windows stay empty.
-    pub fn restore_persist_snapshot(&self, room_id: String, snapshot: ChatPersistSnapshot) {
-        self.on_owner(move |inner| inner.restore_persist_snapshot(&room_id, snapshot));
+    /// Restores persist-only fields. Does not Admit or create sessions.
+    pub fn restore_persist_snapshot(&self, room_id: String, snapshot: PersistRecord) {
+        self.on_owner(move |inner| {
+            let _ = inner.runtime.restore(&room_id, &snapshot.bytes);
+        });
     }
 
-    /// Live entity census. Tombstones are excluded.
+    /// Live entity census from Runtime ListBindings.
     #[must_use]
     pub fn census(&self, room_id: String) -> RoomCensus {
         self.on_owner(move |inner| inner.census(&room_id))
     }
 
-    /// Live admit rows for host-audit census (per-entity host NetEntityId).
+    /// Live admit rows for host-audit census.
     #[must_use]
     pub fn list_admits(&self, room_id: String) -> Vec<AdmitTrace> {
         self.on_owner(move |inner| inner.list_admits(&room_id))
-    }
-
-    /// Projects a gameplay seq to the host `nent_*` string.
-    #[must_use]
-    pub fn host_net_entity_id_of(&self, gameplay_id: u64) -> String {
-        self.on_owner(move |inner| format_host_net_entity_id(inner.instance_key, gameplay_id))
-    }
-
-    /// Client-local chat window.
-    #[must_use]
-    pub fn client_chat_window(&self, connection_id: String) -> Vec<ChatMessageEvent> {
-        self.on_owner(move |inner| inner.client_chat_window(&connection_id))
     }
 
     /// Owner thread id (tests).
@@ -522,421 +422,298 @@ impl Inner {
         if is_bot_namespace(&payload.login_name) && !payload.bot_tool_context {
             return RoomAdmitResult::reject("bot_namespace_admission_forbidden");
         }
-        let kind = classify_entity_kind(&payload.login_name, payload.bot_tool_context);
-        self.expire_due();
-        if self.by_connection.contains_key(connection_id) {
+        if self.sessions.contains_key(connection_id) {
             return RoomAdmitResult::reject("invalid_request");
         }
-        if let Some(existing) = self.by_account.get(&payload.account_id) {
-            if existing.room_id != room_id {
+        let kind = super::runtime::entity_type_of(&payload.login_name, payload.bot_tool_context);
+        if let Some(old_id) = self.account_sessions.get(&payload.account_id).cloned() {
+            return self.takeover(room_id, connection_id, payload, kind, &old_id);
+        }
+        let admitted = self
+            .runtime
+            .admit(connection_id, &payload.account_id, room_id, kind);
+        if admitted.accepted {
+            return self.commit_session(connection_id, payload, admitted, false, false);
+        }
+        if admitted.code.as_deref() == Some("cross_room_reference") {
+            return RoomAdmitResult::reject("invalid_request");
+        }
+        let rebound = self.runtime.rebind(
+            connection_id,
+            &payload.account_id,
+            room_id,
+            RebindMode::Reconnect,
+        );
+        if rebound.accepted {
+            self.cancel_expire_for(
+                rebound
+                    .binding
+                    .as_ref()
+                    .map(|row| row.net_entity_id.as_str()),
+            );
+            return self.commit_session(connection_id, payload, rebound, true, false);
+        }
+        RoomAdmitResult::reject(admitted.code.as_deref().unwrap_or("invalid_request"))
+    }
+
+    fn takeover(
+        &mut self,
+        room_id: &str,
+        connection_id: &str,
+        payload: &AdmissionPayload,
+        _kind: BoundEntityKind,
+        old_id: &str,
+    ) -> RoomAdmitResult {
+        if let Some(old) = self.sessions.get(old_id) {
+            if old.room_id != room_id {
                 return RoomAdmitResult::reject("invalid_request");
             }
-            let account = payload.account_id.clone();
-            return match existing.presence {
-                BindingPresence::Active => self.takeover(&account, connection_id),
-                BindingPresence::Disconnected => self.rebind(&account, connection_id, true, false),
-            };
         }
-        self.gameplay.create_room(room_id);
-        let net_entity_id = self.next_net_entity_id;
-        self.next_net_entity_id += 1;
-        if !self.gameplay.create_entity(room_id, net_entity_id) {
-            return RoomAdmitResult::reject("invalid_request");
-        }
-        let live = LiveEntity {
-            account_id: payload.account_id.clone(),
-            login_name: payload.login_name.clone(),
-            room_id: room_id.to_owned(),
-            net_entity_id,
-            host_net_entity_id: format_host_net_entity_id(self.instance_key, net_entity_id),
-            session_id: session_id_for(&payload.login_name, false),
-            entity_type: kind,
-            generation: 1,
-            presence: BindingPresence::Active,
-            connection_id: Some(connection_id.to_owned()),
-            disconnected_at_ms: None,
-            window: Vec::new(),
+        let rebound = self.runtime.rebind(
+            connection_id,
+            &payload.account_id,
+            room_id,
+            RebindMode::Takeover,
+        );
+        let Some(binding) = rebound.binding.clone() else {
+            return RoomAdmitResult::reject(rebound.code.as_deref().unwrap_or("invalid_request"));
         };
-        let binding = live.binding();
-        self.rooms
-            .entry(room_id.to_owned())
-            .or_insert_with(|| RoomState {
-                revision: 0,
-                entities: HashMap::new(),
-            })
-            .entities
-            .insert(net_entity_id, payload.account_id.clone());
-        self.by_connection
-            .insert(connection_id.to_owned(), payload.account_id.clone());
-        self.by_account.insert(payload.account_id.clone(), live);
-        RoomAdmitResult::ok(binding, false, false)
-    }
-
-    fn takeover(&mut self, account_id: &str, new_connection_id: &str) -> RoomAdmitResult {
-        if let Some(existing) = self.by_account.get(account_id) {
-            if let Some(old) = existing.connection_id.clone() {
-                self.by_connection.remove(&old);
+        let new_generation = binding.connection_generation;
+        let net_u64 = net_entity_id_to_u64(&binding.net_entity_id).unwrap_or(0);
+        if let Some(old) = self.sessions.remove(old_id) {
+            if let Some(egress) = &old.egress {
+                let _ = egress.send_text(connection_superseded_json(net_u64, new_generation));
+                let _ = egress.close();
             }
         }
-        self.rebind(account_id, new_connection_id, false, true)
+        self.account_sessions.remove(&payload.account_id);
+        self.commit_session(connection_id, payload, rebound, false, true)
     }
 
-    fn rebind(
+    fn commit_session(
         &mut self,
-        account_id: &str,
-        new_connection_id: &str,
+        connection_id: &str,
+        payload: &AdmissionPayload,
+        admitted: RuntimeAdmit,
         reconnected: bool,
         takeover: bool,
     ) -> RoomAdmitResult {
-        let Some(live) = self.by_account.get_mut(account_id) else {
+        let Some(runtime_binding) = admitted.binding else {
             return RoomAdmitResult::reject("invalid_request");
         };
-        live.connection_id = Some(new_connection_id.to_owned());
-        live.presence = BindingPresence::Active;
-        live.disconnected_at_ms = None;
-        live.generation += 1;
-        live.session_id = session_id_for(&live.login_name, true);
-        live.window.clear();
-        let binding = live.binding();
-        self.by_connection
-            .insert(new_connection_id.to_owned(), account_id.to_owned());
+        if self
+            .runtime
+            .attach_member(&runtime_binding.room_id, connection_id)
+            .is_err()
+        {
+            return RoomAdmitResult::reject("runtime_failure");
+        }
+        let session_id = session_id_for(&payload.login_name, reconnected || takeover);
+        let egress = self.pending_egress.remove(connection_id);
+        let session = Session {
+            connection_id: connection_id.to_owned(),
+            session_id: session_id.clone(),
+            account_id: payload.account_id.clone(),
+            login_name: payload.login_name.clone(),
+            room_id: runtime_binding.room_id.clone(),
+            net_entity_id: runtime_binding.net_entity_id.clone(),
+            entity_type: runtime_binding.entity_type,
+            generation: runtime_binding.connection_generation,
+            egress,
+        };
+        let binding = ConnectionBinding::from_runtime(runtime_binding, session_id);
+        self.account_sessions
+            .insert(payload.account_id.clone(), connection_id.to_owned());
+        self.sessions.insert(connection_id.to_owned(), session);
+        self.send_full_snapshot(connection_id);
         RoomAdmitResult::ok(binding, reconnected, takeover)
     }
 
     fn disconnect(&mut self, connection_id: &str) -> bool {
-        self.expire_due();
-        let Some(account_id) = self.by_connection.get(connection_id).cloned() else {
+        let Some(session) = self.sessions.remove(connection_id) else {
             return false;
         };
-        let Some(live) = self.by_account.get_mut(&account_id) else {
-            return false;
-        };
-        if !matches!(live.presence, BindingPresence::Active)
-            || live.connection_id.as_deref() != Some(connection_id)
-        {
-            return false;
+        self.account_sessions.remove(&session.account_id);
+        if let Some(egress) = &session.egress {
+            let _ = egress.close();
         }
-        self.by_connection.remove(connection_id);
-        live.presence = BindingPresence::Disconnected;
-        live.connection_id = None;
-        live.disconnected_at_ms = Some(self.clock.now_ms());
+        let _ = self.runtime.disconnect(connection_id);
+        let due = self.clock.now_ms().saturating_add(self.reconnect_window_ms);
+        if let Ok(handle) =
+            self.kernel
+                .schedule_one_shot(TimerMode::WallClock, due, DISPATCH_EXPIRE)
+        {
+            self.expire_watch
+                .insert(handle, session.net_entity_id.clone());
+        }
         true
     }
 
-    fn expire_due(&mut self) -> usize {
-        let now = self.clock.now_ms();
-        let window = self.reconnect_window_ms;
-        let due: Vec<String> = self
-            .by_account
-            .iter()
-            .filter_map(|(account, live)| {
-                if matches!(live.presence, BindingPresence::Disconnected) {
-                    if let Some(at) = live.disconnected_at_ms {
-                        if now.saturating_sub(at) >= window {
-                            return Some(account.clone());
-                        }
-                    }
-                }
-                None
-            })
-            .collect();
-        let count = due.len();
-        for account in due {
-            self.destroy_account(&account);
-        }
-        count
-    }
-
-    fn destroy_account(&mut self, account_id: &str) {
-        let Some(live) = self.by_account.remove(account_id) else {
+    fn cancel_expire_for(&mut self, net_entity_id: Option<&str>) {
+        let Some(net_entity_id) = net_entity_id else {
             return;
         };
-        self.gameplay
-            .destroy_entity(&live.room_id, live.net_entity_id);
-        if let Some(room) = self.rooms.get_mut(&live.room_id) {
-            room.entities.remove(&live.net_entity_id);
+        let handles: Vec<KernelHandle> = self
+            .expire_watch
+            .iter()
+            .filter(|(_, id)| *id == net_entity_id)
+            .map(|(handle, _)| *handle)
+            .collect();
+        for handle in handles {
+            let _ = self.kernel.cancel(handle);
+            self.expire_watch.remove(&handle);
         }
-        self.tombstones.insert(
-            live.net_entity_id,
-            Tombstone {
-                room_id: live.room_id,
-                _account_id: live.account_id,
-            },
-        );
-        if let Some(connection) = live.connection_id {
-            self.by_connection.remove(&connection);
+    }
+
+    fn drive_wall(&mut self) {
+        let now = self.clock.now_ms();
+        let Ok(fired) = self.kernel.pump_wall_clock(now) else {
+            return;
+        };
+        for event in fired {
+            if event.dispatch_id != DISPATCH_EXPIRE {
+                continue;
+            }
+            if let Some(net_entity_id) = self.expire_watch.remove(&event.handle) {
+                let _ = self.runtime.expire(&net_entity_id);
+            }
         }
     }
 
     fn admit_chat_input(&mut self, connection_id: &str, envelope: &InputCommand) -> ChatOperation {
-        let text = match envelope.try_decode_chat_text() {
-            Ok(text) => text,
-            Err(code) => return ChatOperation::rejected(code),
-        };
-        self.expire_due();
-        let Some(account_id) = self.by_connection.get(connection_id) else {
+        let Some(session) = self.sessions.get(connection_id) else {
             return ChatOperation::rejected("disconnected");
         };
-        let Some(live) = self.by_account.get(account_id) else {
-            return ChatOperation::rejected("disconnected");
-        };
-        if !matches!(live.presence, BindingPresence::Active) {
-            return ChatOperation::rejected("disconnected");
-        }
-        let room_id = live.room_id.clone();
-        let net_entity_id = live.net_entity_id;
-        self.gameplay.admit_chat(&room_id, net_entity_id, &text)
+        let room_id = session.room_id.clone();
+        let generation = session.generation;
+        self.runtime
+            .admit_input_command(&room_id, connection_id, generation, &envelope.to_json())
     }
 
-    fn run_tick(&mut self, room_id: &str) -> ChatTickResult {
-        self.expire_due();
-        if !self.rooms.contains_key(room_id) {
-            return ChatTickResult {
+    fn run_tick(&mut self, room_id: &str) -> RuntimeTick {
+        self.tick_id = self.tick_id.saturating_add(1);
+        let Ok(fired) = self.kernel.advance_tick_frame(self.tick_id) else {
+            return RuntimeTick {
                 applied_tick: 0,
-                events: Vec::new(),
+                revision: 0,
+            };
+        };
+        if !fired.iter().any(|row| row.dispatch_id == DISPATCH_TICK) {
+            return RuntimeTick {
+                applied_tick: 0,
+                revision: 0,
             };
         }
-        let tick = self.gameplay.run_tick(room_id);
-        if let Some(room) = self.rooms.get_mut(room_id) {
-            room.revision += 1;
-        }
-        let accounts: Vec<String> = self
-            .rooms
-            .get(room_id)
-            .map(|room| room.entities.values().cloned().collect())
-            .unwrap_or_default();
-        for account in accounts {
-            if let Some(live) = self.by_account.get_mut(&account) {
-                if matches!(live.presence, BindingPresence::Active) && live.connection_id.is_some()
-                {
-                    live.window.extend(tick.events.iter().cloned());
-                }
-            }
-        }
+        let tick = self.runtime.run_tick(room_id, self.tick_id);
+        let frames = self
+            .runtime
+            .build_delta(room_id, tick.applied_tick, tick.revision);
+        self.broadcast(room_id, &frames);
         tick
     }
 
-    fn try_self_lookup(&mut self, connection_id: &str) -> Option<ConnectionBinding> {
-        self.expire_due();
-        let account = self.by_connection.get(connection_id)?;
-        let live = self.by_account.get(account)?;
-        if matches!(live.presence, BindingPresence::Active)
-            && live.connection_id.as_deref() == Some(connection_id)
-        {
-            Some(live.binding())
-        } else {
-            None
+    fn broadcast(&self, room_id: &str, frames: &[Vec<u8>]) {
+        for session in self.sessions.values() {
+            if session.room_id != room_id {
+                continue;
+            }
+            let Some(egress) = &session.egress else {
+                continue;
+            };
+            for frame in frames {
+                let text = String::from_utf8_lossy(frame).into_owned();
+                let _ = egress.send_text(text);
+            }
         }
+    }
+
+    fn send_full_snapshot(&mut self, connection_id: &str) {
+        let Some(session) = self.sessions.get(connection_id) else {
+            return;
+        };
+        let room_id = session.room_id.clone();
+        let Some(egress) = session.egress.clone() else {
+            return;
+        };
+        let bytes = self.runtime.build_full_snapshot(&room_id, self.tick_id, 0);
+        let _ = egress.send_text(String::from_utf8_lossy(&bytes).into_owned());
+    }
+
+    fn on_wire(&mut self, event: WireEvent) {
+        match event {
+            WireEvent::Attached {
+                connection_id,
+                egress,
+            } => {
+                if let Some(session) = self.sessions.get_mut(&connection_id) {
+                    session.egress = Some(egress);
+                    self.send_full_snapshot(&connection_id);
+                } else {
+                    self.pending_egress.insert(connection_id, egress);
+                }
+            }
+            WireEvent::Input {
+                connection_id,
+                text,
+            } => {
+                if let Ok(envelope) = parse_input_command_json(&text) {
+                    let _ = self.admit_chat_input(&connection_id, &envelope);
+                }
+            }
+            WireEvent::Closed { connection_id } => {
+                if let Some(session) = self.sessions.get_mut(&connection_id) {
+                    session.egress = None;
+                }
+            }
+        }
+    }
+
+    fn try_self_lookup(&mut self, connection_id: &str) -> Option<ConnectionBinding> {
+        let runtime = self.runtime.self_lookup(connection_id)?;
+        let session = self.sessions.get(connection_id)?;
+        Some(ConnectionBinding::from_runtime(
+            runtime,
+            session.session_id.clone(),
+        ))
     }
 
     fn try_resolve_by_net_entity_id(
         &mut self,
         room_id: &str,
-        net_entity_id: u64,
+        net_entity_id: &str,
     ) -> Option<EntityResolution> {
-        self.expire_due();
-        let account = self.rooms.get(room_id)?.entities.get(&net_entity_id)?;
-        let live = self.by_account.get(account)?;
+        let runtime = self
+            .runtime
+            .resolve_by_net_entity_id(room_id, net_entity_id)?;
         Some(EntityResolution {
-            net_entity_id: live.net_entity_id,
-            room_id: live.room_id.clone(),
-            entity_type: live.entity_type,
-            account_id: live.account_id.clone(),
+            net_entity_id: runtime.net_entity_id,
+            room_id: runtime.room_id,
+            entity_type: runtime.entity_type,
+            account_id: runtime.account_id,
         })
     }
 
     fn query_attribute(&mut self, request: &AttributeQueryRequest) -> QueryResult {
-        self.expire_due();
-        if classify_attribute_id(&request.attribute_id) {
-            return QueryResult::request_error("storage_access_forbidden");
-        }
-        if !is_declared_attribute_grammar(&request.attribute_id) {
-            return QueryResult::request_error("invalid_attribute_id");
-        }
-        if let Some(tomb) = self.tombstones.get(&request.net_entity_id) {
-            if tomb.room_id != request.room_id {
-                return QueryResult::request_error("cross_room_reference");
-            }
-            return QueryResult::fail(AttributeQueryOutcome::Tombstoned);
-        }
-        let Some(live) = self.find_entity(request.net_entity_id) else {
-            return QueryResult::fail(AttributeQueryOutcome::NonExistent);
-        };
-        let live_room = live.room_id.clone();
-        let live_generation = live.generation;
-        if live_room != request.room_id {
-            return QueryResult::request_error("cross_room_reference");
-        }
-        if let Some(generation) = request.connection_generation {
-            if generation < live_generation {
-                return QueryResult::fail(AttributeQueryOutcome::StaleGeneration);
-            }
-        }
-        self.read_attribute(request)
-    }
-
-    fn find_entity(&self, net_entity_id: u64) -> Option<&LiveEntity> {
-        self.by_account
-            .values()
-            .find(|live| live.net_entity_id == net_entity_id)
-    }
-
-    fn read_attribute(&mut self, request: &AttributeQueryRequest) -> QueryResult {
-        let Some(live) = self.find_entity(request.net_entity_id) else {
-            return QueryResult::fail(AttributeQueryOutcome::NonExistent);
-        };
-        let room_id = live.room_id.clone();
-        let entity_type = live.entity_type;
-        let account_id = live.account_id.clone();
-        let disconnected = matches!(live.presence, BindingPresence::Disconnected);
-        let net_entity_id = live.net_entity_id;
-        let tick = self.gameplay.current_tick(&room_id);
-        let revision = self.rooms.get(&room_id).map_or(0, |room| room.revision);
-        let client = request.caller_scope == AttributeQueryScope::ClientReplica;
-        match request.attribute_id.as_str() {
-            "EntityIdentity.entityType" => {
-                QueryResult::ok(entity_type.as_str().to_owned(), tick, revision)
-            }
-            "EntityIdentity.accountId" => {
-                if client {
-                    QueryResult::fail(AttributeQueryOutcome::Invisible)
-                } else {
-                    QueryResult::ok(account_id, tick, revision)
-                }
-            }
-            "EntityIdentity.restrictedFlag" => {
-                if client {
-                    QueryResult::fail(AttributeQueryOutcome::Unauthorized)
-                } else {
-                    QueryResult::ok("0".to_owned(), tick, revision)
-                }
-            }
-            "EntityPresence.disconnected" => QueryResult::ok(
-                if disconnected {
-                    "true".to_owned()
-                } else {
-                    "false".to_owned()
-                },
-                tick,
-                revision,
-            ),
-            "ChatComponent.lastMessageText" | "ChatComponent.lastMessageTick" => {
-                if client {
-                    return QueryResult::fail(AttributeQueryOutcome::Invisible);
-                }
-                match self.gameplay.last_message(&room_id, net_entity_id) {
-                    Some((text, last_tick)) => {
-                        let value = if request.attribute_id.ends_with("Text") {
-                            text
-                        } else {
-                            last_tick.to_string()
-                        };
-                        QueryResult::ok(value, tick, revision)
-                    }
-                    None => QueryResult::fail(AttributeQueryOutcome::NonExistent),
-                }
-            }
-            _ => QueryResult::request_error("undeclared_attribute"),
-        }
-    }
-
-    fn capture_persist_snapshot(&mut self, room_id: &str) -> ChatPersistSnapshot {
-        let rows = self.gameplay.capture_persist(room_id);
-        let mut entities = Vec::new();
-        for (net_entity_id, text, tick) in rows {
-            if let Some(live) = self.find_entity(net_entity_id) {
-                entities.push(ChatPersistEntity {
-                    net_entity_id,
-                    account_id: live.account_id.clone(),
-                    entity_type: live.entity_type,
-                    last_message_text: text,
-                    last_message_tick: tick,
-                    history_count: 0,
-                });
-            }
-        }
-        ChatPersistSnapshot { entities }
-    }
-
-    fn restore_persist_snapshot(&mut self, room_id: &str, snapshot: ChatPersistSnapshot) {
-        self.gameplay.create_room(room_id);
-        for entity in snapshot.entities {
-            let live = self.find_entity(entity.net_entity_id).is_some();
-            if !live {
-                let _ = self.gameplay.create_entity(room_id, entity.net_entity_id);
-            }
-            let _ = self.gameplay.restore_last_message(
-                room_id,
-                entity.net_entity_id,
-                &entity.last_message_text,
-                entity.last_message_tick,
-            );
-            if entity.net_entity_id >= self.next_net_entity_id {
-                self.next_net_entity_id = entity.net_entity_id + 1;
-            }
-            if live {
-                continue;
-            }
-            let live = LiveEntity {
-                account_id: entity.account_id.clone(),
-                login_name: String::new(),
-                room_id: room_id.to_owned(),
-                net_entity_id: entity.net_entity_id,
-                host_net_entity_id: format_host_net_entity_id(
-                    self.instance_key,
-                    entity.net_entity_id,
-                ),
-                session_id: String::new(),
-                entity_type: entity.entity_type,
-                generation: 1,
-                presence: BindingPresence::Active,
-                connection_id: None,
-                disconnected_at_ms: None,
-                window: Vec::new(),
-            };
-            self.rooms
-                .entry(room_id.to_owned())
-                .or_insert_with(|| RoomState {
-                    revision: 0,
-                    entities: HashMap::new(),
-                })
-                .entities
-                .insert(entity.net_entity_id, entity.account_id.clone());
-            if !entity.account_id.is_empty() {
-                self.by_account.insert(entity.account_id, live);
-            }
-        }
+        self.runtime.query_attribute(&RuntimeQuery {
+            caller_scope: request.caller_scope,
+            room_id: request.room_id.clone(),
+            net_entity_id: request.net_entity_id.clone(),
+            attribute_id: request.attribute_id.clone(),
+            connection_generation: request.connection_generation,
+        })
     }
 
     fn census(&mut self, room_id: &str) -> RoomCensus {
-        self.expire_due();
-        let Some(room) = self.rooms.get(room_id) else {
-            return RoomCensus {
-                bot_count: 0,
-                player_count: 0,
-                total: 0,
-                net_entity_ids: Vec::new(),
-                entity_types: Vec::new(),
-            };
-        };
-        let mut ids = Vec::new();
-        let mut kinds = Vec::new();
+        let mut rows = self.runtime.list_bindings(room_id);
+        rows.sort_by(|left, right| left.net_entity_id.cmp(&right.net_entity_id));
         let mut bots = 0;
         let mut players = 0;
-        let mut rows: Vec<(u64, BoundEntityKind)> = room
-            .entities
-            .iter()
-            .filter_map(|(id, account)| {
-                self.by_account
-                    .get(account)
-                    .map(|live| (*id, live.entity_type))
-            })
-            .collect();
-        rows.sort_by_key(|(id, _)| *id);
-        for (id, kind) in rows {
-            ids.push(id);
-            kinds.push(kind);
-            match kind {
+        let mut ids = Vec::new();
+        let mut kinds = Vec::new();
+        for row in rows {
+            ids.push(row.net_entity_id);
+            kinds.push(row.entity_type);
+            match row.entity_type {
                 BoundEntityKind::Bot => bots += 1,
                 BoundEntityKind::Player => players += 1,
             }
@@ -951,369 +728,55 @@ impl Inner {
     }
 
     fn list_admits(&mut self, room_id: &str) -> Vec<AdmitTrace> {
-        self.expire_due();
-        let Some(room) = self.rooms.get(room_id) else {
-            return Vec::new();
-        };
-        let mut rows: Vec<AdmitTrace> = room
-            .entities
-            .iter()
-            .filter_map(|(id, account)| {
-                let live = self.by_account.get(account)?;
-                Some(AdmitTrace {
-                    connection_id: live.connection_id.clone().unwrap_or_default(),
-                    session_id: live.session_id.clone(),
-                    host_net_entity_id: live.host_net_entity_id.clone(),
-                    net_entity_id: *id,
-                    entity_type: live.entity_type,
-                    account_id: live.account_id.clone(),
-                    login_name: live.login_name.clone(),
-                })
+        let mut rows: Vec<AdmitTrace> = self
+            .sessions
+            .values()
+            .filter(|session| session.room_id == room_id)
+            .map(|session| AdmitTrace {
+                connection_id: session.connection_id.clone(),
+                session_id: session.session_id.clone(),
+                net_entity_id: session.net_entity_id.clone(),
+                entity_type: session.entity_type,
+                account_id: session.account_id.clone(),
+                login_name: session.login_name.clone(),
             })
             .collect();
-        rows.sort_by_key(|row| row.net_entity_id);
+        rows.sort_by(|left, right| left.net_entity_id.cmp(&right.net_entity_id));
         rows
     }
-
-    fn client_chat_window(&self, connection_id: &str) -> Vec<ChatMessageEvent> {
-        let Some(account) = self.by_connection.get(connection_id) else {
-            return Vec::new();
-        };
-        self.by_account
-            .get(account)
-            .map(|live| live.window.clone())
-            .unwrap_or_default()
-    }
 }
 
-fn classify_attribute_id(attribute_id: &str) -> bool {
-    attribute_id.contains('(')
-        || attribute_id.starts_with("Storage.")
-        || attribute_id.contains('/')
-        || attribute_id.contains('\\')
-}
-
-fn is_declared_attribute_grammar(attribute_id: &str) -> bool {
-    let Some(dot) = attribute_id.find('.') else {
-        return false;
-    };
-    if dot == 0 || dot != attribute_id.rfind('.').unwrap_or(0) || dot == attribute_id.len() - 1 {
-        return false;
+fn parse_input_command_json(text: &str) -> Result<InputCommand, ()> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| ())?;
+    if value.get("messageType").and_then(serde_json::Value::as_str) != Some("InputCommand") {
+        return Err(());
     }
-    let (head, tail) = attribute_id.split_at(dot);
-    let tail = &tail[1..];
-    let mut chars = head.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_uppercase() {
-        return false;
-    }
-    if !chars.all(is_attr_char) {
-        return false;
-    }
-    let mut attr = tail.chars();
-    let Some(first_attr) = attr.next() else {
-        return false;
-    };
-    first_attr.is_ascii_lowercase() && attr.all(is_attr_char)
-}
-
-fn is_attr_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::entity_chat::admission::{generate_keys, issue_admission_credential};
-    use crate::entity_chat::gameplay::{ChatOpKind, LocalGameplay};
-    use crate::entity_chat::{InputCommand, ADMISSION_KEY_ID, RECONNECT_WINDOW_MS};
-
-    fn host_with(keys: &crate::entity_chat::Ed25519KeyPair) -> EntityChatHost {
-        EntityChatHost::new(
-            RECONNECT_WINDOW_MS,
-            SharedClock::test(),
-            Box::new(LocalGameplay::new()),
-            ADMISSION_KEY_ID,
-            keys.public.to_vec(),
-            1_000,
-        )
-    }
-
-    fn credential(keys: &crate::entity_chat::Ed25519KeyPair, name: &str, bot: bool) -> String {
-        issue_admission_credential(&keys.seed, 1, &format!("acct_{name}"), name, bot, 1, 9_000)
-    }
-
-    #[test]
-    fn username_password_is_never_an_admission_path() {
-        let keys = generate_keys();
-        let host = host_with(&keys);
-        assert!(!host.try_admit_username_password("room-main", "c1", "Bot01", "123456"));
-    }
-
-    #[test]
-    fn admit_creates_bot_and_player_and_resolves_bindings() {
-        let keys = generate_keys();
-        let host = host_with(&keys);
-        let bot = host.admit(
-            "room-main".to_owned(),
-            "c-bot01".to_owned(),
-            credential(&keys, "Bot01", true),
-        );
-        let player = host.admit(
-            "room-main".to_owned(),
-            "c-browser".to_owned(),
-            credential(&keys, "Browser01", false),
-        );
-        assert!(bot.accepted && player.accepted);
-        assert_eq!(
-            bot.binding.as_ref().map(|b| b.entity_type),
-            Some(BoundEntityKind::Bot)
-        );
-        assert_eq!(
-            player.binding.as_ref().map(|b| b.entity_type),
-            Some(BoundEntityKind::Player)
-        );
-        let census = host.census("room-main".to_owned());
-        assert_eq!(census.bot_count, 1);
-        assert_eq!(census.player_count, 1);
-        let self_bot = host.must_self("c-bot01");
-        assert!(host
-            .try_resolve_by_net_entity_id("room-main".to_owned(), self_bot.net_entity_id)
-            .is_some());
-    }
-
-    #[test]
-    fn reconnect_within_window_rebinds_entity_a() {
-        let keys = generate_keys();
-        let host = host_with(&keys);
-        let _ = host.admit(
-            "room-main".to_owned(),
-            "c-bot01".to_owned(),
-            credential(&keys, "Bot01", true),
-        );
-        let first = host.must_self("c-bot01");
-        let entity_a = first.net_entity_id;
-        let first_host = first.host_net_entity_id.clone();
-        let first_session = first.session_id.clone();
-        assert!(host.disconnect("c-bot01".to_owned()));
-        let rejected = host.admit_chat_input(
-            "c-bot01".to_owned(),
-            InputCommand::from_chat_text("while-down"),
-        );
-        assert_eq!(rejected.kind, ChatOpKind::Rejected);
-        let rebind = host.admit(
-            "room-main".to_owned(),
-            "c-bot01-re".to_owned(),
-            credential(&keys, "Bot01", true),
-        );
-        assert!(rebind.reconnected);
-        let rebound = rebind.binding.expect("rebind binding");
-        assert_eq!(rebound.net_entity_id, entity_a);
-        assert_eq!(rebound.host_net_entity_id, first_host);
-        assert_ne!(rebound.session_id, first_session);
-        assert_ne!(rebound.host_net_entity_id, rebound.session_id);
-        assert!(rebound.host_net_entity_id.starts_with("nent_"));
-        assert!(host.client_chat_window("c-bot01-re".to_owned()).is_empty());
-    }
-
-    #[test]
-    fn host_net_entity_id_is_nent_prefixed_opaque_string() {
-        assert_eq!(
-            format_host_net_entity_id(0x11, 1),
-            "nent_00000000000000110000000000000001"
-        );
-        let keys = generate_keys();
-        let host = host_with(&keys);
-        let bot = host.admit(
-            "room-main".to_owned(),
-            "c-bot01".to_owned(),
-            credential(&keys, "Bot01", true),
-        );
-        let binding = bot.binding.expect("binding");
-        assert!(binding.host_net_entity_id.starts_with("nent_"));
-        assert_eq!(binding.host_net_entity_id.len(), 37);
-        assert_eq!(binding.session_id, "sess-Bot01");
-        assert_ne!(binding.host_net_entity_id, binding.session_id);
-        assert_ne!(binding.host_net_entity_id, binding.account_id);
-    }
-
-    #[test]
-    fn expiry_tombstones_a_and_creates_b() {
-        let keys = generate_keys();
-        let host = host_with(&keys);
-        let _ = host.admit(
-            "room-main".to_owned(),
-            "c-bot01".to_owned(),
-            credential(&keys, "Bot01", true),
-        );
-        let entity_a = host.must_self("c-bot01").net_entity_id;
-        let account = host.must_self("c-bot01").account_id;
-        assert!(host.disconnect("c-bot01".to_owned()));
-        host.advance_monotonic(RECONNECT_WINDOW_MS + 1);
-        assert_eq!(host.expire_due(), 1);
-        let created_b = host.admit(
-            "room-main".to_owned(),
-            "c-bot01-b".to_owned(),
-            credential(&keys, "Bot01", true),
-        );
-        assert!(created_b.accepted);
-        let entity_b = created_b.binding.unwrap().net_entity_id;
-        assert_ne!(entity_b, entity_a);
-        let tomb = host.query_attribute(AttributeQueryRequest {
-            caller_scope: AttributeQueryScope::ServerAuthoritative,
-            room_id: "room-main".to_owned(),
-            net_entity_id: entity_a,
-            attribute_id: "EntityIdentity.entityType".to_owned(),
-            connection_generation: None,
+    let commands = value
+        .get("commands")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(())?;
+    let mut out = Vec::new();
+    for block in commands {
+        out.push(super::envelope::CommandBlock {
+            mapping_id: block
+                .get("mappingId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?
+                .to_owned(),
+            payload: block
+                .get("payload")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?
+                .to_owned(),
+            payload_sha256: block
+                .get("payloadSha256")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?
+                .to_owned(),
         });
-        assert_eq!(tomb.outcome, AttributeQueryOutcome::Tombstoned);
-        assert_eq!(host.must_self("c-bot01-b").account_id, account);
     }
-
-    #[test]
-    fn isolation_rejects_cross_room_query() {
-        let keys = generate_keys();
-        let host = host_with(&keys);
-        let _ = host.admit(
-            "room-main".to_owned(),
-            "c-browser".to_owned(),
-            credential(&keys, "Browser01", false),
-        );
-        let _ = host.admit(
-            "room-iso".to_owned(),
-            "iso-a".to_owned(),
-            credential(&keys, "IsoPlayerA", false),
-        );
-        let browser = host.must_self("c-browser");
-        let cross = host.query_attribute(AttributeQueryRequest {
-            caller_scope: AttributeQueryScope::ServerAuthoritative,
-            room_id: "room-iso".to_owned(),
-            net_entity_id: browser.net_entity_id,
-            attribute_id: "EntityIdentity.entityType".to_owned(),
-            connection_generation: None,
-        });
-        assert_eq!(cross.error_code.as_deref(), Some("cross_room_reference"));
-    }
-
-    #[test]
-    fn attribute_query_five_outcomes() {
-        let keys = generate_keys();
-        let host = host_with(&keys);
-        let _ = host.admit(
-            "room-main".to_owned(),
-            "c-browser".to_owned(),
-            credential(&keys, "Browser01", false),
-        );
-        let binding = host.must_self("c-browser");
-        let ok = host.query_attribute(AttributeQueryRequest {
-            caller_scope: AttributeQueryScope::ServerAuthoritative,
-            room_id: "room-main".to_owned(),
-            net_entity_id: binding.net_entity_id,
-            attribute_id: "EntityIdentity.entityType".to_owned(),
-            connection_generation: None,
-        });
-        let invisible = host.query_attribute(AttributeQueryRequest {
-            caller_scope: AttributeQueryScope::ClientReplica,
-            room_id: "room-main".to_owned(),
-            net_entity_id: binding.net_entity_id,
-            attribute_id: "ChatComponent.lastMessageText".to_owned(),
-            connection_generation: None,
-        });
-        let unauthorized = host.query_attribute(AttributeQueryRequest {
-            caller_scope: AttributeQueryScope::ClientReplica,
-            room_id: "room-main".to_owned(),
-            net_entity_id: binding.net_entity_id,
-            attribute_id: "EntityIdentity.restrictedFlag".to_owned(),
-            connection_generation: None,
-        });
-        let missing = host.query_attribute(AttributeQueryRequest {
-            caller_scope: AttributeQueryScope::ServerAuthoritative,
-            room_id: "room-main".to_owned(),
-            net_entity_id: 999_999,
-            attribute_id: "EntityIdentity.entityType".to_owned(),
-            connection_generation: None,
-        });
-        let stale = host.query_attribute(AttributeQueryRequest {
-            caller_scope: AttributeQueryScope::ServerAuthoritative,
-            room_id: "room-main".to_owned(),
-            net_entity_id: binding.net_entity_id,
-            attribute_id: "EntityIdentity.entityType".to_owned(),
-            connection_generation: Some(0),
-        });
-        assert_eq!(ok.outcome, AttributeQueryOutcome::Ok);
-        assert_eq!(invisible.outcome, AttributeQueryOutcome::Invisible);
-        assert_eq!(unauthorized.outcome, AttributeQueryOutcome::Unauthorized);
-        assert_eq!(missing.outcome, AttributeQueryOutcome::NonExistent);
-        assert_eq!(stale.outcome, AttributeQueryOutcome::StaleGeneration);
-    }
-
-    #[test]
-    fn restore_on_same_host_keeps_last_message_and_does_not_refill_window() {
-        let keys = generate_keys();
-        let host = host_with(&keys);
-        let _ = host.admit(
-            "room-main".to_owned(),
-            "c-bot01".to_owned(),
-            credential(&keys, "Bot01", true),
-        );
-        let _ = host.admit(
-            "room-main".to_owned(),
-            "c-browser".to_owned(),
-            credential(&keys, "Browser01", false),
-        );
-        let _ = host.admit_chat_input(
-            "c-bot01".to_owned(),
-            InputCommand::from_chat_text("hello-Bot01"),
-        );
-        let tick = host.run_tick("room-main".to_owned());
-        assert_eq!(tick.applied_tick, 1);
-        let window_before = host.client_chat_window("c-browser".to_owned());
-        assert_eq!(window_before.len(), 1);
-        let sender = host.must_self("c-bot01");
-        let snapshot = host.capture_persist_snapshot("room-main".to_owned());
-        assert!(snapshot
-            .entities
-            .iter()
-            .all(|entity| entity.history_count == 0));
-        host.restore_persist_snapshot("room-main".to_owned(), snapshot);
-        assert!(
-            host.try_self_lookup("c-browser".to_owned()).is_some(),
-            "restore must keep live bindings on the same host; do not construct LocalGameplay"
-        );
-        let last = host.query_attribute(AttributeQueryRequest {
-            caller_scope: AttributeQueryScope::ServerAuthoritative,
-            room_id: "room-main".to_owned(),
-            net_entity_id: sender.net_entity_id,
-            attribute_id: "ChatComponent.lastMessageText".to_owned(),
-            connection_generation: None,
-        });
-        assert_eq!(last.outcome, AttributeQueryOutcome::Ok);
-        assert_eq!(last.value.as_deref(), Some("hello-Bot01"));
-        let window_after = host.client_chat_window("c-browser".to_owned());
-        assert_eq!(
-            window_after.len(),
-            window_before.len(),
-            "restore must not refill or clear the client-only chat window"
-        );
-    }
-
-    #[test]
-    fn host_timer_tick_applies_admitted_chat() {
-        let keys = generate_keys();
-        let host = host_with(&keys);
-        let _ = host.admit(
-            "room-main".to_owned(),
-            "c-bot01".to_owned(),
-            credential(&keys, "Bot01", true),
-        );
-        let _ = host.admit_chat_input(
-            "c-bot01".to_owned(),
-            InputCommand::from_chat_text("hello-Bot01"),
-        );
-        let tick = host.schedule_room_tick("room-main".to_owned(), 0);
-        assert_eq!(tick.applied_tick, 1);
-        assert_eq!(host.client_chat_window("c-bot01".to_owned()).len(), 1);
-    }
+    Ok(InputCommand {
+        message_type: "InputCommand".to_owned(),
+        commands: out,
+    })
 }

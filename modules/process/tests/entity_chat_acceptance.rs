@@ -1,4 +1,4 @@
-//! R-00354 101-entity suite replay on the slice-scoped Rust host.
+//! R-00354 101-entity suite replay on the consume-only Rust host.
 //! Each round is a child process because `CoreCLR` initializes once per process.
 
 use std::collections::HashSet;
@@ -7,29 +7,33 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
-fn game_root() -> String {
-    std::env::var("LUMIO_GAME_ROOT")
-        .unwrap_or_else(|_| r"C:\Work\LumioGames\wt-game\r-00354-live11".to_owned())
+fn game_root() -> Result<String, String> {
+    std::env::var("LUMIO_GAME_ROOT").map_err(|_| "BLOCKED: LUMIO_GAME_ROOT is not set".to_owned())
 }
 
 fn run_round(bin: &Path, out_dir: &Path) -> Value {
     let _ = std::fs::remove_dir_all(out_dir);
     std::fs::create_dir_all(out_dir).expect("round dir");
-    let status = Command::new(bin)
-        .arg("--out")
-        .arg(out_dir)
-        .env(
-            "DOTNET_ROOT",
-            std::env::var("DOTNET_ROOT").unwrap_or_else(|_| r"C:\Users\g923\.dotnet".to_owned()),
-        )
-        .env("LUMIO_GAME_ROOT", game_root())
-        .status()
-        .expect("spawn lumio-entity-chat-replay");
+    let mut command = Command::new(bin);
+    command.arg("--out").arg(out_dir);
+    if let Ok(dotnet) = std::env::var("DOTNET_ROOT") {
+        command.env("DOTNET_ROOT", dotnet);
+    }
+    if let Ok(game) = std::env::var("LUMIO_GAME_ROOT") {
+        command.env("LUMIO_GAME_ROOT", game);
+    }
+    let status = command.status().expect("spawn lumio-entity-chat-replay");
     let evidence_path = out_dir.join("evidence.json");
     let evidence = std::fs::read_to_string(&evidence_path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .unwrap_or_else(|| json!({ "ok": false, "blocked": "evidence.json missing" }));
+    assert!(
+        evidence.get("blocked").and_then(Value::as_str).is_none(),
+        "BLOCKED round {} status={status} evidence={}",
+        out_dir.display(),
+        evidence
+    );
     assert!(
         status.success() && evidence.get("ok") == Some(&Value::Bool(true)),
         "round failed status={status} evidence={}",
@@ -38,20 +42,21 @@ fn run_round(bin: &Path, out_dir: &Path) -> Value {
     evidence
 }
 
-fn game_oracle_js() -> PathBuf {
-    PathBuf::from(game_root()).join("integration/entity-chat/verify-evidence.mjs")
+fn game_oracle_js() -> Result<PathBuf, String> {
+    Ok(PathBuf::from(game_root()?).join("integration/entity-chat/verify-evidence.mjs"))
 }
 
 fn run_oracle(dir: &Path) {
+    let oracle = game_oracle_js().expect("BLOCKED: Game oracle path");
     let output = Command::new("node")
-        .arg(game_oracle_js())
+        .arg(&oracle)
         .arg("--dir")
         .arg(dir)
         .output()
         .expect("spawn Game verify-evidence.mjs");
     assert!(
         output.status.success(),
-        "Game 1169a66 verify-evidence.mjs failed for {}: {}",
+        "Game verify-evidence.mjs failed for {}: {}",
         dir.display(),
         String::from_utf8_lossy(&output.stdout)
     );
@@ -94,14 +99,12 @@ fn assert_identical_suite_stamps(evidence: &Value) {
         "S6 tickSource must not be a for-loop, got {tick_source:?}"
     );
     assert!(
-        tick_l.contains("host-timer")
-            || tick_l.contains("itimer")
-            || tick_source.contains("test-control/tick"),
-        "S6 tickSource must match host-timer|itimer|test-control/tick, got {tick_source:?}"
+        tick_l.contains("tickframe") || tick_l.contains("kernel") || tick_l.contains("native"),
+        "S6 tickSource must be kernel tickFrame, got {tick_source:?}"
     );
     assert_eq!(
         s6.get("cadence").and_then(Value::as_str),
-        Some("host-timer")
+        Some("kernel:tickFrame")
     );
 
     let s7 = evidence.pointer("/scenarios/7").unwrap_or(&empty);
@@ -110,8 +113,8 @@ fn assert_identical_suite_stamps(evidence: &Value) {
         .and_then(Value::as_str)
         .unwrap_or("");
     assert!(
-        source == "lumio-entity-chat-replay" || source == "live-replay",
-        "S7 snapshotSource must be lumio-entity-chat-replay or live-replay, got {source:?}"
+        source == "lumio-entity-chat-replay" || source.contains("lumio-entity-chat-replay"),
+        "S7 snapshotSource must name the rust replay, got {source:?}"
     );
     assert_ne!(source, "live-rust-host");
     assert_ne!(source, "live-mvp-host");
@@ -130,9 +133,14 @@ fn is_launcher_loop_index(id: &str) -> bool {
         .is_ok_and(|n| (1..=101).contains(&n) && id == n.to_string())
 }
 
-fn is_host_nent(id: &str) -> bool {
+fn is_runtime_net_entity_id(id: &str) -> bool {
     let lower = id.to_ascii_lowercase();
-    lower.starts_with("nent-") || lower.starts_with("nent_")
+    if is_launcher_loop_index(&lower) {
+        return false;
+    }
+    (lower.len() == 32 && lower.chars().all(|c| c.is_ascii_hexdigit()))
+        || lower.starts_with("nent-")
+        || lower.starts_with("nent_")
 }
 
 fn census_from_audit(audit: &str) -> (usize, usize, HashSet<String>) {
@@ -158,7 +166,7 @@ fn census_from_audit(audit: &str) -> (usize, usize, HashSet<String>) {
         let Some(id) = row.get("netEntityId").and_then(Value::as_str) else {
             continue;
         };
-        if !is_host_nent(id) || is_launcher_loop_index(id) {
+        if !is_runtime_net_entity_id(id) || is_launcher_loop_index(id) {
             continue;
         }
         if !ids.insert(id.to_owned()) {
@@ -174,12 +182,7 @@ fn census_from_audit(audit: &str) -> (usize, usize, HashSet<String>) {
 }
 
 fn event_order_key(entry: &str) -> String {
-    let mut parts = entry.splitn(3, ':');
-    let _nent = parts.next();
-    match (parts.next(), parts.next()) {
-        (Some(text), Some(seq)) => format!("{text}:{seq}"),
-        _ => entry.to_owned(),
-    }
+    entry.to_owned()
 }
 
 fn assert_round_shape(round_dir: &Path, evidence: &Value) {
@@ -205,16 +208,16 @@ fn assert_round_shape(round_dir: &Path, evidence: &Value) {
     let (bots, players, ids) = census_from_audit(&audit);
     assert_eq!(
         bots, 100,
-        "BotEntity census must come from per-entity nent ids"
+        "BotEntity census must come from per-entity Runtime NetEntityIds"
     );
     assert_eq!(
         players, 1,
-        "PlayerEntity census must come from per-entity nent ids"
+        "PlayerEntity census must come from per-entity Runtime NetEntityIds"
     );
     assert_eq!(
         ids.len(),
         101,
-        "census total must be 101 distinct host NetEntityIds"
+        "census total must be 101 distinct Runtime NetEntityIds"
     );
 
     let empty = json!({});
@@ -229,7 +232,7 @@ fn assert_round_shape(round_dir: &Path, evidence: &Value) {
     )
     .to_ascii_lowercase();
     assert!(
-        !s5_traces.is_null() && s5_traces.as_object().is_some_and(|m| !m.is_empty()),
+        !s5_traces.is_null() && s5_traces.as_object().is_some_and(|map| !map.is_empty()),
         "S5 traces.queries must be real query results, not empty"
     );
     for needed in ["unauthorized", "invisible", "stale"] {
@@ -273,10 +276,10 @@ fn assert_round_shape(round_dir: &Path, evidence: &Value) {
         .and_then(Value::as_str)
         .unwrap_or("");
     assert!(
-        is_host_nent(nent),
-        "S8 netEntityId must be host nent_*, got {nent:?}"
+        is_runtime_net_entity_id(nent),
+        "S8 netEntityId must be Runtime-issued, got {nent:?}"
     );
-    assert_eq!(nent, prev, "S8 must rebind the same host NetEntityId");
+    assert_eq!(nent, prev, "S8 must rebind the same Runtime NetEntityId");
     assert_ne!(nent, session, "S8 sessionId is not Entity A");
     assert!(!is_launcher_loop_index(nent));
 }
@@ -317,6 +320,8 @@ fn produce_two_round_pack(bin: &Path, out_dir: &Path) {
     assert_eq!(round1["census"]["botCount"], 100);
     assert_eq!(round2["census"]["playerCount"], 1);
 
+    run_oracle(out_dir);
+
     let manifest = json!({
         "schemaVersion": 1,
         "tool": "lumio-entity-chat-rust-host/replay",
@@ -332,19 +337,18 @@ fn produce_two_round_pack(bin: &Path, out_dir: &Path) {
         serde_json::to_string_pretty(&manifest).expect("manifest") + "\n",
     )
     .expect("write manifest");
-
-    run_oracle(out_dir);
 }
 
 #[test]
 fn replays_the_r00354_suite_twice_on_the_rust_host() {
+    let _ = game_root().expect("BLOCKED: LUMIO_GAME_ROOT is not set");
     let bin = Path::new(env!("CARGO_BIN_EXE_lumio-entity-chat-replay"));
     produce_two_round_pack(
         bin,
-        &std::env::temp_dir().join("lumio-r-00359-entity-chat-evidence"),
+        &std::env::temp_dir().join("lumio-r-00374-entity-chat-evidence"),
     );
     produce_two_round_pack(
         bin,
-        &std::env::temp_dir().join("lumio-r-00359-entity-chat-evidence-b"),
+        &std::env::temp_dir().join("lumio-r-00374-entity-chat-evidence-b"),
     );
 }

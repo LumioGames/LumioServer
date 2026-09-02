@@ -27,7 +27,11 @@ function fail(error) {
 }
 
 const args = parseArgs(process.argv.slice(2))
-const gameRoot = process.env.LUMIO_GAME_ROOT || 'C:\\Work\\LumioGames\\wt-game\\r-00354-live11'
+const gameRoot = process.env.LUMIO_GAME_ROOT
+if (!gameRoot) {
+  fail('BLOCKED: LUMIO_GAME_ROOT is not set')
+  process.exit(2)
+}
 const spec = resolve(gameRoot, 'integration/entity-chat/scenarios.mjs')
 
 let runPlaywrightBrowser

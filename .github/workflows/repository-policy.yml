@@ -53,3 +53,15 @@ jobs:
       - name: Validate mvp-host build and tests
         working-directory: mvp-host
         run: bash eng/verify-all.sh
+
+  cargo-entity-chat:
+    name: Cargo entity-chat acceptance
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Cargo test lumio-server-process
+        run: cargo test -p lumio-server-process --locked
+        env:
+          CARGO_TERM_COLOR: always

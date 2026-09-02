@@ -89,6 +89,40 @@ impl InputCommand {
         }
         decoded.ok_or("unknown_command_type")
     }
+
+    /// C-1 JSON object for Runtime `AdmitInputCommand`.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "messageType": self.message_type,
+            "commands": self.commands.iter().map(|block| {
+                serde_json::json!({
+                    "mappingId": block.mapping_id,
+                    "payload": block.payload,
+                    "payloadSha256": block.payload_sha256,
+                })
+            }).collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+}
+
+/// C-1 ConnectionSuperseded text frame.
+#[must_use]
+pub fn connection_superseded_json(net_entity_id: u64, new_generation: u64) -> String {
+    serde_json::json!({
+        "messageType": "ConnectionSuperseded",
+        "reasonCode": "connection_superseded",
+        "netEntityId": net_entity_id,
+        "newConnectionGeneration": new_generation,
+    })
+    .to_string()
+}
+
+/// Runtime issues 32-char lowercase hex of a u64 sequence.
+#[must_use]
+pub fn net_entity_id_to_u64(net_entity_id: &str) -> Option<u64> {
+    u64::from_str_radix(net_entity_id, 16).ok()
 }
 
 fn is_lower_sha256(value: &str) -> bool {

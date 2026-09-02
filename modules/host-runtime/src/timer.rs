@@ -1,253 +1,266 @@
-//! Slice-scoped one-shot and periodic host timers.
-//!
-//! Callbacks fire when due on the host monotonic clock. This is not Native
-//! Timer ABI (C-4); reconnect windows and tick pacing stay on this service.
+//! Host adapter over [`crate::KernelTimer`]. Due decisions stay in the kernel.
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Mutex;
 
-use crate::{
-    bounded_channel, spawn_supervised, HostClock, RecvError, Sender, SharedClock, SupervisedTask,
-};
+use crate::clock::HostClock;
+use crate::kernel::{KernelError, KernelFired, KernelHandle, KernelTimer, TimerMode};
+use crate::SharedClock;
 
-/// Identifier returned by [`HostTimer::schedule_one_shot`] / [`schedule_periodic`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TimerId(u64);
-
-enum Callback {
-    Once(Option<Box<dyn FnOnce() + Send>>),
-    Periodic(Arc<dyn Fn() + Send + Sync>),
-}
-
-struct Job {
-    id: u64,
-    due_ms: u64,
-    period_ms: Option<u64>,
-    callback: Callback,
-}
-
-struct Inner {
-    next_id: u64,
-    jobs: Vec<Job>,
-}
-
-/// Host clock timer. Due callbacks run on the pump thread or [`Self::pump_due`].
+/// Adapter that translates host delay/tick requests into kernel schedule/pump.
 pub struct HostTimer {
     clock: SharedClock,
-    inner: Arc<Mutex<Inner>>,
-    wakeup: Sender<()>,
-    _pump: SupervisedTask,
+    kernel: Mutex<Box<dyn KernelTimer>>,
 }
 
 impl HostTimer {
-    /// Starts a supervised pump against `clock`.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the timer mutex is poisoned.
+    /// Wraps an already-constructed kernel adapter.
     #[must_use]
-    pub fn new(clock: SharedClock) -> Self {
-        let inner = Arc::new(Mutex::new(Inner {
-            next_id: 1,
-            jobs: Vec::new(),
-        }));
-        let (wakeup, rx) = bounded_channel(8);
-        let pump_inner = Arc::clone(&inner);
-        let pump_clock = clock.clone();
-        let pump = spawn_supervised("lumio-host-timer", move |cancel| loop {
-            if cancel.is_cancelled() {
-                break;
-            }
-            pump_due(&pump_clock, &pump_inner);
-            let wait = next_wait(&pump_clock, &pump_inner);
-            match rx.recv_timeout(wait) {
-                Ok(()) | Err(RecvError::Empty) => {}
-                Err(RecvError::Closed) => break,
-            }
-        });
+    pub fn new(clock: SharedClock, kernel: Box<dyn KernelTimer>) -> Self {
         Self {
             clock,
-            inner,
-            wakeup,
-            _pump: pump,
+            kernel: Mutex::new(kernel),
         }
     }
 
-    /// Schedules `callback` once after `delay_ms` on the host clock.
+    /// Schedules a wallClock one-shot `delay_ms` from the host clock origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns the kernel status.
     ///
     /// # Panics
     ///
-    /// Panics when the timer mutex is poisoned.
-    pub fn schedule_one_shot<F>(&self, delay_ms: u64, callback: F) -> TimerId
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.push(delay_ms, None, Callback::Once(Some(Box::new(callback))))
+    /// Panics when the kernel mutex is poisoned.
+    pub fn schedule_wall_one_shot(
+        &self,
+        delay_ms: u64,
+        dispatch_id: u32,
+    ) -> Result<KernelHandle, KernelError> {
+        let due = self.clock.now_ms().saturating_add(delay_ms);
+        self.kernel.lock().expect("kernel mutex").schedule_one_shot(
+            TimerMode::WallClock,
+            due,
+            dispatch_id,
+        )
     }
 
-    /// Schedules `callback` every `period_ms` on the host clock.
+    /// Schedules tickFrame repeating from tick 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns the kernel status.
     ///
     /// # Panics
     ///
-    /// Panics when the timer mutex is poisoned.
-    pub fn schedule_periodic<F>(&self, period_ms: u64, callback: F) -> TimerId
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
-        let period = period_ms.max(1);
-        self.push(period, Some(period), Callback::Periodic(Arc::new(callback)))
-    }
-
-    /// Drops a pending job. No-op when the id is unknown or already fired.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the timer mutex is poisoned.
-    pub fn cancel(&self, id: TimerId) {
-        self.inner
+    /// Panics when the kernel mutex is poisoned.
+    pub fn schedule_tick_repeating(
+        &self,
+        interval: u64,
+        dispatch_id: u32,
+    ) -> Result<KernelHandle, KernelError> {
+        self.kernel
             .lock()
-            .expect("host timer mutex")
-            .jobs
-            .retain(|job| job.id != id.0);
+            .expect("kernel mutex")
+            .schedule_repeating(TimerMode::TickFrame, 1, interval.max(1), dispatch_id)
     }
 
-    /// Runs every job whose due time is `<= now`. Tests with a test clock call
-    /// this after [`HostClock::advance_ms`].
+    /// Pumps wallClock at the current host clock reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns the kernel status.
     ///
     /// # Panics
     ///
-    /// Panics when the timer mutex is poisoned.
-    pub fn pump_due(&self) {
-        pump_due(&self.clock, &self.inner);
+    /// Panics when the kernel mutex is poisoned.
+    pub fn pump_wall_clock(&self) -> Result<Vec<KernelFired>, KernelError> {
+        let now = self.clock.now_ms();
+        self.kernel
+            .lock()
+            .expect("kernel mutex")
+            .pump_wall_clock(now)
     }
 
-    fn push(&self, delay_ms: u64, period_ms: Option<u64>, callback: Callback) -> TimerId {
-        let due_ms = self.clock.now_ms().saturating_add(delay_ms);
-        let mut inner = self.inner.lock().expect("host timer mutex");
-        let id = inner.next_id;
-        inner.next_id = inner.next_id.saturating_add(1);
-        inner.jobs.push(Job {
-            id,
-            due_ms,
-            period_ms,
-            callback,
-        });
-        drop(inner);
-        let _ = self.wakeup.try_send(());
-        TimerId(id)
+    /// Advances tickFrame to `to_tick`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the kernel status.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the kernel mutex is poisoned.
+    pub fn advance_tick_frame(&self, to_tick: u64) -> Result<Vec<KernelFired>, KernelError> {
+        self.kernel
+            .lock()
+            .expect("kernel mutex")
+            .advance_tick_frame(to_tick)
     }
-}
 
-fn pump_due(clock: &SharedClock, inner: &Arc<Mutex<Inner>>) {
-    let now = clock.now_ms();
-    let mut once = Vec::new();
-    let mut periodic = Vec::new();
-    {
-        let mut guard = inner.lock().expect("host timer mutex");
-        let mut index = 0;
-        while index < guard.jobs.len() {
-            if guard.jobs[index].due_ms > now {
-                index += 1;
-                continue;
-            }
-            match &mut guard.jobs[index].callback {
-                Callback::Once(slot) => {
-                    if let Some(callback) = slot.take() {
-                        once.push(callback);
-                    }
-                    guard.jobs.remove(index);
-                }
-                Callback::Periodic(callback) => {
-                    let callback = Arc::clone(callback);
-                    if let Some(period) = guard.jobs[index].period_ms {
-                        guard.jobs[index].due_ms = now.saturating_add(period);
-                    }
-                    periodic.push(callback);
-                    index += 1;
-                }
-            }
-        }
-    }
-    for callback in once {
-        callback();
-    }
-    for callback in periodic {
-        callback();
-    }
-}
-
-fn next_wait(clock: &SharedClock, inner: &Arc<Mutex<Inner>>) -> Duration {
-    let now = clock.now_ms();
-    let guard = inner.lock().expect("host timer mutex");
-    let Some(due) = guard.jobs.iter().map(|job| job.due_ms).min() else {
-        return Duration::from_millis(50);
-    };
-    if due <= now {
-        Duration::from_millis(1)
-    } else {
-        Duration::from_millis((due - now).clamp(1, 50))
+    /// Cancels a kernel handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns the kernel status.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the kernel mutex is poisoned.
+    pub fn cancel(&self, handle: KernelHandle) -> Result<(), KernelError> {
+        self.kernel.lock().expect("kernel mutex").cancel(handle)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{bounded_channel, RecvError, SharedClock};
+    use crate::clock::HostClock;
+    use crate::kernel::KernelError;
+    use crate::SharedClock;
 
-    #[test]
-    fn one_shot_fires_after_clock_advance() {
-        let clock = SharedClock::test();
-        let timer = HostTimer::new(clock.clone());
-        let (tx, rx) = bounded_channel(1);
-        timer.schedule_one_shot(100, move || {
-            let _ = tx.send(());
-        });
-        assert!(
-            matches!(rx.try_recv(), Err(RecvError::Empty)),
-            "one-shot must not run before it is due"
-        );
-        clock.advance_ms(100);
-        timer.pump_due();
-        rx.recv().expect("one-shot should fire after due");
+    struct ScriptedKernel {
+        one_shots: Vec<(u64, u32, KernelHandle)>,
+        repeating: Vec<(u64, u64, u32, KernelHandle)>,
+        next: u32,
+        committed_ms: u64,
+        committed_tick: u64,
+    }
+
+    impl ScriptedKernel {
+        fn new() -> Self {
+            Self {
+                one_shots: Vec::new(),
+                repeating: Vec::new(),
+                next: 1,
+                committed_ms: 0,
+                committed_tick: 0,
+            }
+        }
+
+        fn alloc(&mut self) -> KernelHandle {
+            let handle = KernelHandle {
+                index: self.next,
+                generation: 1,
+                context: 1,
+            };
+            self.next += 1;
+            handle
+        }
+    }
+
+    impl KernelTimer for ScriptedKernel {
+        fn schedule_one_shot(
+            &mut self,
+            mode: TimerMode,
+            due: u64,
+            dispatch_id: u32,
+        ) -> Result<KernelHandle, KernelError> {
+            assert_eq!(mode, TimerMode::WallClock);
+            let handle = self.alloc();
+            self.one_shots.push((due, dispatch_id, handle));
+            Ok(handle)
+        }
+
+        fn schedule_repeating(
+            &mut self,
+            mode: TimerMode,
+            first_due: u64,
+            interval: u64,
+            dispatch_id: u32,
+        ) -> Result<KernelHandle, KernelError> {
+            assert_eq!(mode, TimerMode::TickFrame);
+            let handle = self.alloc();
+            self.repeating
+                .push((first_due, interval, dispatch_id, handle));
+            Ok(handle)
+        }
+
+        fn cancel(&mut self, handle: KernelHandle) -> Result<(), KernelError> {
+            self.one_shots.retain(|row| row.2 != handle);
+            self.repeating.retain(|row| row.3 != handle);
+            Ok(())
+        }
+
+        fn pump_wall_clock(&mut self, now_ms: u64) -> Result<Vec<KernelFired>, KernelError> {
+            if now_ms < self.committed_ms {
+                return Err(KernelError {
+                    status: 9,
+                    detail: "invalid_due_tick".to_owned(),
+                });
+            }
+            self.committed_ms = now_ms;
+            let mut fired = Vec::new();
+            self.one_shots.retain(|(due, dispatch, handle)| {
+                if *due <= now_ms {
+                    fired.push(KernelFired {
+                        handle: *handle,
+                        due: *due,
+                        schedule_sequence: 1,
+                        dispatch_id: *dispatch,
+                    });
+                    false
+                } else {
+                    true
+                }
+            });
+            Ok(fired)
+        }
+
+        fn advance_tick_frame(&mut self, to_tick: u64) -> Result<Vec<KernelFired>, KernelError> {
+            if to_tick < self.committed_tick {
+                return Err(KernelError {
+                    status: 9,
+                    detail: "invalid_due_tick".to_owned(),
+                });
+            }
+            let mut fired = Vec::new();
+            for (next_due, interval, dispatch, handle) in &mut self.repeating {
+                while *next_due <= to_tick {
+                    fired.push(KernelFired {
+                        handle: *handle,
+                        due: *next_due,
+                        schedule_sequence: 1,
+                        dispatch_id: *dispatch,
+                    });
+                    *next_due = next_due.saturating_add(*interval);
+                }
+            }
+            self.committed_tick = to_tick;
+            Ok(fired)
+        }
     }
 
     #[test]
-    fn periodic_fires_twice_then_cancel_stops() {
+    fn wall_clock_one_shot_fires_after_clock_advance() {
         let clock = SharedClock::test();
-        let timer = HostTimer::new(clock.clone());
-        let (tx, rx) = bounded_channel(8);
-        let id = timer.schedule_periodic(10, move || {
-            let _ = tx.try_send(());
-        });
-        clock.advance_ms(10);
-        timer.pump_due();
-        clock.advance_ms(10);
-        timer.pump_due();
-        assert_eq!(rx.try_recv(), Ok(()));
-        assert_eq!(rx.try_recv(), Ok(()));
-        timer.cancel(id);
-        clock.advance_ms(10);
-        timer.pump_due();
-        assert!(
-            matches!(rx.try_recv(), Err(RecvError::Empty | RecvError::Closed)),
-            "cancelled periodic must not fire again"
-        );
+        let timer = HostTimer::new(clock.clone(), Box::new(ScriptedKernel::new()));
+        timer.schedule_wall_one_shot(100, 7).expect("schedule");
+        assert!(timer.pump_wall_clock().expect("pump").is_empty());
+        clock.advance_ms(100);
+        let fired = timer.pump_wall_clock().expect("pump due");
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].dispatch_id, 7);
+    }
+
+    #[test]
+    fn tick_frame_repeating_fires_on_advance() {
+        let clock = SharedClock::test();
+        let timer = HostTimer::new(clock, Box::new(ScriptedKernel::new()));
+        timer.schedule_tick_repeating(1, 2).expect("schedule tick");
+        let first = timer.advance_tick_frame(1).expect("tick 1");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].dispatch_id, 2);
+        let second = timer.advance_tick_frame(2).expect("tick 2");
+        assert_eq!(second.len(), 1);
     }
 
     #[test]
     fn cancelled_one_shot_does_not_fire() {
         let clock = SharedClock::test();
-        let timer = HostTimer::new(clock.clone());
-        let (tx, rx) = bounded_channel(1);
-        let id = timer.schedule_one_shot(50, move || {
-            let _ = tx.send(());
-        });
-        timer.cancel(id);
+        let timer = HostTimer::new(clock.clone(), Box::new(ScriptedKernel::new()));
+        let handle = timer.schedule_wall_one_shot(50, 1).expect("schedule");
+        timer.cancel(handle).expect("cancel");
         clock.advance_ms(50);
-        timer.pump_due();
-        assert!(
-            matches!(rx.try_recv(), Err(RecvError::Empty | RecvError::Closed)),
-            "cancelled one-shot must not fire"
-        );
+        assert!(timer.pump_wall_clock().expect("pump").is_empty());
     }
 }

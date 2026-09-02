@@ -1,11 +1,8 @@
-//! Sibling artifact discovery for the slice replay. Missing files are BLOCKED.
+//! Artifact discovery for the slice replay. Missing files are BLOCKED.
 
 use std::path::{Path, PathBuf};
 
 use super::clr::ClrGameplayConfig;
-
-const DEFAULT_HOSTFXR: &str = r"C:\Users\g923\.dotnet\host\fxr\10.0.11\hostfxr.dll";
-const DEFAULT_NATIVE: &str = r"C:\Work\LumioGames\LumioGameEngineArchitecture\.run\ab12bf280961a39632022f7c6f3be78f\win-x64\lumio_engine_native.dll";
 
 /// Account Server + CoreCLR files required to replay the suite.
 pub struct ReplayArtifacts {
@@ -20,54 +17,48 @@ pub fn discover() -> Result<ReplayArtifacts, String> {
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
-        .ok_or_else(|| "cannot resolve LumioServer root".to_owned())?;
+        .ok_or_else(|| "BLOCKED: cannot resolve LumioServer root".to_owned())?;
 
-    let account = first_existing(&[
-        repo.join("account-server/src/Lumio.Server.Account.App/bin/Debug/net10.0/lumio-account-server.dll"),
-        repo.join("account-server/src/Lumio.Server.Account.App/bin/Release/net10.0/lumio-account-server.dll"),
-        PathBuf::from(
-            r"C:\Work\LumioGames\wt-server\r-00344\account-server\src\Lumio.Server.Account.App\bin\Debug\net10.0\lumio-account-server.dll",
-        ),
-    ])
-    .ok_or_else(|| "account-server dll not found".to_owned())?;
+    let account = env_file("LUMIO_ACCOUNT_SERVER_DLL").or_else(|_| {
+        first_existing(&[
+            repo.join("account-server/src/Lumio.Server.Account.App/bin/Debug/net10.0/lumio-account-server.dll"),
+            repo.join("account-server/src/Lumio.Server.Account.App/bin/Release/net10.0/lumio-account-server.dll"),
+        ])
+        .ok_or_else(|| "BLOCKED: account-server dll not found (set LUMIO_ACCOUNT_SERVER_DLL)".to_owned())
+    })?;
 
-    let host_entry_dir = first_existing(&[
-        repo.join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/bin/Debug/net10.0"),
-        repo.join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/bin/Release/net10.0"),
-    ])
-    .ok_or_else(|| "entity-chat HostEntry build output not found".to_owned())?;
+    let host_entry_dir = env_dir("LUMIO_HOST_ENTRY_DIR").or_else(|_| {
+        first_existing(&[
+            repo.join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/bin/Debug/net10.0"),
+            repo.join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/bin/Release/net10.0"),
+        ])
+        .ok_or_else(|| {
+            "BLOCKED: entity-chat HostEntry build output not found (set LUMIO_HOST_ENTRY_DIR)"
+                .to_owned()
+        })
+    })?;
     let assembly = host_entry_dir.join("Lumio.Server.EntityChat.HostEntry.dll");
     let runtime_config =
         host_entry_dir.join("Lumio.Server.EntityChat.HostEntry.runtimeconfig.json");
     if !assembly.is_file() || !runtime_config.is_file() {
-        return Err("entity-chat HostEntry dll/runtimeconfig missing".to_owned());
+        return Err("BLOCKED: entity-chat HostEntry dll/runtimeconfig missing".to_owned());
     }
 
-    let gameplay = first_existing(&[
-        PathBuf::from(
-            r"C:\Work\LumioGames\wt-game\r-00354\modules\server-gameplay\src\Lumio.Game.ServerGameplay\bin\Debug\net10.0\Lumio.Game.ServerGameplay.dll",
-        ),
-        PathBuf::from(
-            r"C:\Work\LumioGames\wt-game\r-00354-review\modules\server-gameplay\src\Lumio.Game.ServerGameplay\bin\Debug\net10.0\Lumio.Game.ServerGameplay.dll",
-        ),
-        PathBuf::from(
-            r"C:\Work\LumioGames\LumioGame\modules\server-gameplay\src\Lumio.Game.ServerGameplay\bin\Debug\net10.0\Lumio.Game.ServerGameplay.dll",
-        ),
-    ])
-    .ok_or_else(|| "Lumio.Game.ServerGameplay.dll not found".to_owned())?;
+    let replication = env_file("LUMIO_RUNTIME_REPLICATION_DLL").or_else(|_| {
+        runtime_dll(&repo, "Lumio.GameRuntime.Replication.dll")
+            .ok_or_else(|| "BLOCKED: Lumio.GameRuntime.Replication.dll not found (set LUMIO_RUNTIME_REPLICATION_DLL)".to_owned())
+    })?;
+    let ecs = env_file("LUMIO_RUNTIME_ECS_DLL").or_else(|_| {
+        runtime_dll(&repo, "Lumio.GameRuntime.Ecs.dll").ok_or_else(|| {
+            "BLOCKED: Lumio.GameRuntime.Ecs.dll not found (set LUMIO_RUNTIME_ECS_DLL)".to_owned()
+        })
+    })?;
 
-    let hostfxr = PathBuf::from(
-        std::env::var("LUMIO_HOSTFXR").unwrap_or_else(|_| DEFAULT_HOSTFXR.to_owned()),
-    );
-    if !hostfxr.is_file() {
-        return Err(format!("hostfxr missing: {}", hostfxr.display()));
-    }
-    let engine_native = PathBuf::from(
-        std::env::var("LUMIO_ENGINE_NATIVE").unwrap_or_else(|_| DEFAULT_NATIVE.to_owned()),
-    );
-    if !engine_native.is_file() {
-        return Err(format!("native SDK missing: {}", engine_native.display()));
-    }
+    let hostfxr = env_file("LUMIO_HOSTFXR").or_else(|_| {
+        discover_hostfxr()
+            .ok_or_else(|| "BLOCKED: hostfxr missing (set LUMIO_HOSTFXR or DOTNET_ROOT)".to_owned())
+    })?;
+    let engine_native = env_file("LUMIO_ENGINE_NATIVE")?;
 
     Ok(ReplayArtifacts {
         account_server_dll: account,
@@ -80,9 +71,73 @@ pub fn discover() -> Result<ReplayArtifacts, String> {
                 "Lumio.Server.EntityChat.HostEntry.HostEntry, Lumio.Server.EntityChat.HostEntry"
                     .to_owned(),
             entry_method: "LumioEntityChatEntry".to_owned(),
-            gameplay_assembly: gameplay,
+            replication_assembly: replication,
+            ecs_assembly: ecs,
         },
     })
+}
+
+fn env_file(var: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(std::env::var(var).map_err(|_| format!("BLOCKED: {var} is not set"))?);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(format!("BLOCKED: {var} missing: {}", path.display()))
+    }
+}
+
+fn env_dir(var: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(std::env::var(var).map_err(|_| format!("BLOCKED: {var} is not set"))?);
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err(format!("BLOCKED: {var} missing: {}", path.display()))
+    }
+}
+
+fn runtime_dll(repo: &Path, file_name: &str) -> Option<PathBuf> {
+    let root = std::env::var("LUMIO_RUNTIME_ROOT")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| repo.parent().map(|parent| parent.join("LumioGameRuntime")))?;
+    first_existing(&[
+        root.join(format!(
+            "modules/replication/src/Lumio.GameRuntime.Replication/bin/Debug/net10.0/{file_name}"
+        )),
+        root.join(format!(
+            "modules/ecs/src/Lumio.GameRuntime.Ecs/bin/Debug/net10.0/{file_name}"
+        )),
+        root.join(format!(
+            "modules/replication/src/Lumio.GameRuntime.Replication/bin/Release/net10.0/{file_name}"
+        )),
+        root.join(format!(
+            "modules/ecs/src/Lumio.GameRuntime.Ecs/bin/Release/net10.0/{file_name}"
+        )),
+    ])
+}
+
+fn discover_hostfxr() -> Option<PathBuf> {
+    let root = PathBuf::from(std::env::var("DOTNET_ROOT").ok()?);
+    let fxr = root.join("host/fxr");
+    let mut versions = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(fxr) {
+        for entry in entries.filter_map(Result::ok) {
+            let dll = entry.path().join(hostfxr_name());
+            if dll.is_file() {
+                versions.push(dll);
+            }
+        }
+    }
+    versions.sort();
+    versions.pop()
+}
+
+fn hostfxr_name() -> &'static str {
+    if cfg!(windows) {
+        "hostfxr.dll"
+    } else {
+        "libhostfxr.so"
+    }
 }
 
 fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
