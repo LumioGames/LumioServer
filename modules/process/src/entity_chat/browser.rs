@@ -8,14 +8,25 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 const STATIC_READY_PREFIX: &str = "STATIC_READY ";
-const DEFAULT_GAME_ROOT: &str = r"C:\Work\LumioGames\wt-game\r-00354-live11";
 
 /// Game worktree that owns `integration/entity-chat` static page + Playwright helper.
-#[must_use]
-pub fn game_root() -> PathBuf {
-    std::env::var("LUMIO_GAME_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_GAME_ROOT))
+///
+/// # Errors
+///
+/// Returns BLOCKED when `LUMIO_GAME_ROOT` is unset or not a directory.
+pub fn game_root() -> Result<PathBuf, String> {
+    let path = PathBuf::from(
+        std::env::var("LUMIO_GAME_ROOT")
+            .map_err(|_| "BLOCKED: LUMIO_GAME_ROOT is not set".to_owned())?,
+    );
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err(format!(
+            "BLOCKED: LUMIO_GAME_ROOT missing: {}",
+            path.display()
+        ))
+    }
 }
 
 /// Child static file server for the Game Browser page.
@@ -32,7 +43,7 @@ impl StaticServer {
     /// Returns a human-readable failure when the process cannot start or ready
     /// is not observed.
     pub fn start(web_root: &Path, ready_file: &Path) -> Result<Self, String> {
-        let script = game_root().join("integration/entity-chat/static-server.mjs");
+        let script = game_root()?.join("integration/entity-chat/static-server.mjs");
         if !script.is_file() {
             return Err(format!("static-server.mjs missing: {}", script.display()));
         }
@@ -194,7 +205,13 @@ pub fn run_playwright_browser(
         .arg(result_path)
         .arg("--console-path")
         .arg(console_path)
-        .env("LUMIO_GAME_ROOT", game_root())
+        .env(
+            "LUMIO_GAME_ROOT",
+            match game_root() {
+                Ok(path) => path,
+                Err(error) => return PlaywrightCapture::failed(&error),
+            },
+        )
         .output();
     let output = match output {
         Ok(output) => output,
@@ -246,7 +263,10 @@ pub fn capture_browser_login(
     password: &str,
     out_dir: &Path,
 ) -> PlaywrightCapture {
-    let web = game_root().join("integration/entity-chat/web");
+    let web = match game_root() {
+        Ok(root) => root.join("integration/entity-chat/web"),
+        Err(error) => return PlaywrightCapture::failed(&error),
+    };
     if !web.is_dir() {
         return PlaywrightCapture::failed(&format!("game web missing: {}", web.display()));
     }

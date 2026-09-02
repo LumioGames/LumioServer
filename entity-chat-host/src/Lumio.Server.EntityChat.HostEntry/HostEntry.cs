@@ -10,9 +10,8 @@ using System.Text.Json;
 namespace Lumio.Server.EntityChat.HostEntry;
 
 /// <summary>
-/// Native JSON op entry that hosts <c>Lumio.Game.ServerGameplay.ChatRoomWorld</c>
-/// through Assembly.LoadFrom. Single-threaded calling model: the Rust owner
-/// thread must serialize every call.
+/// Native JSON op entry that consumes Runtime EntityBindingQuery / ChatCommandRuntime.
+/// Single-threaded: the Rust owner thread must serialize every call.
 /// </summary>
 public static class HostEntry
 {
@@ -22,10 +21,13 @@ public static class HostEntry
     private const int EntryRuntimeFailure = 3;
 
     private static readonly object Gate = new();
-    private static Assembly? GameplayAssembly;
-    private static Type? WorldType;
-    private static Type? ChatInputType;
-    private static readonly Dictionary<string, object> Worlds = new(StringComparer.Ordinal);
+    private static Assembly? Replication;
+    private static Assembly? Ecs;
+    private static Type? BindingType;
+    private static Type? ChatType;
+    private static Type? PersistType;
+    private static object? Bindings;
+    private static object? Chat;
 
     /// <summary>Native entry point used by CoreCLR hostfxr.</summary>
     [UnmanagedCallersOnly(EntryPoint = "lumio_entity_chat_entry")]
@@ -98,15 +100,21 @@ public static class HostEntry
             return name switch
             {
                 "boot" => Boot(root),
-                "create_room" => CreateRoom(root),
-                "create_entity" => CreateEntity(root),
-                "destroy_entity" => DestroyEntity(root),
-                "admit_chat" => AdmitChat(root),
+                "admit" => Admit(root),
+                "disconnect" => Disconnect(root),
+                "rebind" => Rebind(root),
+                "expire" => Expire(root),
+                "self_lookup" => SelfLookup(root),
+                "resolve" => Resolve(root),
+                "query" => Query(root),
+                "list_bindings" => ListBindings(root),
+                "attach_member" => AttachMember(root),
+                "admit_input" => AdmitInput(root),
                 "tick" => Tick(root),
+                "build_full_snapshot" => BuildFullSnapshot(root),
+                "build_delta" => BuildDelta(root),
                 "persist" => Persist(root),
                 "restore" => Restore(root),
-                "get_component" => GetComponent(root),
-                "current_tick" => CurrentTick(root),
                 "shutdown" => (EntrySuccess, Ok()),
                 _ => (EntryInvalidInput, Fail("bad_envelope")),
             };
@@ -115,217 +123,390 @@ public static class HostEntry
 
     private static (int, byte[]) Boot(JsonElement root)
     {
-        if (!TryReadString(root, "gameplayAssembly", out string? path) || string.IsNullOrEmpty(path) || !File.Exists(path))
+        if (!TryReadString(root, "replicationAssembly", out string? replicationPath)
+            || !TryReadString(root, "ecsAssembly", out string? ecsPath)
+            || string.IsNullOrEmpty(replicationPath)
+            || string.IsNullOrEmpty(ecsPath)
+            || !File.Exists(replicationPath)
+            || !File.Exists(ecsPath))
         {
             return (EntrySuccess, Fail("boot_failed"));
         }
 
-        GameplayAssembly = Assembly.LoadFrom(path);
-        WorldType = GameplayAssembly.GetType("Lumio.Game.ServerGameplay.ChatRoomWorld");
-        ChatInputType = GameplayAssembly.GetType("Lumio.Game.ServerGameplay.ChatInput");
-        if (WorldType is null || ChatInputType is null)
+        LoadSiblingAssemblies(Path.GetDirectoryName(replicationPath));
+        LoadSiblingAssemblies(Path.GetDirectoryName(ecsPath));
+        Replication = Assembly.LoadFrom(replicationPath);
+        Ecs = Assembly.LoadFrom(ecsPath);
+        BindingType = Replication.GetType("Lumio.GameRuntime.Replication.Binding.EntityBindingQuery");
+        ChatType = Replication.GetType("Lumio.GameRuntime.Replication.Chat.ChatCommandRuntime");
+        PersistType = Ecs.GetType("Lumio.GameRuntime.Ecs.EcsPersistSnapshotPipeline");
+        if (BindingType is null || ChatType is null)
         {
             return (EntrySuccess, Fail("boot_failed"));
         }
 
-        Worlds.Clear();
+        Bindings = BindingType.GetMethod("Create", Type.EmptyTypes)!.Invoke(null, Array.Empty<object>());
+        Chat = ChatType.GetMethod("Create", new[] { BindingType, typeof(bool) })
+            ?.Invoke(null, new object?[] { Bindings, false });
+        Chat ??= ChatType.GetMethod("Create", Type.EmptyTypes)?.Invoke(null, Array.Empty<object>());
+        if (Bindings is null || Chat is null)
+        {
+            return (EntrySuccess, Fail("boot_failed"));
+        }
+
         return (EntrySuccess, Ok());
     }
 
-    private static (int, byte[]) CreateRoom(JsonElement root)
+    private static void LoadSiblingAssemblies(string? directory)
     {
-        if (!TryWorld(root, create: true, out object? world))
+        if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory))
         {
-            return (EntrySuccess, Fail("invalid_request"));
+            return;
         }
 
-        _ = world;
-        return (EntrySuccess, Ok());
+        foreach (string dll in Directory.GetFiles(directory, "Lumio.GameRuntime.*.dll"))
+        {
+            try
+            {
+                Assembly.LoadFrom(dll);
+            }
+            catch (Exception)
+            {
+                // Best-effort: the requested Replication/Ecs LoadFrom is the gate.
+            }
+        }
     }
 
-    private static (int, byte[]) CreateEntity(JsonElement root)
+    private static (int, byte[]) Admit(JsonElement root)
     {
-        if (!TryWorld(root, create: true, out object? world) || !TryReadU64(root, "netEntityId", out ulong id))
+        if (Bindings is null
+            || !TryReadString(root, "connection", out string? connection)
+            || !TryReadString(root, "accountId", out string? account)
+            || !TryReadString(root, "roomId", out string? room)
+            || !TryReadString(root, "entityType", out string? entityType)
+            || connection is null || account is null || room is null || entityType is null)
         {
             return (EntrySuccess, Fail("invalid_request"));
         }
 
-        bool ok = (bool)WorldType!.GetMethod("TryCreateEntity")!.Invoke(world, new object[] { id })!;
-        return (EntrySuccess, ok ? Ok() : Fail("invalid_request"));
+        object result = BindingType!.GetMethod("Admit", new[] { typeof(string), typeof(string), typeof(string), typeof(string) })!
+            .Invoke(Bindings, new object[] { connection, account, room, entityType })!;
+        return FromBindingResult(result);
     }
 
-    private static (int, byte[]) DestroyEntity(JsonElement root)
+    private static (int, byte[]) Disconnect(JsonElement root)
     {
-        if (!TryWorld(root, create: false, out object? world) || !TryReadU64(root, "netEntityId", out ulong id))
+        if (Bindings is null || !TryReadString(root, "connection", out string? connection) || connection is null)
         {
             return (EntrySuccess, Fail("invalid_request"));
         }
 
-        bool ok = (bool)WorldType!.GetMethod("DestroyEntity")!.Invoke(world, new object[] { id })!;
-        return (EntrySuccess, ok ? Ok() : Fail("invalid_request"));
+        object result = BindingType!.GetMethod("Disconnect", new[] { typeof(string) })!
+            .Invoke(Bindings, new object[] { connection })!;
+        return FromBindingResult(result);
     }
 
-    private static (int, byte[]) AdmitChat(JsonElement root)
+    private static (int, byte[]) Rebind(JsonElement root)
     {
-        if (!TryWorld(root, create: false, out object? world)
-            || !TryReadU64(root, "senderNetEntityId", out ulong sender)
-            || !TryReadString(root, "text", out string? text)
-            || text is null)
+        if (Bindings is null
+            || !TryReadString(root, "connection", out string? connection)
+            || !TryReadString(root, "accountId", out string? account)
+            || !TryReadString(root, "roomId", out string? room)
+            || !TryReadString(root, "mode", out string? mode)
+            || connection is null || account is null || room is null || mode is null)
         {
             return (EntrySuccess, Fail("invalid_request"));
         }
 
-        object input = Activator.CreateInstance(ChatInputType!, text)!;
-        object result = WorldType!.GetMethod("AdmitChatInput")!.Invoke(world, new object[] { sender, input })!;
-        object kind = result.GetType().GetProperty("Kind")!.GetValue(result)!;
-        if (Convert.ToInt32(kind, CultureInfo.InvariantCulture) == 0)
+        Type enumType = Replication!.GetType("Lumio.GameRuntime.Replication.Binding.RebindMode")!;
+        object modeValue = Enum.Parse(enumType, mode.Equals("takeover", StringComparison.OrdinalIgnoreCase) ? "Takeover" : "Reconnect");
+        object result = BindingType!.GetMethod("Rebind", new[] { typeof(string), typeof(string), typeof(string), enumType })!
+            .Invoke(Bindings, new object[] { connection, account, room, modeValue })!;
+        return FromBindingResult(result);
+    }
+
+    private static (int, byte[]) Expire(JsonElement root)
+    {
+        if (Bindings is null || !TryReadString(root, "netEntityId", out string? id) || id is null)
+        {
+            return (EntrySuccess, Fail("invalid_request"));
+        }
+
+        object result = BindingType!.GetMethod("Expire", new[] { typeof(string) })!
+            .Invoke(Bindings, new object[] { id })!;
+        return FromBindingResult(result);
+    }
+
+    private static (int, byte[]) SelfLookup(JsonElement root)
+    {
+        if (Bindings is null || !TryReadString(root, "connection", out string? connection) || connection is null)
+        {
+            return (EntrySuccess, Fail("invalid_request"));
+        }
+
+        object result = BindingType!.GetMethod("SelfLookup")!
+            .Invoke(Bindings, new object[] { connection, "client-replica" })!;
+        return FromBindingResult(result);
+    }
+
+    private static (int, byte[]) Resolve(JsonElement root)
+    {
+        if (Bindings is null
+            || !TryReadString(root, "roomId", out string? room)
+            || !TryReadString(root, "netEntityId", out string? id)
+            || room is null || id is null)
+        {
+            return (EntrySuccess, Fail("invalid_request"));
+        }
+
+        object result = BindingType!.GetMethod("ResolveByNetEntityId")!
+            .Invoke(Bindings, new object?[] { room, id, null, "server-authoritative" })!;
+        return FromBindingResult(result);
+    }
+
+    private static (int, byte[]) Query(JsonElement root)
+    {
+        if (Bindings is null)
+        {
+            return (EntrySuccess, Fail("invalid_request"));
+        }
+
+        Type requestType = Replication!.GetType("Lumio.GameRuntime.Replication.Binding.AttributeQueryRequest")!;
+        object request = Activator.CreateInstance(requestType)!;
+        requestType.GetProperty("CallerScope")!.SetValue(request, ReadString(root, "callerScope"));
+        requestType.GetProperty("RoomId")!.SetValue(request, ReadString(root, "roomId"));
+        requestType.GetProperty("NetEntityId")!.SetValue(request, ReadString(root, "netEntityId"));
+        requestType.GetProperty("AttributeId")!.SetValue(request, ReadString(root, "attributeId"));
+        if (root.TryGetProperty("connectionGeneration", out JsonElement gen) && gen.ValueKind == JsonValueKind.Number
+            && gen.TryGetUInt64(out ulong generation))
+        {
+            requestType.GetProperty("ConnectionGeneration")!.SetValue(request, generation);
+        }
+
+        object result = BindingType!.GetMethod("QueryAttribute")!
+            .Invoke(Bindings, new object?[] { request, null })!;
+        return FromBindingResult(result);
+    }
+
+    private static (int, byte[]) ListBindings(JsonElement root)
+    {
+        if (Bindings is null || !TryReadString(root, "roomId", out string? room) || room is null)
+        {
+            return (EntrySuccess, Fail("invalid_request"));
+        }
+
+        object result = BindingType!.GetMethod("ListBindings", new[] { typeof(string) })!
+            .Invoke(Bindings, new object[] { room })!;
+        return FromBindingResult(result);
+    }
+
+    private static (int, byte[]) AttachMember(JsonElement root)
+    {
+        if (Chat is null
+            || !TryReadString(root, "roomId", out string? room)
+            || !TryReadString(root, "connection", out string? connection)
+            || room is null || connection is null)
+        {
+            return (EntrySuccess, Fail("invalid_request"));
+        }
+
+        object result = ChatType!.GetMethod("AttachMember")!.Invoke(Chat, new object[] { room, connection })!;
+        bool ok = Convert.ToBoolean(result.GetType().GetProperty("Succeeded")!.GetValue(result)!, CultureInfo.InvariantCulture);
+        return (EntrySuccess, ok ? Ok() : Fail("runtime_failure"));
+    }
+
+    private static (int, byte[]) AdmitInput(JsonElement root)
+    {
+        if (Chat is null
+            || !TryReadString(root, "roomId", out string? room)
+            || !TryReadString(root, "connection", out string? connection)
+            || !TryReadString(root, "envelope", out string? envelope)
+            || room is null || connection is null || envelope is null
+            || !TryReadU64(root, "connectionGeneration", out ulong generation))
+        {
+            return (EntrySuccess, Fail("invalid_request"));
+        }
+
+        object result = ChatType!.GetMethod("AdmitInputCommand")!
+            .Invoke(Chat, new object[] { room, connection, generation, envelope })!;
+        bool ok = Convert.ToBoolean(result.GetType().GetProperty("Succeeded")!.GetValue(result)!, CultureInfo.InvariantCulture);
+        if (ok)
         {
             return (EntrySuccess, Ok());
         }
 
-        string? code = result.GetType().GetProperty("ErrorCode")!.GetValue(result) as string;
+        string? code = result.GetType().GetProperty("Code")!.GetValue(result) as string;
         return (EntrySuccess, Fail(code ?? "invalid_request"));
     }
 
     private static (int, byte[]) Tick(JsonElement root)
     {
-        if (!TryWorld(root, create: false, out object? world))
+        if (Chat is null || !TryReadString(root, "roomId", out string? room) || room is null
+            || !TryReadU64(root, "tickId", out ulong tickId))
         {
             return (EntrySuccess, Fail("invalid_request"));
         }
 
-        object tick = WorldType!.GetMethod("RunTick")!.Invoke(world, Array.Empty<object>())!;
-        ulong applied = Convert.ToUInt64(tick.GetType().GetProperty("AppliedTick")!.GetValue(tick)!, CultureInfo.InvariantCulture);
-        var events = new List<Dictionary<string, object?>>();
-        if (tick.GetType().GetProperty("Events")!.GetValue(tick) is Array rows)
-        {
-            foreach (object row in rows)
-            {
-                Type type = row.GetType();
-                events.Add(new Dictionary<string, object?>
-                {
-                    ["messageId"] = Convert.ToUInt64(type.GetProperty("MessageId")!.GetValue(row)!, CultureInfo.InvariantCulture),
-                    ["roomSequence"] = Convert.ToUInt64(type.GetProperty("RoomSequence")!.GetValue(row)!, CultureInfo.InvariantCulture),
-                    ["senderNetEntityId"] = Convert.ToUInt64(type.GetProperty("SenderNetEntityId")!.GetValue(row)!, CultureInfo.InvariantCulture),
-                    ["text"] = type.GetProperty("Text")!.GetValue(row) as string,
-                    ["appliedTick"] = Convert.ToUInt64(type.GetProperty("AppliedTick")!.GetValue(row)!, CultureInfo.InvariantCulture),
-                });
-            }
-        }
-
+        object result = ChatType!.GetMethod("RunTick")!.Invoke(Chat, new object[] { tickId })!;
+        ulong applied = Convert.ToUInt64(result.GetType().GetProperty("AppliedTick")!.GetValue(result)!, CultureInfo.InvariantCulture);
+        ulong revision = Convert.ToUInt64(result.GetType().GetProperty("Revision")!.GetValue(result)!, CultureInfo.InvariantCulture);
         return (EntrySuccess, Json(new Dictionary<string, object?>
         {
             ["ok"] = true,
             ["appliedTick"] = applied,
-            ["events"] = events,
+            ["revision"] = revision,
         }));
     }
 
-    private static (int, byte[]) Persist(JsonElement root)
+    private static (int, byte[]) BuildFullSnapshot(JsonElement root)
     {
-        if (!TryWorld(root, create: false, out object? world))
+        if (Chat is null || !TryReadString(root, "roomId", out string? room) || room is null
+            || !TryReadU64(root, "tickId", out ulong tickId)
+            || !TryReadU64(root, "revision", out ulong revision))
         {
             return (EntrySuccess, Fail("invalid_request"));
         }
 
-        object states = WorldType!.GetMethod("CapturePersistState")!.Invoke(world, Array.Empty<object>())!;
-        var entities = new List<Dictionary<string, object?>>();
-        if (states is Array rows)
+        string json = (string)ChatType!.GetMethod("BuildFullSnapshot")!.Invoke(Chat, new object[] { room, tickId, revision })!;
+        return (EntrySuccess, Json(new Dictionary<string, object?> { ["ok"] = true, ["json"] = json }));
+    }
+
+    private static (int, byte[]) BuildDelta(JsonElement root)
+    {
+        if (Chat is null || !TryReadString(root, "roomId", out string? room) || room is null
+            || !TryReadU64(root, "tickId", out ulong tickId)
+            || !TryReadU64(root, "revision", out ulong revision))
+        {
+            return (EntrySuccess, Fail("invalid_request"));
+        }
+
+        object frames = ChatType!.GetMethod("BuildDelta")!.Invoke(Chat, new object[] { room, tickId, revision })!;
+        var list = new List<string>();
+        if (frames is System.Collections.IEnumerable rows)
         {
             foreach (object row in rows)
             {
-                Type type = row.GetType();
-                entities.Add(new Dictionary<string, object?>
+                if (row is string text)
                 {
-                    ["netEntityId"] = Convert.ToUInt64(type.GetProperty("NetEntityId")!.GetValue(row)!, CultureInfo.InvariantCulture),
-                    ["lastMessageText"] = type.GetProperty("LastMessageText")!.GetValue(row) as string,
-                    ["lastMessageTick"] = Convert.ToUInt64(type.GetProperty("LastMessageTick")!.GetValue(row)!, CultureInfo.InvariantCulture),
-                });
+                    list.Add(text);
+                }
             }
+        }
+
+        return (EntrySuccess, Json(new Dictionary<string, object?> { ["ok"] = true, ["frames"] = list }));
+    }
+
+    private static (int, byte[]) Persist(JsonElement root)
+    {
+        if (Chat is null || PersistType is null)
+        {
+            return (EntrySuccess, Fail("invalid_request"));
+        }
+
+        object? world = GetChatWorld();
+        if (world is null)
+        {
+            return (EntrySuccess, Fail("runtime_failure"));
+        }
+
+        object[] args = { world, null! };
+        object result = PersistType.GetMethod("CapturePersist", new[] { world.GetType(), typeof(byte[]).MakeByRefType() })!
+            .Invoke(null, args)!;
+        bool accepted = Convert.ToInt32(result.GetType().GetProperty("Status")!.GetValue(result)!, CultureInfo.InvariantCulture) == 0;
+        byte[]? bytes = args[1] as byte[];
+        if (!accepted || bytes is null)
+        {
+            return (EntrySuccess, Fail("runtime_failure"));
         }
 
         return (EntrySuccess, Json(new Dictionary<string, object?>
         {
             ["ok"] = true,
-            ["entities"] = entities,
+            ["bytesHex"] = Convert.ToHexString(bytes).ToLowerInvariant(),
         }));
     }
 
     private static (int, byte[]) Restore(JsonElement root)
     {
-        if (!TryWorld(root, create: true, out object? world)
-            || !TryReadU64(root, "netEntityId", out ulong id)
-            || !TryReadString(root, "text", out string? text)
-            || text is null
-            || !TryReadU64(root, "lastMessageTick", out ulong tick))
+        if (Chat is null || PersistType is null || !TryReadString(root, "bytesHex", out string? hex) || hex is null)
         {
             return (EntrySuccess, Fail("invalid_request"));
         }
 
-        bool ok = (bool)WorldType!.GetMethod("TryRestoreLastMessage")!.Invoke(world, new object[] { id, text, tick })!;
-        return (EntrySuccess, ok ? Ok() : Fail("invalid_request"));
-    }
-
-    private static (int, byte[]) GetComponent(JsonElement root)
-    {
-        if (!TryWorld(root, create: false, out object? world) || !TryReadU64(root, "netEntityId", out ulong id))
-        {
-            return (EntrySuccess, Fail("invalid_request"));
-        }
-
-        object?[] args = { id, null };
-        bool ok = (bool)WorldType!.GetMethod("TryGetComponent")!.Invoke(world, args)!;
-        if (!ok || args[1] is null)
-        {
-            return (EntrySuccess, Fail("non_existent"));
-        }
-
-        object component = args[1]!;
-        return (EntrySuccess, Json(new Dictionary<string, object?>
-        {
-            ["ok"] = true,
-            ["lastMessageText"] = component.GetType().GetProperty("LastMessageText")!.GetValue(component) as string,
-            ["lastMessageTick"] = Convert.ToUInt64(component.GetType().GetProperty("LastMessageTick")!.GetValue(component)!, CultureInfo.InvariantCulture),
-        }));
-    }
-
-    private static (int, byte[]) CurrentTick(JsonElement root)
-    {
-        if (!TryWorld(root, create: false, out object? world))
-        {
-            return (EntrySuccess, Json(new Dictionary<string, object?> { ["ok"] = true, ["tick"] = 0UL }));
-        }
-
-        ulong tick = Convert.ToUInt64(WorldType!.GetProperty("CurrentTick")!.GetValue(world)!, CultureInfo.InvariantCulture);
-        return (EntrySuccess, Json(new Dictionary<string, object?> { ["ok"] = true, ["tick"] = tick }));
-    }
-
-    private static bool TryWorld(JsonElement root, bool create, out object? world)
-    {
-        world = null;
-        if (WorldType is null || !TryReadString(root, "roomId", out string? roomId) || string.IsNullOrEmpty(roomId))
-        {
-            return false;
-        }
-
-        if (Worlds.TryGetValue(roomId, out world))
-        {
-            return true;
-        }
-
-        if (!create)
-        {
-            return false;
-        }
-
-        world = Activator.CreateInstance(WorldType);
+        object? world = GetChatWorld();
         if (world is null)
         {
-            return false;
+            return (EntrySuccess, Fail("runtime_failure"));
         }
 
-        Worlds[roomId] = world;
-        return true;
+        byte[] bytes = Convert.FromHexString(hex);
+        object result = PersistType.GetMethod("RestorePersist", new[] { world.GetType(), typeof(byte[]) })!
+            .Invoke(null, new object[] { world, bytes })!;
+        bool accepted = Convert.ToInt32(result.GetType().GetProperty("Status")!.GetValue(result)!, CultureInfo.InvariantCulture) == 0;
+        return (EntrySuccess, accepted ? Ok() : Fail("runtime_failure"));
+    }
+
+    private static object? GetChatWorld()
+    {
+        if (Chat is null || ChatType is null)
+        {
+            return null;
+        }
+
+        FieldInfo? field = ChatType.GetField("_world", BindingFlags.Instance | BindingFlags.NonPublic);
+        object? ingress = field?.GetValue(Chat);
+        return ingress?.GetType().GetProperty("World")?.GetValue(ingress);
+    }
+
+    private static (int, byte[]) FromBindingResult(object result)
+    {
+        Type type = result.GetType();
+        string outcome = type.GetProperty("Outcome")!.GetValue(result) as string ?? "request_error";
+        string? code = type.GetProperty("Code")!.GetValue(result) as string;
+        object? binding = type.GetProperty("Binding")!.GetValue(result);
+        object? bindings = type.GetProperty("Bindings")!.GetValue(result);
+        object? value = type.GetProperty("Value")!.GetValue(result);
+        var payload = new Dictionary<string, object?>
+        {
+            ["ok"] = outcome == "ok",
+            ["outcome"] = outcome,
+            ["code"] = code,
+        };
+        if (binding is not null)
+        {
+            payload["binding"] = BindingDict(binding);
+        }
+
+        if (bindings is Array array)
+        {
+            var rows = new List<Dictionary<string, object?>>();
+            foreach (object row in array)
+            {
+                rows.Add(BindingDict(row));
+            }
+
+            payload["bindings"] = rows;
+        }
+
+        if (value is not null)
+        {
+            payload["value"] = Convert.ToString(value, CultureInfo.InvariantCulture);
+        }
+
+        return (EntrySuccess, Json(payload));
+    }
+
+    private static Dictionary<string, object?> BindingDict(object binding)
+    {
+        Type type = binding.GetType();
+        return new Dictionary<string, object?>
+        {
+            ["accountId"] = type.GetProperty("AccountId")!.GetValue(binding) as string,
+            ["roomId"] = type.GetProperty("RoomId")!.GetValue(binding) as string,
+            ["netEntityId"] = type.GetProperty("NetEntityId")!.GetValue(binding) as string,
+            ["entityType"] = type.GetProperty("EntityType")!.GetValue(binding) as string,
+            ["connectionGeneration"] = Convert.ToUInt64(type.GetProperty("ConnectionGeneration")!.GetValue(binding)!, CultureInfo.InvariantCulture),
+        };
     }
 
     private static bool TryReadString(JsonElement root, string name, out string? value)
@@ -338,6 +519,11 @@ public static class HostEntry
 
         value = el.GetString();
         return true;
+    }
+
+    private static string? ReadString(JsonElement root, string name)
+    {
+        return TryReadString(root, name, out string? value) ? value : null;
     }
 
     private static bool TryReadU64(JsonElement root, string name, out ulong value)

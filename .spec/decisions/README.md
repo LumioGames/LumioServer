@@ -34,3 +34,4 @@
 | [0004](0004-csharp-mvp-host-frozen-reference.md) | C# MVP host 在切片验收通过后冻结为 reference | 被 0005 取代 |
 | [0005](0005-csharp-mvp-host-unfrozen-until-live-11.md) | C# MVP host 在 11 场景 live-green 之前不得冻结为 reference | 被 0006 取代 |
 | [0006](0006-csharp-mvp-host-frozen-after-rust-identical-suite.md) | C# MVP host 冻结为 reference，identical suite 以 Rust replay 为交付面 | 生效 |
+| [0007](0007-rust-host-consume-runtime.md) | Rust entity-chat 宿主纯消费 Runtime 绑定/查询/快照与 NativeCore 定时 | 生效 |

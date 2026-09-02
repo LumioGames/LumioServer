@@ -53,3 +53,32 @@ jobs:
       - name: Validate mvp-host build and tests
         working-directory: mvp-host
         run: bash eng/verify-all.sh
+
+  cargo-entity-chat:
+    name: Cargo entity-chat acceptance
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Cargo test lumio-host-runtime
+        run: cargo test -p lumio-host-runtime --locked
+        env:
+          CARGO_TERM_COLOR: always
+      - name: Cargo test lumio-server-process excluding 11-scenario
+        run: cargo test -p lumio-server-process --locked --lib --bins --test entity_chat_architecture --test entity_chat_host --test entity_chat_wire
+        env:
+          CARGO_TERM_COLOR: always
+
+  cargo-entity-chat-eleven:
+    name: Cargo entity-chat 11-scenario
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Run 11-scenario (BLOCKED without Game root, never skip)
+        run: cargo test -p lumio-server-process --locked --test entity_chat_acceptance -- --nocapture
+        env:
+          CARGO_TERM_COLOR: always

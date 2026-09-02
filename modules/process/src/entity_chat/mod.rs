@@ -1,9 +1,10 @@
 //! Slice-scoped entity-chat Rust host: clock, owner thread, bounded queues,
-//! Account Server admission verify, Room world-slot, `CoreCLR` gameplay.
+//! Account Server admission verify, Room world-slot, `CoreCLR` Runtime consume.
 #![allow(
     clippy::chunks_exact_to_as_chunks,
     clippy::doc_markdown,
     clippy::double_must_use,
+    clippy::manual_let_else,
     clippy::map_unwrap_or,
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
@@ -11,6 +12,8 @@
     clippy::needless_as_bytes,
     clippy::needless_pass_by_value,
     clippy::similar_names,
+    clippy::single_match,
+    clippy::struct_field_names,
     clippy::too_many_lines,
     clippy::while_let_loop
 )]
@@ -22,9 +25,10 @@ mod clr;
 mod crypto;
 mod discover;
 mod envelope;
-mod gameplay;
 mod host;
+mod runtime;
 mod suite;
+mod wire;
 
 pub use account::{AccountLoginResult, AccountServerProcess};
 pub use admission::{
@@ -34,16 +38,17 @@ pub use admission::{
 pub use clr::{ClrGameplay, ClrGameplayConfig};
 pub use discover::{discover, ReplayArtifacts};
 pub use envelope::{CommandBlock, InputCommand, CHAT_INPUT_MAPPING, MESSAGE_TYPE};
-pub use gameplay::{
-    ChatMessageEvent, ChatOpKind, ChatOperation, ChatPersistEntity, ChatPersistSnapshot,
-    ChatTickResult, GameplayWorld, LocalGameplay,
-};
 pub use host::{
-    format_host_net_entity_id, AdmitTrace, AttributeQueryOutcome, AttributeQueryRequest,
-    AttributeQueryScope, BoundEntityKind, ConnectionBinding, EntityChatHost, EntityResolution,
-    QueryResult, RoomAdmitResult, RoomCensus,
+    AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution,
+    RoomAdmitResult, RoomCensus, DISPATCH_EXPIRE, DISPATCH_TICK,
+};
+pub use runtime::{
+    AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, ChatOperation,
+    PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding, RuntimeQuery,
+    RuntimeSurface, RuntimeTick,
 };
 pub use suite::{run_round, run_round_blocking, run_two_rounds, SuiteOptions, SuiteReport};
+pub use wire::{RoomClient, RoomListener};
 
 pub const MAIN_ROOM: &str = "room-main";
 pub const ISO_ROOM: &str = "room-iso";
