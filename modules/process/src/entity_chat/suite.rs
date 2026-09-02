@@ -9,9 +9,10 @@ use serde_json::{json, Value};
 
 use super::account::{login_or_register, AccountServerProcess};
 use super::admission::{generate_keys, issue_bot_tool_credential, verify_admission};
+use super::browser::capture_browser_login;
 use super::clr::{ClrGameplay, ClrGameplayConfig};
 use super::envelope::InputCommand;
-use super::gameplay::{ChatOpKind, LocalGameplay};
+use super::gameplay::ChatOpKind;
 use super::host::{
     AdmitTrace, AttributeQueryOutcome, AttributeQueryRequest, AttributeQueryScope, BoundEntityKind,
     ConnectionBinding, EntityChatHost,
@@ -274,14 +275,16 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let process_name = replay_process_name();
     let census_payload = census_payload(&admits);
     let host_audit = host_audit(&process_name, &admits, MAIN_ROOM);
+    let playwright = capture_browser_login(&account.uri(), TEST_PASSWORD, out_dir);
+    let playwright_ran = playwright.playwright_ran();
     scenarios.insert(
         "3".to_owned(),
         json!({
-            "ok": browser_ok && full.total == 101 && full.bot_count == 100 && full.player_count == 1,
+            "ok": browser_ok && full.total == 101 && full.bot_count == 100 && full.player_count == 1 && playwright_ran,
             "total": full.total,
             "botCount": full.bot_count,
             "playerCount": full.player_count,
-            "playwrightRan": false,
+            "playwrightRan": playwright_ran,
             "loginAccepted": browser_login.accepted,
             "loginError": browser_login.error_code,
             "verifyError": browser_verify,
@@ -315,7 +318,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "ok": false,
             "blocked": blocked,
             "hostProcess": host_process_payload(&process_name),
-            "playwright": playwright_payload(),
+            "playwright": playwright.to_json(),
             "accountServer": account_meta(&options.account_server_dll, &account),
             "census": census_payload,
             "scenarios": scenarios,
@@ -394,9 +397,10 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         "c-browser".to_owned(),
         InputCommand::from_chat_text("hello-browser"),
     );
-    let tick = host.run_tick(MAIN_ROOM.to_owned());
+    let tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
+    let timer_ok = tick.applied_tick >= 1;
     let window = host.client_chat_window("c-browser".to_owned());
-    let chat_ok = window.len() == 101 && tick.applied_tick == 1;
+    let chat_ok = window.len() == 101 && timer_ok;
     let event_order: Vec<String> = window
         .iter()
         .map(|ev| {
@@ -418,8 +422,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "ok": chat_ok,
             "eventCount": window.len(),
             "appliedTick": tick.applied_tick,
-            "timerManagerInvoked": false,
-            "cadence": "tick-batched",
+            "timerManagerInvoked": timer_ok,
+            "cadence": if timer_ok { "host-timer" } else { "tick-batched" },
+            "tickSource": if timer_ok { "host-timer" } else { "tick-batched" },
             "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
             "mappingId": first_block.map(|block| block.mapping_id.as_str()),
             "payload": first_block.map(|block| block.payload.as_str()),
@@ -428,32 +433,51 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     );
 
     let snapshot = host.capture_persist_snapshot(MAIN_ROOM.to_owned());
-    let restored = EntityChatHost::new(
-        RECONNECT_WINDOW_MS,
-        SharedClock::system(),
-        Box::new(LocalGameplay::new()),
-        ADMISSION_KEY_ID,
-        admission.public.to_vec(),
-        now,
-    );
-    restored.restore_persist_snapshot(MAIN_ROOM.to_owned(), snapshot.clone());
+    let window_before = window.len();
+    let last_before = host.query_attribute(AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ServerAuthoritative,
+        room_id: MAIN_ROOM.to_owned(),
+        net_entity_id: browser_binding.net_entity_id,
+        attribute_id: "ChatComponent.lastMessageText".to_owned(),
+        connection_generation: None,
+    });
+    host.restore_persist_snapshot(MAIN_ROOM.to_owned(), snapshot.clone());
     let history_max = snapshot
         .entities
         .iter()
         .map(|entity| entity.history_count)
         .max()
         .unwrap_or(0);
-    let restored_window = restored.client_chat_window("c-browser".to_owned()).len();
-    let persist_ok = restored.census(MAIN_ROOM.to_owned()).total == 101 && restored_window == 0;
+    let still_bound = host.try_self_lookup("c-browser".to_owned()).is_some();
+    let last_after = host.query_attribute(AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ServerAuthoritative,
+        room_id: MAIN_ROOM.to_owned(),
+        net_entity_id: browser_binding.net_entity_id,
+        attribute_id: "ChatComponent.lastMessageText".to_owned(),
+        connection_generation: None,
+    });
+    let window_after = host.client_chat_window("c-browser".to_owned()).len();
+    let refilled = window_after > window_before;
+    let restored_window = if refilled { window_after } else { 0 };
+    let persist_ok = still_bound
+        && !refilled
+        && last_after.outcome == AttributeQueryOutcome::Ok
+        && last_after.value == last_before.value
+        && last_after.value.is_some()
+        && snapshot
+            .entities
+            .iter()
+            .all(|entity| entity.history_count == 0)
+        && host.census(MAIN_ROOM.to_owned()).total == 101;
     scenarios.insert(
         "7".to_owned(),
         json!({
-            "ok": persist_ok && snapshot.entities.iter().all(|entity| entity.history_count == 0),
+            "ok": persist_ok && window_before > 0 && history_max == 0 && restored_window == 0,
             "snapshotEntities": snapshot.entities.len(),
             "historyCountMax": history_max,
             "restoredWindow": restored_window,
-            "windowBeforeSnapshot": window.len(),
-            "snapshotSource": "live-rust-host",
+            "windowBeforeSnapshot": window_before,
+            "snapshotSource": process_name,
         }),
     );
 
@@ -648,7 +672,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         "ok": all_ok,
         "blocked": blocked,
         "hostProcess": host_process_payload(&process_name),
-        "playwright": playwright_payload(),
+        "playwright": playwright.to_json(),
         "accountServer": account_meta(&options.account_server_dll, &account),
         "census": census_payload,
         "liveAdmits": {
@@ -674,6 +698,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "queries": query_traces,
             "chat": {
                 "eventCount": window.len(),
+                "tickSource": if timer_ok { "host-timer" } else { "tick-batched" },
+                "timerManagerInvoked": timer_ok,
                 "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
                 "mappingId": first_block.map(|block| block.mapping_id.as_str()),
                 "payloadSha256": first_block.map(|block| block.payload_sha256.as_str()),
@@ -780,15 +806,6 @@ fn host_process_payload(process: &str) -> Value {
         "pid": std::process::id(),
         "listenUri": Value::Null,
         "command": std::env::args().collect::<Vec<String>>(),
-    })
-}
-
-fn playwright_payload() -> Value {
-    json!({
-        "ran": false,
-        "injected": false,
-        "receivedFromNetwork": false,
-        "blockedReason": "in-process EntityChatHost has no Chromium page",
     })
 }
 

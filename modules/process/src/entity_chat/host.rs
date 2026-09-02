@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 use std::thread;
 use std::thread::ThreadId;
+use std::time::Duration;
 
 use lumio_host_runtime::{
-    bounded_channel, spawn_supervised, HostClock, SharedClock, SupervisedTask,
+    bounded_channel, spawn_supervised, HostClock, HostTimer, RecvError, SharedClock, SupervisedTask,
 };
 
 use super::admission::{
@@ -269,6 +270,7 @@ pub struct EntityChatHost {
     owner_id: ThreadId,
     tx: lumio_host_runtime::Sender<OwnerWork>,
     _owner: SupervisedTask,
+    timer: HostTimer,
 }
 
 impl EntityChatHost {
@@ -282,6 +284,7 @@ impl EntityChatHost {
         admission_public: Vec<u8>,
         unix_seconds: u64,
     ) -> Self {
+        let timer = HostTimer::new(clock.clone());
         let (tx, rx) = bounded_channel(256);
         let (id_tx, id_rx) = bounded_channel(1);
         let owner = spawn_supervised("lumio-entity-chat-owner", move |_cancel| {
@@ -312,6 +315,7 @@ impl EntityChatHost {
             owner_id,
             tx,
             _owner: owner,
+            timer,
         }
     }
 
@@ -369,9 +373,10 @@ impl EntityChatHost {
         self.on_owner(move |inner| inner.disconnect(&connection_id))
     }
 
-    /// Advances the host monotonic clock.
+    /// Advances the host monotonic clock and pumps due host timers.
     pub fn advance_monotonic(&self, delta_ms: u64) {
         self.on_owner(move |inner| inner.clock.advance_ms(delta_ms));
+        self.timer.pump_due();
     }
 
     /// Destroys disconnected entities whose window has elapsed.
@@ -390,6 +395,27 @@ impl EntityChatHost {
     #[must_use]
     pub fn run_tick(&self, room_id: String) -> ChatTickResult {
         self.on_owner(move |inner| inner.run_tick(&room_id))
+    }
+
+    /// Schedules `run_tick` as a host-timer callback. Not a caller for-loop.
+    #[must_use]
+    pub fn schedule_room_tick(&self, room_id: String, delay_ms: u64) -> ChatTickResult {
+        let (done_tx, done_rx) = bounded_channel(1);
+        let work_tx = self.tx.clone();
+        let _timer_id = self.timer.schedule_one_shot(delay_ms, move || {
+            let _ = work_tx.send(OwnerWork::Run(Box::new(move |inner| {
+                let tick = inner.run_tick(&room_id);
+                let _ = done_tx.send(tick);
+            })));
+        });
+        self.timer.pump_due();
+        match done_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(tick) => tick,
+            Err(RecvError::Empty | RecvError::Closed) => ChatTickResult {
+                applied_tick: 0,
+                events: Vec::new(),
+            },
+        }
     }
 
     /// Client self-lookup.
@@ -835,7 +861,10 @@ impl Inner {
     fn restore_persist_snapshot(&mut self, room_id: &str, snapshot: ChatPersistSnapshot) {
         self.gameplay.create_room(room_id);
         for entity in snapshot.entities {
-            let _ = self.gameplay.create_entity(room_id, entity.net_entity_id);
+            let live = self.find_entity(entity.net_entity_id).is_some();
+            if !live {
+                let _ = self.gameplay.create_entity(room_id, entity.net_entity_id);
+            }
             let _ = self.gameplay.restore_last_message(
                 room_id,
                 entity.net_entity_id,
@@ -844,6 +873,9 @@ impl Inner {
             );
             if entity.net_entity_id >= self.next_net_entity_id {
                 self.next_net_entity_id = entity.net_entity_id + 1;
+            }
+            if live {
+                continue;
             }
             let live = LiveEntity {
                 account_id: entity.account_id.clone(),
@@ -1215,5 +1247,73 @@ mod tests {
         assert_eq!(unauthorized.outcome, AttributeQueryOutcome::Unauthorized);
         assert_eq!(missing.outcome, AttributeQueryOutcome::NonExistent);
         assert_eq!(stale.outcome, AttributeQueryOutcome::StaleGeneration);
+    }
+
+    #[test]
+    fn restore_on_same_host_keeps_last_message_and_does_not_refill_window() {
+        let keys = generate_keys();
+        let host = host_with(&keys);
+        let _ = host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true),
+        );
+        let _ = host.admit(
+            "room-main".to_owned(),
+            "c-browser".to_owned(),
+            credential(&keys, "Browser01", false),
+        );
+        let _ = host.admit_chat_input(
+            "c-bot01".to_owned(),
+            InputCommand::from_chat_text("hello-Bot01"),
+        );
+        let tick = host.run_tick("room-main".to_owned());
+        assert_eq!(tick.applied_tick, 1);
+        let window_before = host.client_chat_window("c-browser".to_owned());
+        assert_eq!(window_before.len(), 1);
+        let sender = host.must_self("c-bot01");
+        let snapshot = host.capture_persist_snapshot("room-main".to_owned());
+        assert!(snapshot
+            .entities
+            .iter()
+            .all(|entity| entity.history_count == 0));
+        host.restore_persist_snapshot("room-main".to_owned(), snapshot);
+        assert!(
+            host.try_self_lookup("c-browser".to_owned()).is_some(),
+            "restore must keep live bindings on the same host; do not construct LocalGameplay"
+        );
+        let last = host.query_attribute(AttributeQueryRequest {
+            caller_scope: AttributeQueryScope::ServerAuthoritative,
+            room_id: "room-main".to_owned(),
+            net_entity_id: sender.net_entity_id,
+            attribute_id: "ChatComponent.lastMessageText".to_owned(),
+            connection_generation: None,
+        });
+        assert_eq!(last.outcome, AttributeQueryOutcome::Ok);
+        assert_eq!(last.value.as_deref(), Some("hello-Bot01"));
+        let window_after = host.client_chat_window("c-browser".to_owned());
+        assert_eq!(
+            window_after.len(),
+            window_before.len(),
+            "restore must not refill or clear the client-only chat window"
+        );
+    }
+
+    #[test]
+    fn host_timer_tick_applies_admitted_chat() {
+        let keys = generate_keys();
+        let host = host_with(&keys);
+        let _ = host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true),
+        );
+        let _ = host.admit_chat_input(
+            "c-bot01".to_owned(),
+            InputCommand::from_chat_text("hello-Bot01"),
+        );
+        let tick = host.schedule_room_tick("room-main".to_owned(), 0);
+        assert_eq!(tick.applied_tick, 1);
+        assert_eq!(host.client_chat_window("c-bot01".to_owned()).len(), 1);
     }
 }

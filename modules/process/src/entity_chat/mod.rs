@@ -17,6 +17,7 @@
 
 mod account;
 mod admission;
+mod browser;
 mod clr;
 mod crypto;
 mod discover;
