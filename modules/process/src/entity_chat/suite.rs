@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 use lumio_host_runtime::{HostClock, NativeAbiKernel, SharedClock};
 use serde_json::{json, Value};
@@ -11,15 +14,17 @@ use super::account::{login_or_register, AccountServerProcess};
 use super::admission::{generate_keys, issue_bot_tool_credential, verify_admission};
 use super::browser::capture_browser_login;
 use super::clr::{ClrGameplay, ClrGameplayConfig};
+use super::crypto::hex_lower;
 use super::envelope::InputCommand;
 use super::host::{AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost};
 use super::runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, RuntimeSurface,
+    RuntimeTick,
 };
 use super::wire::RoomClient;
 use super::{
-    bot_name, ADMISSION_KEY_ID, BOT_COUNT, BROWSER_NAME, ISO_ROOM, MAIN_ROOM, RECONNECT_WINDOW_MS,
-    TEST_PASSWORD,
+    bot_name, ADMISSION_KEY_ID, BOT_COUNT, BROWSER_NAME, ISO_ROOM, MAIN_ROOM,
+    MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS, TEST_PASSWORD,
 };
 
 /// Inputs for one suite run.
@@ -400,33 +405,46 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     if let Some(client) = browser_wire.as_mut() {
         let _ = client.recv_text();
     }
+    let mut pending_chats = 0usize;
+    let mut tick = RuntimeTick {
+        applied_tick: 0,
+        revision: 0,
+    };
+    let mut received = Vec::new();
     for (connection, name) in &connections {
         let command = InputCommand::from_chat_text(&format!("hello-{name}"));
         if first_envelope.is_none() {
             first_envelope = Some(command.clone());
         }
         let _ = host.admit_chat_input(connection.clone(), command);
+        pending_chats += 1;
+        if pending_chats >= MAX_CHAT_INPUTS_PER_TICK {
+            tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
+            drain_chat_event_deltas(&mut browser_wire, &mut received);
+            pending_chats = 0;
+        }
     }
     let _ = host.admit_chat_input(
         "c-browser".to_owned(),
         InputCommand::from_chat_text("hello-browser"),
     );
-    let tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
-    let timer_ok = tick.applied_tick >= 1;
-    let mut received = Vec::new();
-    if let Some(client) = browser_wire.as_mut() {
-        while let Ok(frame) = client.recv_text() {
-            if frame.contains("\"messageType\":\"Delta\"") {
-                received.push(frame);
-            }
-            if received.len() >= 101 {
-                break;
-            }
-        }
+    pending_chats += 1;
+    if pending_chats > 0 {
+        tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
+        drain_chat_event_deltas(&mut browser_wire, &mut received);
     }
-    let chat_ok = received.len() == 101 && timer_ok;
-    let event_order: Vec<String> = received.clone();
-    let applied_ticks: Vec<u64> = vec![tick.applied_tick; received.len()];
+    let timer_ok = tick.applied_tick >= 1;
+    let chat_events: Vec<String> = received
+        .iter()
+        .filter(|frame| is_chat_event_delta(frame))
+        .cloned()
+        .collect();
+    let chat_ok = chat_events.len() == 101 && timer_ok;
+    let event_order: Vec<String> = chat_events.clone();
+    let applied_ticks: Vec<u64> = chat_events
+        .iter()
+        .filter_map(|frame| delta_tick_id(frame))
+        .collect();
     let first_block = first_envelope
         .as_ref()
         .and_then(|envelope| envelope.commands.first());
@@ -434,7 +452,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         "6".to_owned(),
         json!({
             "ok": chat_ok,
-            "eventCount": received.len(),
+            "eventCount": chat_events.len(),
             "appliedTick": tick.applied_tick,
             "timerManagerInvoked": timer_ok,
             "cadence": if timer_ok { "kernel:tickFrame" } else { "tick-batched" },
@@ -447,7 +465,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     );
 
     let snapshot = host.capture_persist_snapshot(MAIN_ROOM.to_owned());
-    let window_before = received.len();
+    let window_before = chat_events.len();
     let last_before = host.query_attribute(AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
         room_id: MAIN_ROOM.to_owned(),
@@ -455,7 +473,16 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         attribute_id: "ChatComponent.lastMessageText".to_owned(),
         connection_generation: None,
     });
-    host.restore_persist_snapshot(MAIN_ROOM.to_owned(), snapshot.clone());
+    let snapshot_path = out_dir.join("persist-snapshot.bin");
+    let snapshot_sha256 = if snapshot.bytes.is_empty() {
+        None
+    } else {
+        let _ = std::fs::write(&snapshot_path, &snapshot.bytes);
+        Some(sha256_hex(&snapshot.bytes))
+    };
+    if !snapshot.bytes.is_empty() {
+        host.restore_persist_snapshot(MAIN_ROOM.to_owned(), snapshot.clone());
+    }
     let history_max = 0;
     let still_bound = host.try_self_lookup("c-browser".to_owned()).is_some();
     let last_after = host.query_attribute(AttributeQueryRequest {
@@ -468,18 +495,35 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let extra_after_restore = browser_wire
         .as_mut()
         .and_then(|client| client.recv_text().ok());
-    let refilled = extra_after_restore.is_some();
-    let restored_window = 0;
+    let refilled = extra_after_restore
+        .as_ref()
+        .is_some_and(|frame| is_chat_event_delta(frame));
+    let restored_window = if snapshot.bytes.is_empty() {
+        None
+    } else if refilled {
+        Some(1_u64)
+    } else {
+        Some(0_u64)
+    };
+    let process_a = json!({
+        "pid": std::process::id(),
+        "process": process_name,
+    });
+    let process_b = snapshot_sha256
+        .as_ref()
+        .and_then(|_| spawn_restore_process(&snapshot_path, out_dir));
     let persist_ok = still_bound
         && !refilled
         && last_after.outcome == AttributeQueryOutcome::Ok
         && last_after.value == last_before.value
         && last_after.value.is_some()
-        && host.census(MAIN_ROOM.to_owned()).total == 101;
+        && host.census(MAIN_ROOM.to_owned()).total == 101
+        && snapshot_sha256.is_some()
+        && process_b.is_some();
     scenarios.insert(
         "7".to_owned(),
         json!({
-            "ok": persist_ok && window_before > 0 && history_max == 0 && restored_window == 0,
+            "ok": persist_ok && window_before > 0 && history_max == 0 && restored_window == Some(0),
             "snapshotEntities": snapshot.bytes.len(),
             "historyCountMax": history_max,
             "restoredWindow": restored_window,
@@ -493,7 +537,29 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let entity_a_host = previous_bot100.net_entity_id.clone();
     let previous_session = previous_bot100.session_id.clone();
     let previous_account = previous_bot100.account_id.clone();
-    assert!(host.disconnect("c-bot100".to_owned()));
+    let re_login = login_or_register(&account.uri(), "Bot100", TEST_PASSWORD, Some(&bot_claim))
+        .await
+        .unwrap_or_else(|_| empty_login());
+    let mut re_ok = false;
+    let mut rebound_binding: Option<ConnectionBinding> = None;
+    let mut takeover = false;
+    if re_login.accepted {
+        if let Some(credential) = re_login.admission_credential {
+            if verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now).is_ok() {
+                let rebind = host.admit(MAIN_ROOM.to_owned(), "c-bot100-re".to_owned(), credential);
+                takeover = rebind.takeover;
+                re_ok = rebind.takeover
+                    && rebind.binding.as_ref().is_some_and(|binding| {
+                        binding.net_entity_id == entity_a
+                            && binding.net_entity_id == entity_a_host
+                            && binding.session_id != previous_session
+                            && binding.net_entity_id != binding.session_id
+                            && binding.account_id == previous_account
+                    });
+                rebound_binding = rebind.binding;
+            }
+        }
+    }
     let rejected = host.admit_chat_input(
         "c-bot100".to_owned(),
         InputCommand::from_chat_text("while-down"),
@@ -503,28 +569,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         InputCommand::from_chat_text("room-continues"),
     );
     let _ = host.run_tick(MAIN_ROOM.to_owned());
-    let re_login = login_or_register(&account.uri(), "Bot100", TEST_PASSWORD, Some(&bot_claim))
-        .await
-        .unwrap_or_else(|_| empty_login());
-    let mut re_ok = false;
-    let mut rebound_binding: Option<ConnectionBinding> = None;
-    if re_login.accepted {
-        if let Some(credential) = re_login.admission_credential {
-            if verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now).is_ok() {
-                let rebind = host.admit(MAIN_ROOM.to_owned(), "c-bot100-re".to_owned(), credential);
-                re_ok = rebind.reconnected
-                    && rebind.binding.as_ref().is_some_and(|binding| {
-                        binding.net_entity_id == entity_a
-                            && binding.net_entity_id == entity_a_host
-                            && binding.session_id != previous_session
-                            && binding.net_entity_id != binding.session_id
-                            && binding.account_id == previous_account
-                    })
-                    && rejected.kind == ChatOpKind::Rejected;
-                rebound_binding = rebind.binding;
-            }
-        }
-    }
+    re_ok = re_ok && rejected.kind == ChatOpKind::Rejected;
     let reconnect_trace = json!({
         "rebound": re_ok,
         "entityA": entity_a_host,
@@ -534,11 +579,13 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         "previousSessionId": previous_session,
         "accountId": rebound_binding.as_ref().map(|binding| binding.account_id.clone()),
         "previousAccountId": previous_account,
+        "connectionSupersededReceived": takeover,
+        "oldConnectionId": "c-bot100",
     });
     scenarios.insert(
         "8".to_owned(),
         json!({
-            "ok": re_ok,
+            "ok": re_ok && takeover,
             "rebound": re_ok,
             "entityA": entity_a_host,
             "netEntityId": reconnect_trace.get("netEntityId").cloned(),
@@ -547,6 +594,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "previousSessionId": previous_session,
             "accountId": reconnect_trace.get("accountId").cloned(),
             "previousAccountId": previous_account,
+            "connectionSupersededReceived": takeover,
         }),
     );
 
@@ -654,7 +702,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         }),
     );
 
-    let scale_ok = full.total == 101 && chat_ok && event_order.len() == 101;
+    let scale_ok =
+        full.total == 101 && chat_ok && event_order.len() == 101 && applied_ticks.len() == 101;
     scenarios.insert(
         "11".to_owned(),
         json!({
@@ -704,14 +753,23 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             },
             "queries": query_traces,
             "chat": {
-                "eventCount": received.len(),
+                "eventCount": chat_events.len(),
                 "tickSource": if timer_ok { "kernel:tickFrame" } else { "tick-batched" },
                 "timerManagerInvoked": timer_ok,
                 "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
                 "mappingId": first_block.map(|block| block.mapping_id.as_str()),
                 "payloadSha256": first_block.map(|block| block.payload_sha256.as_str()),
+                "receivedEvents": chat_events,
+                "windowLines": chat_events,
             },
             "reconnect": reconnect_trace,
+            "persist": {
+                "clientWindowBeforeSnapshot": window_before,
+                "clientWindowAfterRestore": restored_window,
+                "processA": process_a,
+                "processB": process_b,
+                "snapshotSha256": snapshot_sha256,
+            },
             "expiry": expiry_trace,
             "handshake": {
                 "completed": admits.len(),
@@ -719,10 +777,71 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             },
         },
         "scenarios": scenarios,
-        "browserWindow": received,
+        "browserWindow": chat_events,
     });
     write_evidence(out_dir, &evidence, &host_audit);
     evidence
+}
+
+fn is_chat_event_delta(frame: &str) -> bool {
+    frame.contains("\"messageType\":\"Delta\"") && frame.contains("\"mappingId\":\"chat.event\"")
+}
+
+fn delta_tick_id(frame: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(frame)
+        .ok()?
+        .get("tickId")?
+        .as_u64()
+}
+
+fn drain_chat_event_deltas(client: &mut Option<RoomClient>, received: &mut Vec<String>) {
+    let Some(client) = client.as_mut() else {
+        return;
+    };
+    while received.len() < 101 {
+        match client.recv_text() {
+            Ok(frame) if is_chat_event_delta(&frame) => received.push(frame),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_lower(&Sha256::digest(bytes))
+}
+
+fn spawn_restore_process(snapshot_path: &Path, out_dir: &Path) -> Option<Value> {
+    let exe = std::env::current_exe().ok()?;
+    let child_dir = out_dir.join("process-b");
+    std::fs::create_dir_all(&child_dir).ok()?;
+    let status = Command::new(&exe)
+        .arg("--restore-snapshot")
+        .arg(snapshot_path)
+        .arg("--out")
+        .arg(&child_dir)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+    let parsed = std::fs::read_to_string(child_dir.join("restore-result.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
+    if parsed.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let pid = parsed
+        .get("pid")
+        .and_then(Value::as_u64)
+        .filter(|pid| *pid > 0)?;
+    Some(json!({
+        "pid": pid,
+        "process": parsed
+            .get("process")
+            .and_then(Value::as_str)
+            .unwrap_or("lumio-entity-chat-replay"),
+    }))
 }
 
 fn empty_login() -> super::AccountLoginResult {

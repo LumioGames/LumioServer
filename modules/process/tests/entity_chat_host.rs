@@ -279,3 +279,12 @@ fn kernel_tick_frame_runs_runtime_tick() {
     let tick = host.schedule_room_tick("room-main".to_owned(), 0);
     assert_eq!(tick.applied_tick, 1);
 }
+
+#[test]
+fn batched_chat_inputs_stay_within_runtime_change_entry_budget() {
+    assert_eq!(
+        lumio_server_process::entity_chat::MAX_CHAT_INPUTS_PER_TICK * 2,
+        128,
+        "two ChatComponent field writes per chat.input must fit MaxChangeEntries=128"
+    );
+}

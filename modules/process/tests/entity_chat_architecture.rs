@@ -98,6 +98,25 @@ fn process_src_grep_bans_are_empty() {
 }
 
 #[test]
+fn host_entry_restore_persist_uses_readonly_memory() {
+    let path = process_root()
+        .parent()
+        .expect("modules")
+        .parent()
+        .expect("repo")
+        .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
+    let text = fs::read_to_string(&path).expect("HostEntry.cs");
+    assert!(
+        text.contains("ReadOnlyMemory"),
+        "RestorePersist is ReadOnlyMemory<byte> on the Runtime public surface"
+    );
+    assert!(
+        !text.contains("RestorePersist\", new[] { world.GetType(), typeof(byte[]) }"),
+        "must not invoke RestorePersist(EcsWorld, byte[]) — that overload does not exist"
+    );
+}
+
+#[test]
 fn owned_sources_have_no_hardcoded_dev_machine_paths() {
     let mut hits = Vec::new();
     for (path, text) in read_owned_sources() {

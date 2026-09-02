@@ -5,8 +5,8 @@ mod common;
 use common::{delta_frame, snapshot_with_state_blocks, SharedRuntime, TestKernel};
 use lumio_host_runtime::SharedClock;
 use lumio_server_process::entity_chat::{
-    generate_keys, issue_admission_credential, EntityChatHost, InputCommand, RoomClient,
-    ADMISSION_KEY_ID, RECONNECT_WINDOW_MS,
+    generate_keys, issue_admission_credential, ChatOpKind, EntityChatHost, InputCommand,
+    RoomClient, ADMISSION_KEY_ID, RECONNECT_WINDOW_MS,
 };
 
 fn credential(
@@ -62,6 +62,51 @@ fn admit_sends_full_snapshot_with_state_blocks_to_the_client() {
     assert!(
         frame.contains("\"mappingId\":\"entity.identity\""),
         "FullSnapshot must carry Runtime entity.identity, got {frame}"
+    );
+}
+
+#[test]
+fn admit_chat_input_then_tick_sends_chat_event_delta_to_room_client() {
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(SharedRuntime::new()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    let admit = host.admit(
+        "room-main".to_owned(),
+        "c-bot01".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(admit.accepted);
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
+    let _ = client.recv_text();
+    let admitted = host.admit_chat_input(
+        "c-bot01".to_owned(),
+        InputCommand::from_chat_text("hello-Bot01"),
+    );
+    assert_eq!(admitted.kind, ChatOpKind::Admitted);
+    let tick = host.run_tick("room-main".to_owned());
+    assert!(
+        tick.applied_tick >= 1,
+        "kernel tickFrame must run, got {tick:?}"
+    );
+    let frame = client.recv_text().expect("delta");
+    assert!(
+        frame.contains("\"messageType\":\"Delta\""),
+        "Room client must receive a C-1 Delta, got {frame}"
+    );
+    assert!(
+        frame.contains("\"mappingId\":\"chat.event\""),
+        "Delta.changedBlocks must contain decodeable mappingId=chat.event, got {frame}"
+    );
+    assert!(
+        !frame.contains("\"changedBlocks\":[]"),
+        "live-equivalent admit_input + tick must not broadcast empty changedBlocks, got {frame}"
     );
 }
 
