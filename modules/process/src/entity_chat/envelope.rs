@@ -120,9 +120,32 @@ pub fn connection_superseded_json(net_entity_id: u64, new_generation: u64) -> St
 }
 
 /// Runtime issues 32-char lowercase hex of a u64 sequence.
+/// C-1 `NetEntityId` is the same u64 (decimal or shorter hex on some clients).
+#[must_use]
+pub fn normalize_net_entity_id(net_entity_id: &str) -> String {
+    let lower = net_entity_id.trim().to_ascii_lowercase();
+    if lower.len() == 32
+        && lower
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return lower;
+    }
+    if !lower.is_empty() && lower.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(value) = lower.parse::<u64>() {
+            return format!("{value:032x}");
+        }
+    }
+    if let Ok(value) = u64::from_str_radix(&lower, 16) {
+        return format!("{value:032x}");
+    }
+    lower
+}
+
+/// Runtime issues 32-char lowercase hex of a u64 sequence.
 #[must_use]
 pub fn net_entity_id_to_u64(net_entity_id: &str) -> Option<u64> {
-    u64::from_str_radix(net_entity_id, 16).ok()
+    u64::from_str_radix(&normalize_net_entity_id(net_entity_id), 16).ok()
 }
 
 fn is_lower_sha256(value: &str) -> bool {

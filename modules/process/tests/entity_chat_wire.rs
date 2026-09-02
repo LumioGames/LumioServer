@@ -212,3 +212,43 @@ fn runtime_snapshot_failure_does_not_send_host_minted_empty_full_snapshot() {
         client.received
     );
 }
+
+#[test]
+fn second_c_browser_attach_still_receives_room_delta() {
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(SharedRuntime::new()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    let admit = host.admit(
+        "room-main".to_owned(),
+        "c-browser".to_owned(),
+        credential(&keys, "Browser01", false),
+    );
+    assert!(admit.accepted);
+    let mut first = RoomClient::connect(&host.listen_uri(), "c-browser").expect("first");
+    let _ = first.recv_text();
+    let mut second = RoomClient::connect(&host.listen_uri(), "c-browser").expect("second");
+    let _ = second.recv_text();
+    let _ = host.admit_chat_input(
+        "c-browser".to_owned(),
+        InputCommand::from_chat_text("hello-browser"),
+    );
+    let tick = host.run_tick("room-main".to_owned());
+    assert!(tick.ok);
+    let first_frame = first.recv_text().expect("first delta");
+    let second_frame = second.recv_text().expect("second delta");
+    assert!(
+        first_frame.contains("\"mappingId\":\"chat.event\""),
+        "first c-browser observer must keep receiving, got {first_frame}"
+    );
+    assert!(
+        second_frame.contains("\"mappingId\":\"chat.event\""),
+        "Playwright-style second c-browser attach must also receive, got {second_frame}"
+    );
+}

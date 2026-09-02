@@ -48,6 +48,8 @@ try {
     password: args.password,
     resultPath: args['result-path'],
     consolePath: args['console-path'],
+    waitForEvents: Number(args['wait-for-events'] ?? 0),
+    waitMs: Number(args['wait-ms'] ?? 90000),
   })
   process.stdout.write(JSON.stringify(result) + '\n')
 } catch (err) {

@@ -186,6 +186,7 @@ pub fn run_playwright_browser(
     password: &str,
     result_path: &Path,
     console_path: &Path,
+    wait_for_events: u32,
 ) -> PlaywrightCapture {
     let wrapper =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/run_playwright_browser.mjs");
@@ -205,6 +206,8 @@ pub fn run_playwright_browser(
         .arg(result_path)
         .arg("--console-path")
         .arg(console_path)
+        .arg("--wait-for-events")
+        .arg(wait_for_events.to_string())
         .env(
             "LUMIO_GAME_ROOT",
             match game_root() {
@@ -260,8 +263,10 @@ pub fn run_playwright_browser(
 #[must_use]
 pub fn capture_browser_login(
     account_uri: &str,
+    room_uri: Option<&str>,
     password: &str,
     out_dir: &Path,
+    wait_for_events: u32,
 ) -> PlaywrightCapture {
     let web = match game_root() {
         Ok(root) => root.join("integration/entity-chat/web"),
@@ -275,16 +280,21 @@ pub fn capture_browser_login(
         Ok(server) => server,
         Err(error) => return PlaywrightCapture::failed(&error),
     };
-    let page_url = format!(
-        "http://127.0.0.1:{}/index.html?account={}&login=Browser01",
+    let mut page_url = format!(
+        "http://127.0.0.1:{}/index.html?account={}&login=Browser01&connectionId=c-browser",
         static_server.port,
         encode_query_component(account_uri)
     );
+    if let Some(room) = room_uri {
+        page_url.push_str("&room=");
+        page_url.push_str(&encode_query_component(room));
+    }
     let capture = run_playwright_browser(
         &page_url,
         password,
         &out_dir.join("browser-result.json"),
         &out_dir.join("browser-console.ndjson"),
+        wait_for_events,
     );
     drop(static_server);
     capture
