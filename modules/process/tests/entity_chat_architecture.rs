@@ -7,6 +7,30 @@ fn process_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+fn rust_fn_src<'a>(text: &'a str, marker: &str) -> &'a str {
+    let start = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing `{marker}`"));
+    let after = &text[start..];
+    let brace = after
+        .find('{')
+        .unwrap_or_else(|| panic!("no body for `{marker}`"));
+    let mut depth = 0;
+    for (index, ch) in after.char_indices().skip(brace) {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &after[..=index];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unclosed `{marker}`");
+}
+
 fn collect_text_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -220,6 +244,50 @@ fn suite_schedules_kernel_tick_every_max_chat_inputs() {
     assert!(
         ticks >= 2,
         "suite must schedule at least a batch tick and a remainder tick, got {ticks}"
+    );
+}
+
+#[test]
+fn drain_and_apply_pending_must_not_block_past_a_deadline() {
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    let wire = fs::read_to_string(process_root().join("src/entity_chat/wire.rs")).expect("wire.rs");
+    let drain = rust_fn_src(&suite, "fn drain_chat_event_deltas");
+    let apply = rust_fn_src(&suite, "fn apply_pending_chat_ticks");
+    let wait = rust_fn_src(&suite, "fn wait_for_observed_chat_events");
+    assert!(
+        drain.contains("try_recv_text") || drain.contains("WouldBlock"),
+        "drain_chat_event_deltas must non-block or WouldBlock-stop; blocking recv_text is the live9 hang"
+    );
+    assert!(
+        !drain.contains(".recv_text()"),
+        "drain must not call blocking recv_text while waiting for 101 chat.event frames"
+    );
+    assert!(
+        drain.contains("deadline") || wait.contains("deadline"),
+        "observer drain/wait must stop at a deadline, not hang until dispatcher kill"
+    );
+    assert!(
+        wire.contains("try_recv_text")
+            && (wire.contains("set_nonblocking") || wire.contains("WouldBlock")),
+        "RoomClient must expose a non-blocking recv so hold sockets cannot pin drain"
+    );
+    assert!(
+        apply.contains("!tick.ok"),
+        "apply_pending_chat_ticks must stop when tick.ok is false (65+ Runtime _faulted)"
+    );
+    assert!(
+        apply.contains("pending_chats > MAX_CHAT_INPUTS_PER_TICK"),
+        "apply_pending must not RunTick more than MAX_CHAT_INPUTS_PER_TICK chat.inputs"
+    );
+}
+
+#[test]
+fn max_chat_inputs_per_tick_stays_sixty_four() {
+    let text = fs::read_to_string(process_root().join("src/entity_chat/mod.rs")).expect("mod.rs");
+    assert!(
+        text.contains("MAX_CHAT_INPUTS_PER_TICK: usize = 64"),
+        "must not raise Runtime MaxChangeEntries / MAX_CHAT_INPUTS_PER_TICK"
     );
 }
 

@@ -943,20 +943,24 @@ fn delta_tick_id(frame: &str) -> Option<u64> {
         .as_u64()
 }
 
-fn drain_chat_event_deltas(client: &mut Option<RoomClient>, received: &mut Vec<String>) {
+/// Drains already-queued Room `chat.event` frames. Must not block past a deadline.
+pub fn drain_chat_event_deltas(client: &mut Option<RoomClient>, received: &mut Vec<String>) {
     let Some(client) = client.as_mut() else {
         return;
     };
-    while received.len() < 101 {
-        match client.recv_text() {
-            Ok(frame) if is_chat_event_delta(&frame) => received.push(frame),
-            Ok(_) => {}
-            Err(_) => break,
+    let deadline = Instant::now() + Duration::from_millis(50);
+    while received.len() < 101 && Instant::now() < deadline {
+        match client.try_recv_text() {
+            Ok(Some(frame)) if is_chat_event_delta(&frame) => received.push(frame),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
         }
     }
 }
 
-fn apply_pending_chat_ticks(
+/// Applies Room-observed pending chats in ≤64 batches. Must return if a tick
+/// does not reduce pending or `tick.ok` is false.
+pub fn apply_pending_chat_ticks(
     host: &EntityChatHost,
     tick: &mut RuntimeTick,
     browser_wire: &mut Option<RoomClient>,
@@ -964,14 +968,28 @@ fn apply_pending_chat_ticks(
 ) {
     loop {
         let pending_chats = host.pending_wire_chat_inputs();
+        if pending_chats > MAX_CHAT_INPUTS_PER_TICK {
+            *tick = RuntimeTick::failed("runtime_failure");
+            break;
+        }
         if pending_chats >= MAX_CHAT_INPUTS_PER_TICK {
             *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
             drain_chat_event_deltas(browser_wire, received);
+            if !tick.ok {
+                break;
+            }
+            let after = host.pending_wire_chat_inputs();
+            if after >= pending_chats {
+                break;
+            }
             continue;
         }
         if pending_chats > 0 {
             *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
             drain_chat_event_deltas(browser_wire, received);
+            if !tick.ok {
+                break;
+            }
         }
         break;
     }

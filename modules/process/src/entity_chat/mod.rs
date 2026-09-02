@@ -51,7 +51,10 @@ pub use runtime::{
     PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding, RuntimeQuery,
     RuntimeSurface, RuntimeTick,
 };
-pub use suite::{run_round, run_round_blocking, run_two_rounds, SuiteOptions, SuiteReport};
+pub use suite::{
+    apply_pending_chat_ticks, drain_chat_event_deltas, run_round, run_round_blocking,
+    run_two_rounds, SuiteOptions, SuiteReport,
+};
 pub use wire::{RoomClient, RoomListener};
 
 pub const MAIN_ROOM: &str = "room-main";

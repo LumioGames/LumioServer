@@ -19,6 +19,7 @@ use super::runtime::{
     RuntimeAdmit, RuntimeBinding, RuntimeQuery, RuntimeSurface, RuntimeTick,
 };
 use super::wire::{RoomListener, WireEvent, WireSender};
+use super::MAX_CHAT_INPUTS_PER_TICK;
 
 /// WallClock expire dispatch id (NativeCore slot).
 pub const DISPATCH_EXPIRE: u32 = 1;
@@ -622,6 +623,9 @@ impl Inner {
     }
 
     fn run_tick(&mut self, room_id: &str) -> RuntimeTick {
+        if self.wire_chat_pending > MAX_CHAT_INPUTS_PER_TICK as u64 {
+            return RuntimeTick::failed("runtime_failure");
+        }
         self.tick_id = self.tick_id.saturating_add(1);
         let Ok(fired) = self.kernel.advance_tick_frame(self.tick_id) else {
             return RuntimeTick::failed("runtime_failure");
