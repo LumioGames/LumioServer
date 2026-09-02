@@ -13,8 +13,8 @@ use super::clr::{ClrGameplay, ClrGameplayConfig};
 use super::envelope::InputCommand;
 use super::gameplay::{ChatOpKind, LocalGameplay};
 use super::host::{
-    AttributeQueryOutcome, AttributeQueryRequest, AttributeQueryScope, BoundEntityKind,
-    EntityChatHost,
+    AdmitTrace, AttributeQueryOutcome, AttributeQueryRequest, AttributeQueryScope, BoundEntityKind,
+    ConnectionBinding, EntityChatHost,
 };
 use super::{
     bot_name, ADMISSION_KEY_ID, BOT_COUNT, BROWSER_NAME, ISO_ROOM, MAIN_ROOM, RECONNECT_WINDOW_MS,
@@ -270,8 +270,10 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     }
 
     let full = host.census(MAIN_ROOM.to_owned());
-    let census_payload = census_payload(&full);
-    let host_audit = host_audit(&host, &full, MAIN_ROOM);
+    let admits = host.list_admits(MAIN_ROOM.to_owned());
+    let process_name = replay_process_name();
+    let census_payload = census_payload(&admits);
+    let host_audit = host_audit(&process_name, &admits, MAIN_ROOM);
     scenarios.insert(
         "3".to_owned(),
         json!({
@@ -279,6 +281,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "total": full.total,
             "botCount": full.bot_count,
             "playerCount": full.player_count,
+            "playwrightRan": false,
             "loginAccepted": browser_login.accepted,
             "loginError": browser_login.error_code,
             "verifyError": browser_verify,
@@ -311,6 +314,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         let evidence = json!({
             "ok": false,
             "blocked": blocked,
+            "hostProcess": host_process_payload(&process_name),
+            "playwright": playwright_payload(),
             "accountServer": account_meta(&options.account_server_dll, &account),
             "census": census_payload,
             "scenarios": scenarios,
@@ -354,6 +359,13 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         attribute_id: "EntityIdentity.entityType".to_owned(),
         connection_generation: Some(0),
     });
+    let query_traces = json!({
+        "okValue": ok_query.value,
+        "invisible": format!("{:?}", invisible.outcome),
+        "unauthorized": format!("{:?}", unauthorized.outcome),
+        "stale": format!("{:?}", stale.outcome),
+        "nonExistent": format!("{:?}", missing.outcome),
+    });
     scenarios.insert(
         "5".to_owned(),
         json!({
@@ -366,6 +378,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "invisible": format!("{:?}", invisible.outcome),
             "unauthorized": format!("{:?}", unauthorized.outcome),
             "stale": format!("{:?}", stale.outcome),
+            "nonExistent": format!("{:?}", missing.outcome),
         }),
     );
 
@@ -389,7 +402,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         .map(|ev| {
             format!(
                 "{}:{}:{}",
-                ev.sender_net_entity_id, ev.text, ev.room_sequence
+                host.host_net_entity_id_of(ev.sender_net_entity_id),
+                ev.text,
+                ev.room_sequence
             )
         })
         .collect();
@@ -403,6 +418,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "ok": chat_ok,
             "eventCount": window.len(),
             "appliedTick": tick.applied_tick,
+            "timerManagerInvoked": false,
+            "cadence": "tick-batched",
             "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
             "mappingId": first_block.map(|block| block.mapping_id.as_str()),
             "payload": first_block.map(|block| block.payload.as_str()),
@@ -435,10 +452,16 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "snapshotEntities": snapshot.entities.len(),
             "historyCountMax": history_max,
             "restoredWindow": restored_window,
+            "windowBeforeSnapshot": window.len(),
+            "snapshotSource": "live-rust-host",
         }),
     );
 
-    let entity_a = host.must_self("c-bot100").net_entity_id;
+    let previous_bot100 = host.must_self("c-bot100");
+    let entity_a = previous_bot100.net_entity_id;
+    let entity_a_host = previous_bot100.host_net_entity_id.clone();
+    let previous_session = previous_bot100.session_id.clone();
+    let previous_account = previous_bot100.account_id.clone();
     assert!(host.disconnect("c-bot100".to_owned()));
     let rejected = host.admit_chat_input(
         "c-bot100".to_owned(),
@@ -453,27 +476,54 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         .await
         .unwrap_or_else(|_| empty_login());
     let mut re_ok = false;
+    let mut rebound_binding: Option<ConnectionBinding> = None;
     if re_login.accepted {
         if let Some(credential) = re_login.admission_credential {
             if verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now).is_ok() {
                 let rebind = host.admit(MAIN_ROOM.to_owned(), "c-bot100-re".to_owned(), credential);
                 re_ok = rebind.reconnected
-                    && rebind
-                        .binding
-                        .as_ref()
-                        .is_some_and(|binding| binding.net_entity_id == entity_a)
+                    && rebind.binding.as_ref().is_some_and(|binding| {
+                        binding.net_entity_id == entity_a
+                            && binding.host_net_entity_id == entity_a_host
+                            && binding.session_id != previous_session
+                            && binding.host_net_entity_id != binding.session_id
+                            && binding.account_id == previous_account
+                    })
                     && host.client_chat_window("c-bot100-re".to_owned()).is_empty()
                     && rejected.kind == ChatOpKind::Rejected;
+                rebound_binding = rebind.binding;
             }
         }
     }
+    let reconnect_trace = json!({
+        "rebound": re_ok,
+        "entityA": entity_a_host,
+        "netEntityId": rebound_binding.as_ref().map(|binding| binding.host_net_entity_id.clone()).unwrap_or(entity_a_host.clone()),
+        "previousNetEntityId": entity_a_host,
+        "sessionId": rebound_binding.as_ref().map(|binding| binding.session_id.clone()),
+        "previousSessionId": previous_session,
+        "accountId": rebound_binding.as_ref().map(|binding| binding.account_id.clone()),
+        "previousAccountId": previous_account,
+    });
     scenarios.insert(
         "8".to_owned(),
-        json!({ "ok": re_ok, "entityA": entity_a.to_string() }),
+        json!({
+            "ok": re_ok,
+            "rebound": re_ok,
+            "entityA": entity_a_host,
+            "netEntityId": reconnect_trace.get("netEntityId").cloned(),
+            "previousNetEntityId": entity_a_host,
+            "sessionId": reconnect_trace.get("sessionId").cloned(),
+            "previousSessionId": previous_session,
+            "accountId": reconnect_trace.get("accountId").cloned(),
+            "previousAccountId": previous_account,
+        }),
     );
 
-    let entity_99 = host.must_self("c-bot99").net_entity_id;
-    let account_99 = host.must_self("c-bot99").account_id;
+    let previous_99 = host.must_self("c-bot99");
+    let entity_99 = previous_99.net_entity_id;
+    let entity_99_host = previous_99.host_net_entity_id.clone();
+    let account_99 = previous_99.account_id;
     assert!(host.disconnect("c-bot99".to_owned()));
     host.advance_monotonic(RECONNECT_WINDOW_MS + 1_000);
     let expired = host.expire_due();
@@ -481,6 +531,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         .await
         .unwrap_or_else(|_| empty_login());
     let mut expiry_ok = false;
+    let mut entity_b_host: Option<String> = None;
     if after_expiry.accepted {
         if let Some(credential) = after_expiry.admission_credential {
             if verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now).is_ok() {
@@ -496,18 +547,31 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                 expiry_ok = expired == 1
                     && created_b.accepted
                     && created_b.binding.as_ref().is_some_and(|binding| {
-                        binding.net_entity_id != entity_99 && binding.account_id == account_99
+                        binding.net_entity_id != entity_99
+                            && binding.host_net_entity_id != entity_99_host
+                            && binding.account_id == account_99
                     })
                     && tombstoned.outcome == AttributeQueryOutcome::Tombstoned;
+                entity_b_host = created_b
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.host_net_entity_id.clone());
             }
         }
     }
+    let expiry_trace = json!({
+        "tombstoned": expiry_ok,
+        "staleARejected": expiry_ok,
+        "entityA": entity_99_host,
+        "entityB": entity_b_host,
+    });
     scenarios.insert(
         "9".to_owned(),
         json!({
             "ok": expiry_ok,
             "expired": expired,
-            "entityA": entity_99.to_string(),
+            "entityA": entity_99_host,
+            "entityB": entity_b_host,
             "tombstoned": expiry_ok,
             "staleARejected": expiry_ok,
         }),
@@ -579,16 +643,53 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             all_ok = false;
         }
     }
+    let session_ids: Vec<String> = admits.iter().map(|row| row.session_id.clone()).collect();
     let evidence = json!({
         "ok": all_ok,
         "blocked": blocked,
+        "hostProcess": host_process_payload(&process_name),
+        "playwright": playwright_payload(),
         "accountServer": account_meta(&options.account_server_dll, &account),
         "census": census_payload,
+        "liveAdmits": {
+            "desired": 101,
+            "live": admits.len(),
+            "admits": admits.iter().map(|row| json!({
+                "ok": true,
+                "process": process_name,
+                "entityType": row.entity_type.as_str(),
+                "netEntityId": row.host_net_entity_id,
+                "sessionId": row.session_id,
+                "loginName": row.login_name,
+                "connectionId": row.connection_id,
+                "accountId": row.account_id,
+            })).collect::<Vec<_>>(),
+        },
+        "traces": {
+            "account": {
+                "createAck": first.accepted && first.account_newly_created,
+                "loadAck": repeat.accepted,
+                "wrongPasswordCode": wrong.error_code,
+            },
+            "queries": query_traces,
+            "chat": {
+                "eventCount": window.len(),
+                "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
+                "mappingId": first_block.map(|block| block.mapping_id.as_str()),
+                "payloadSha256": first_block.map(|block| block.payload_sha256.as_str()),
+            },
+            "reconnect": reconnect_trace,
+            "expiry": expiry_trace,
+            "handshake": {
+                "completed": admits.len(),
+                "sessionIds": session_ids,
+            },
+        },
         "scenarios": scenarios,
         "browserWindow": window.iter().map(|ev| json!({
             "messageId": ev.message_id,
             "roomSequence": ev.room_sequence,
-            "senderNetEntityId": ev.sender_net_entity_id.to_string(),
+            "senderNetEntityId": host.host_net_entity_id_of(ev.sender_net_entity_id),
             "text": ev.text,
             "appliedTick": ev.applied_tick,
         })).collect::<Vec<_>>(),
@@ -608,39 +709,87 @@ fn empty_login() -> super::AccountLoginResult {
     }
 }
 
-fn census_payload(census: &super::RoomCensus) -> Value {
+fn census_payload(admits: &[AdmitTrace]) -> Value {
+    let mut bots = 0;
+    let mut players = 0;
+    let mut net_entity_ids = Vec::new();
+    let mut entity_types = Vec::new();
+    for row in admits {
+        net_entity_ids.push(row.host_net_entity_id.clone());
+        entity_types.push(row.entity_type.as_str());
+        match row.entity_type {
+            BoundEntityKind::Bot => bots += 1,
+            BoundEntityKind::Player => players += 1,
+        }
+    }
     json!({
-        "botCount": census.bot_count,
-        "playerCount": census.player_count,
-        "total": census.total,
-        "netEntityIds": census.net_entity_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "entityTypes": census.entity_types.iter().map(BoundEntityKind::as_str).collect::<Vec<_>>(),
+        "botCount": bots,
+        "playerCount": players,
+        "total": bots + players,
+        "netEntityIds": net_entity_ids,
+        "entityTypes": entity_types,
     })
 }
 
-fn host_audit(host: &EntityChatHost, census: &super::RoomCensus, room_id: &str) -> String {
+fn host_audit(process: &str, admits: &[AdmitTrace], room_id: &str) -> String {
     let mut lines = Vec::new();
-    for (i, id) in census.net_entity_ids.iter().enumerate() {
-        let entity_type = census
-            .entity_types
-            .get(i)
-            .map_or("bot", BoundEntityKind::as_str);
-        let account_id = host
-            .try_resolve_by_net_entity_id(room_id.to_owned(), *id)
-            .map(|resolved| resolved.account_id)
-            .unwrap_or_default();
+    lines.push(
+        json!({
+            "seq": 0,
+            "kind": "audit",
+            "process": process,
+            "eventId": "host.start",
+            "category": "host",
+            "severity": "info",
+        })
+        .to_string(),
+    );
+    for (i, row) in admits.iter().enumerate() {
         lines.push(
             json!({
+                "seq": i + 1,
                 "kind": "entity_admitted",
+                "process": process,
                 "roomId": room_id,
-                "netEntityId": id.to_string(),
-                "entityType": entity_type,
-                "accountId": account_id,
+                "netEntityId": row.host_net_entity_id,
+                "entityType": row.entity_type.as_str(),
+                "accountId": row.account_id,
+                "sessionId": row.session_id,
+                "loginName": row.login_name,
+                "connectionId": row.connection_id,
             })
             .to_string(),
         );
     }
     lines.join("\n") + "\n"
+}
+
+fn replay_process_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "lumio-entity-chat-replay".to_owned())
+}
+
+fn host_process_payload(process: &str) -> Value {
+    json!({
+        "process": process,
+        "pid": std::process::id(),
+        "listenUri": Value::Null,
+        "command": std::env::args().collect::<Vec<String>>(),
+    })
+}
+
+fn playwright_payload() -> Value {
+    json!({
+        "ran": false,
+        "injected": false,
+        "receivedFromNetwork": false,
+        "blockedReason": "in-process EntityChatHost has no Chromium page",
+    })
 }
 
 fn account_meta(dll: &Path, account: &AccountServerProcess) -> Value {
@@ -658,6 +807,7 @@ fn write_evidence(out_dir: &Path, evidence: &Value, audit: &str) {
         serde_json::to_string_pretty(evidence).unwrap_or_default() + "\n",
     );
     let _ = std::fs::write(out_dir.join("host-audit.ndjson"), audit);
+    let _ = std::fs::write(out_dir.join("admit-trace.ndjson"), audit);
 }
 
 fn write_blocked(out_dir: &Path, reason: &str) -> Value {

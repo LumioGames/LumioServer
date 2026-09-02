@@ -15,4 +15,4 @@ R-00359 要求在切片级最小 Rust host 上复跑与 R-00354 相同的 101-en
 
 ## 后果
 
-切片验收证据必须来自 Rust host 复跑。C# MVP 与 Game 仓 `GameRoomHost` 只作对照，不再扩展 hello-wire-v1。
+切片验收证据必须来自 Rust host 复跑（`lumio-entity-chat-replay` + CoreCLR `ChatRoomWorld`）。C# MVP 与 Game 仓 `GameRoomHost` 只作对照，不再扩展 hello-wire-v1。Game `verify-evidence.mjs` 仍锁定 `lumio-mvp-host` 时，以本仓 oracle 为 SUCCESS 谓词，不得为通过 Game 对账器而假冒进程名。

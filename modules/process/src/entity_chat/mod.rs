@@ -38,8 +38,9 @@ pub use gameplay::{
     ChatTickResult, GameplayWorld, LocalGameplay,
 };
 pub use host::{
-    AttributeQueryOutcome, AttributeQueryRequest, AttributeQueryScope, BoundEntityKind,
-    ConnectionBinding, EntityChatHost, EntityResolution, QueryResult, RoomAdmitResult, RoomCensus,
+    format_host_net_entity_id, AdmitTrace, AttributeQueryOutcome, AttributeQueryRequest,
+    AttributeQueryScope, BoundEntityKind, ConnectionBinding, EntityChatHost, EntityResolution,
+    QueryResult, RoomAdmitResult, RoomCensus,
 };
 pub use suite::{run_round, run_round_blocking, run_two_rounds, SuiteOptions, SuiteReport};
 

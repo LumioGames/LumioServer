@@ -11,11 +11,32 @@ use lumio_host_runtime::{
 use super::admission::{
     classify_entity_kind, is_bot_namespace, verify_admission, AdmissionPayload,
 };
+use super::crypto::fill_random;
 use super::envelope::InputCommand;
 use super::gameplay::{
     ChatMessageEvent, ChatOperation, ChatPersistEntity, ChatPersistSnapshot, ChatTickResult,
     GameplayWorld,
 };
+
+/// Host NetEntityId wire form: `nent_` + 16-hex instance + 16-hex seq.
+#[must_use]
+pub fn format_host_net_entity_id(instance_key: u64, seq: u64) -> String {
+    format!("nent_{instance_key:016x}{seq:016x}")
+}
+
+fn session_id_for(login_name: &str, reconnected: bool) -> String {
+    if reconnected {
+        format!("sess-{login_name}-re")
+    } else {
+        format!("sess-{login_name}")
+    }
+}
+
+fn new_instance_key() -> u64 {
+    let mut bytes = [0_u8; 8];
+    fill_random(&mut bytes);
+    u64::from_le_bytes(bytes)
+}
 
 /// Player or Bot, classified from login name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,14 +55,28 @@ impl BoundEntityKind {
     }
 }
 
-/// Binding five-tuple.
+/// Binding five-tuple plus host projections used by evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionBinding {
     pub account_id: String,
     pub room_id: String,
     pub net_entity_id: u64,
+    pub host_net_entity_id: String,
+    pub session_id: String,
     pub entity_type: BoundEntityKind,
     pub connection_generation: u64,
+}
+
+/// One live admit row for host-audit / census.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmitTrace {
+    pub connection_id: String,
+    pub session_id: String,
+    pub host_net_entity_id: String,
+    pub net_entity_id: u64,
+    pub entity_type: BoundEntityKind,
+    pub account_id: String,
+    pub login_name: String,
 }
 
 /// Server resolution of a live entity.
@@ -173,9 +208,11 @@ enum BindingPresence {
 
 struct LiveEntity {
     account_id: String,
-    _login_name: String,
+    login_name: String,
     room_id: String,
     net_entity_id: u64,
+    host_net_entity_id: String,
+    session_id: String,
     entity_type: BoundEntityKind,
     generation: u64,
     presence: BindingPresence,
@@ -190,6 +227,8 @@ impl LiveEntity {
             account_id: self.account_id.clone(),
             room_id: self.room_id.clone(),
             net_entity_id: self.net_entity_id,
+            host_net_entity_id: self.host_net_entity_id.clone(),
+            session_id: self.session_id.clone(),
             entity_type: self.entity_type,
             connection_generation: self.generation,
         }
@@ -218,6 +257,7 @@ struct Inner {
     by_connection: HashMap<String, String>,
     tombstones: HashMap<u64, Tombstone>,
     next_net_entity_id: u64,
+    instance_key: u64,
 }
 
 enum OwnerWork {
@@ -258,6 +298,7 @@ impl EntityChatHost {
                 by_connection: HashMap::new(),
                 tombstones: HashMap::new(),
                 next_net_entity_id: 1,
+                instance_key: new_instance_key(),
             };
             loop {
                 match rx.recv() {
@@ -401,6 +442,18 @@ impl EntityChatHost {
         self.on_owner(move |inner| inner.census(&room_id))
     }
 
+    /// Live admit rows for host-audit census (per-entity host NetEntityId).
+    #[must_use]
+    pub fn list_admits(&self, room_id: String) -> Vec<AdmitTrace> {
+        self.on_owner(move |inner| inner.list_admits(&room_id))
+    }
+
+    /// Projects a gameplay seq to the host `nent_*` string.
+    #[must_use]
+    pub fn host_net_entity_id_of(&self, gameplay_id: u64) -> String {
+        self.on_owner(move |inner| format_host_net_entity_id(inner.instance_key, gameplay_id))
+    }
+
     /// Client-local chat window.
     #[must_use]
     pub fn client_chat_window(&self, connection_id: String) -> Vec<ChatMessageEvent> {
@@ -466,9 +519,11 @@ impl Inner {
         }
         let live = LiveEntity {
             account_id: payload.account_id.clone(),
-            _login_name: payload.login_name.clone(),
+            login_name: payload.login_name.clone(),
             room_id: room_id.to_owned(),
             net_entity_id,
+            host_net_entity_id: format_host_net_entity_id(self.instance_key, net_entity_id),
+            session_id: session_id_for(&payload.login_name, false),
             entity_type: kind,
             generation: 1,
             presence: BindingPresence::Active,
@@ -514,6 +569,7 @@ impl Inner {
         live.presence = BindingPresence::Active;
         live.disconnected_at_ms = None;
         live.generation += 1;
+        live.session_id = session_id_for(&live.login_name, true);
         live.window.clear();
         let binding = live.binding();
         self.by_connection
@@ -791,9 +847,14 @@ impl Inner {
             }
             let live = LiveEntity {
                 account_id: entity.account_id.clone(),
-                _login_name: String::new(),
+                login_name: String::new(),
                 room_id: room_id.to_owned(),
                 net_entity_id: entity.net_entity_id,
+                host_net_entity_id: format_host_net_entity_id(
+                    self.instance_key,
+                    entity.net_entity_id,
+                ),
+                session_id: String::new(),
                 entity_type: entity.entity_type,
                 generation: 1,
                 presence: BindingPresence::Active,
@@ -855,6 +916,31 @@ impl Inner {
             net_entity_ids: ids,
             entity_types: kinds,
         }
+    }
+
+    fn list_admits(&mut self, room_id: &str) -> Vec<AdmitTrace> {
+        self.expire_due();
+        let Some(room) = self.rooms.get(room_id) else {
+            return Vec::new();
+        };
+        let mut rows: Vec<AdmitTrace> = room
+            .entities
+            .iter()
+            .filter_map(|(id, account)| {
+                let live = self.by_account.get(account)?;
+                Some(AdmitTrace {
+                    connection_id: live.connection_id.clone().unwrap_or_default(),
+                    session_id: live.session_id.clone(),
+                    host_net_entity_id: live.host_net_entity_id.clone(),
+                    net_entity_id: *id,
+                    entity_type: live.entity_type,
+                    account_id: live.account_id.clone(),
+                    login_name: live.login_name.clone(),
+                })
+            })
+            .collect();
+        rows.sort_by_key(|row| row.net_entity_id);
+        rows
     }
 
     fn client_chat_window(&self, connection_id: &str) -> Vec<ChatMessageEvent> {
@@ -975,7 +1061,10 @@ mod tests {
             "c-bot01".to_owned(),
             credential(&keys, "Bot01", true),
         );
-        let entity_a = host.must_self("c-bot01").net_entity_id;
+        let first = host.must_self("c-bot01");
+        let entity_a = first.net_entity_id;
+        let first_host = first.host_net_entity_id.clone();
+        let first_session = first.session_id.clone();
         assert!(host.disconnect("c-bot01".to_owned()));
         let rejected = host.admit_chat_input(
             "c-bot01".to_owned(),
@@ -988,8 +1077,34 @@ mod tests {
             credential(&keys, "Bot01", true),
         );
         assert!(rebind.reconnected);
-        assert_eq!(rebind.binding.map(|b| b.net_entity_id), Some(entity_a));
+        let rebound = rebind.binding.expect("rebind binding");
+        assert_eq!(rebound.net_entity_id, entity_a);
+        assert_eq!(rebound.host_net_entity_id, first_host);
+        assert_ne!(rebound.session_id, first_session);
+        assert_ne!(rebound.host_net_entity_id, rebound.session_id);
+        assert!(rebound.host_net_entity_id.starts_with("nent_"));
         assert!(host.client_chat_window("c-bot01-re".to_owned()).is_empty());
+    }
+
+    #[test]
+    fn host_net_entity_id_is_nent_prefixed_opaque_string() {
+        assert_eq!(
+            format_host_net_entity_id(0x11, 1),
+            "nent_00000000000000110000000000000001"
+        );
+        let keys = generate_keys();
+        let host = host_with(&keys);
+        let bot = host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true),
+        );
+        let binding = bot.binding.expect("binding");
+        assert!(binding.host_net_entity_id.starts_with("nent_"));
+        assert_eq!(binding.host_net_entity_id.len(), 37);
+        assert_eq!(binding.session_id, "sess-Bot01");
+        assert_ne!(binding.host_net_entity_id, binding.session_id);
+        assert_ne!(binding.host_net_entity_id, binding.account_id);
     }
 
     #[test]
