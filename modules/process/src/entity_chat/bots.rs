@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,45 @@ pub struct ClientBotTrace {
     pub submitted: u32,
     pub pid: u32,
     pub blocked: Option<String>,
+}
+
+/// Live Bot.Host process whose Room sockets stay open until [`ClientBotFleet::release`].
+pub struct ClientBotFleet {
+    pub trace: ClientBotTrace,
+    child: Option<Child>,
+    release_path: PathBuf,
+}
+
+impl ClientBotFleet {
+    /// Lets the hook dispose Room sockets and exit after Room observed chat.event.
+    pub fn release(mut self) {
+        self.release_mut();
+    }
+
+    fn release_mut(&mut self) {
+        let _ = std::fs::write(&self.release_path, "release\n");
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match child.try_wait() {
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Ok(Some(_)) | Err(_) => break,
+            }
+        }
+    }
+}
+
+impl Drop for ClientBotFleet {
+    fn drop(&mut self) {
+        self.release_mut();
+    }
 }
 
 /// Env lookup used by discovery. Process env in production; map in unit tests.
@@ -126,9 +165,9 @@ pub fn run_client_bot_fleet<F>(
     out_dir: &Path,
     dotnet: &str,
     mut on_progress: F,
-) -> Result<ClientBotTrace, String>
+) -> Result<ClientBotFleet, String>
 where
-    F: FnMut(u32),
+    F: FnMut(),
 {
     std::fs::create_dir_all(out_dir).map_err(|error| error.to_string())?;
     let host = ensure_bot_host_executable(bot_host, dotnet)?;
@@ -137,11 +176,13 @@ where
     let spec_path = out_dir.join("fleet-spec.json");
     let trace_path = out_dir.join("timer-trace.json");
     let sent_path = out_dir.join("sent.txt");
+    let release_path = out_dir.join("release.flag");
     let spec = json!({
         "roomUri": room_uri,
         "engineNative": engine_native.display().to_string(),
         "tracePath": trace_path.display().to_string(),
         "sentPath": sent_path.display().to_string(),
+        "releasePath": release_path.display().to_string(),
         "advanceToTick": 15,
         "bots": envelopes.iter().map(|(connection, envelope)| {
             json!({
@@ -174,7 +215,7 @@ where
         .map_err(|error| format!("BLOCKED: spawn Lumio.Client.Bot.Host: {error}"))?;
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        on_progress(read_sent(&sent_path));
+        on_progress();
         if trace_path.is_file() {
             break;
         }
@@ -202,9 +243,20 @@ where
         }
         thread::sleep(Duration::from_millis(50));
     }
-    let _ = child.wait();
-    on_progress(read_sent(&sent_path));
-    parse_trace(&trace_path)
+    on_progress();
+    let trace = match parse_trace(&trace_path) {
+        Ok(trace) => trace,
+        Err(reason) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(reason);
+        }
+    };
+    Ok(ClientBotFleet {
+        trace,
+        child: Some(child),
+        release_path,
+    })
 }
 
 fn process_repo_root() -> PathBuf {
@@ -384,13 +436,6 @@ fn bot_host_command(dotnet: &str, host: &Path) -> Command {
     }
 }
 
-fn read_sent(path: &Path) -> u32 {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(0)
-}
-
 fn tail_logs(stdout_path: &Path, stderr_path: &Path) -> String {
     let stdout = std::fs::read_to_string(stdout_path).unwrap_or_default();
     let stderr = std::fs::read_to_string(stderr_path).unwrap_or_default();
@@ -449,6 +494,7 @@ fn parse_trace(path: &Path) -> Result<ClientBotTrace, String> {
 mod tests {
     use super::{
         discover_bot_host_in, hook_compile_failure_text, write_hook_isolation_files, BotHostEnv,
+        ClientBotFleet, ClientBotTrace,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -605,6 +651,22 @@ internal static class Warn
         assert!(
             output.status.success(),
             "isolated hook must build under Game Directory.Build.props, got {text}"
+        );
+    }
+
+    #[test]
+    fn fleet_release_writes_release_path() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let release_path = tmp.path().join("release.flag");
+        let fleet = ClientBotFleet {
+            trace: ClientBotTrace::default(),
+            child: None,
+            release_path: release_path.clone(),
+        };
+        fleet.release();
+        assert!(
+            release_path.is_file(),
+            "suite release must create the hook wait file"
         );
     }
 

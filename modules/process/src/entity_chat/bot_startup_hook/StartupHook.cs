@@ -95,6 +95,20 @@ internal static class StartupHook
             }
 
             WriteTrace(spec, invoked && sent == n, source, ticks, sent, null);
+            if (!string.IsNullOrWhiteSpace(spec.ReleasePath))
+            {
+                DateTime deadline = DateTime.UtcNow.AddMinutes(2);
+                while (!File.Exists(spec.ReleasePath))
+                {
+                    if (DateTime.UtcNow >= deadline)
+                    {
+                        break;
+                    }
+
+                    Thread.Sleep(50);
+                }
+            }
+
             return invoked && sent == n ? 0 : 2;
         }
         finally
@@ -197,6 +211,8 @@ internal static class StartupHook
         public string TracePath { get; set; } = "";
 
         public string SentPath { get; set; } = "";
+
+        public string ReleasePath { get; set; } = "";
 
         public ulong AdvanceToTick { get; set; }
 
