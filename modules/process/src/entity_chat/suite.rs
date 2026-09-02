@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use super::account::{login_or_register, AccountServerProcess};
 use super::admission::{generate_keys, issue_bot_tool_credential, verify_admission};
+use super::bots::{discover_bot_host, run_client_bot_fleet, ClientBotTrace};
 use super::browser::capture_browser_login;
 use super::clr::{ClrGameplay, ClrGameplayConfig};
 use super::crypto::hex_lower;
@@ -430,33 +431,94 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         }),
     );
 
-    let mut first_envelope: Option<InputCommand> = None;
+    let bot_host = match discover_bot_host() {
+        Ok(path) => path,
+        Err(reason) => {
+            let playwright = match pw_thread {
+                Some(handle) => handle.join().unwrap_or_else(|_| {
+                    super::browser::PlaywrightCapture::failed("playwright thread")
+                }),
+                None => super::browser::PlaywrightCapture::failed(&reason),
+            };
+            let evidence = json!({
+                "ok": false,
+                "blocked": reason,
+                "hostProcess": host_process_payload(&process_name, &host.listen_uri()),
+                "playwright": playwright.to_json(),
+                "accountServer": account_meta(&options.account_server_dll, &account),
+                "census": census_payload,
+                "scenarios": scenarios,
+            });
+            write_evidence(out_dir, &evidence, &host_audit);
+            return evidence;
+        }
+    };
+    let engine_native = match options.clr.as_ref() {
+        Some(config) if config.engine_native.is_file() => config.engine_native.clone(),
+        _ => {
+            return write_blocked(out_dir, "BLOCKED: LUMIO_ENGINE_NATIVE is not set");
+        }
+    };
+    let envelopes: Vec<(String, InputCommand)> = connections
+        .iter()
+        .map(|(connection, name)| {
+            (
+                connection.clone(),
+                InputCommand::from_chat_text(&format!("hello-{name}")),
+            )
+        })
+        .collect();
+    let first_envelope = envelopes.first().map(|(_, envelope)| envelope.clone());
     let mut pending_chats = 0usize;
+    let mut last_ticked = 0u32;
     let mut tick = RuntimeTick::default();
     let mut received = Vec::new();
-    for (connection, name) in &connections {
-        let command = InputCommand::from_chat_text(&format!("hello-{name}"));
-        if first_envelope.is_none() {
-            first_envelope = Some(command.clone());
+    let fleet_dir = out_dir.join("client-bots");
+    let bot_trace = match run_client_bot_fleet(
+        &bot_host,
+        &engine_native,
+        &listen_uri,
+        &envelopes,
+        &fleet_dir,
+        &options.dotnet,
+        |sent| {
+            pending_chats = sent.saturating_sub(last_ticked) as usize;
+            if pending_chats >= MAX_CHAT_INPUTS_PER_TICK {
+                tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
+                drain_chat_event_deltas(&mut browser_wire, &mut received);
+                last_ticked = sent;
+                pending_chats = 0;
+            }
+        },
+    ) {
+        Ok(trace) => trace,
+        Err(reason) => {
+            blocked = blocked.or(Some(reason));
+            ClientBotTrace::default()
         }
-        let _ = host.admit_chat_input(connection.clone(), command);
-        pending_chats += 1;
-        if pending_chats >= MAX_CHAT_INPUTS_PER_TICK {
-            tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
-            drain_chat_event_deltas(&mut browser_wire, &mut received);
-            pending_chats = 0;
-        }
+    };
+    if let Some(client) = browser_wire.as_mut() {
+        let _ = client.send_text(&InputCommand::from_chat_text("hello-browser").to_json());
     }
-    let _ = host.admit_chat_input(
-        "c-browser".to_owned(),
-        InputCommand::from_chat_text("hello-browser"),
-    );
-    pending_chats += 1;
+    pending_chats = pending_chats.saturating_add(1);
     if pending_chats > 0 {
         tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
         drain_chat_event_deltas(&mut browser_wire, &mut received);
     }
-    let timer_ok = tick.ok && tick.applied_tick >= 1;
+    for _ in 0..6 {
+        if received.len() >= 101 {
+            break;
+        }
+        tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
+        drain_chat_event_deltas(&mut browser_wire, &mut received);
+    }
+    let timer_ok = bot_trace.timer_manager_invoked
+        && bot_trace.tick_source == "native-kernel/tickFrame"
+        && bot_trace.utterance_ticks.contains(&5)
+        && bot_trace.utterance_ticks.contains(&10)
+        && bot_trace.utterance_ticks.contains(&15)
+        && tick.ok
+        && tick.applied_tick >= 1;
     let chat_events: Vec<String> = received
         .iter()
         .filter(|frame| is_chat_event_delta(frame))
@@ -500,8 +562,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "eventCount": chat_events.len(),
             "appliedTick": tick.applied_tick,
             "timerManagerInvoked": timer_ok,
-            "cadence": if timer_ok { "kernel:tickFrame" } else { "tick-batched" },
-            "tickSource": if timer_ok { "kernel:tickFrame" } else { "tick-batched" },
+            "cadence": bot_trace.tick_source,
+            "tickSource": bot_trace.tick_source,
+            "utteranceTicks": bot_trace.utterance_ticks,
             "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
             "mappingId": first_block.map(|block| block.mapping_id.as_str()),
             "payload": first_block.map(|block| block.payload.as_str()),
@@ -816,8 +879,10 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "queries": query_traces,
             "chat": {
                 "eventCount": chat_events.len(),
-                "tickSource": if timer_ok { "kernel:tickFrame" } else { "tick-batched" },
+                "tickSource": bot_trace.tick_source,
                 "timerManagerInvoked": timer_ok,
+                "utteranceTicks": bot_trace.utterance_ticks,
+                "botHostPid": bot_trace.pid,
                 "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
                 "mappingId": first_block.map(|block| block.mapping_id.as_str()),
                 "payloadSha256": first_block.map(|block| block.payload_sha256.as_str()),

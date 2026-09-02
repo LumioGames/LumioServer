@@ -66,6 +66,39 @@ fn admit_sends_full_snapshot_with_state_blocks_to_the_client() {
 }
 
 #[test]
+fn room_client_chat_input_over_wire_then_tick_sends_chat_event_delta() {
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(SharedRuntime::new()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    let admit = host.admit(
+        "room-main".to_owned(),
+        "c-bot01".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(admit.accepted);
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
+    let _ = client.recv_text();
+    client
+        .send_text(&InputCommand::from_chat_text("hello-Bot01").to_json())
+        .expect("wire chat.input");
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    let tick = host.run_tick("room-main".to_owned());
+    assert!(tick.ok, "kernel tickFrame must run, got {tick:?}");
+    let frame = client.recv_text().expect("delta");
+    assert!(
+        frame.contains("\"mappingId\":\"chat.event\""),
+        "Room WS chat.input must become chat.event, got {frame}"
+    );
+}
+
+#[test]
 fn admit_chat_input_then_tick_sends_chat_event_delta_to_room_client() {
     let keys = generate_keys();
     let host = EntityChatHost::new(

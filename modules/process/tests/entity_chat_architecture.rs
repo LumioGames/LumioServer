@@ -143,11 +143,12 @@ fn suite_attaches_c_browser_room_ws_before_chat_burst() {
         .or_else(|| text.find("RoomClient::connect(&host.listen_uri(), \"c-browser\")"))
         .expect("suite must attach c-browser as a RoomClient");
     let burst = text
-        .find("for (connection, name) in &connections")
-        .expect("chat burst loop");
+        .find("run_client_bot_fleet(")
+        .or_else(|| text.find("spawn_client_bot_host("))
+        .expect("chat burst must spawn Client Bot.Host, not a host-admit loop");
     assert!(
         browser < burst,
-        "c-browser Room WS must be attached before the 101 chat burst"
+        "c-browser Room WS must be attached before Client Bot utterances"
     );
 }
 
@@ -219,6 +220,83 @@ fn suite_schedules_kernel_tick_every_max_chat_inputs() {
     assert!(
         ticks >= 2,
         "suite must schedule at least a batch tick and a remainder tick, got {ticks}"
+    );
+}
+
+#[test]
+fn suite_discovers_client_bot_host_via_env_or_sibling() {
+    let bots = fs::read_to_string(process_root().join("src/entity_chat/bots.rs")).expect("bots.rs");
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    let blob = format!("{bots}\n{suite}");
+    assert!(
+        blob.contains("LUMIO_CLIENT_ROOT") && blob.contains("LUMIO_BOT_HOST"),
+        "Client Bot.Host must be discovered via LUMIO_CLIENT_ROOT / LUMIO_BOT_HOST"
+    );
+    assert!(
+        blob.contains("LumioClient") && blob.contains("Lumio.Client.Bot.Host"),
+        "missing Bot.Host must fall back to a repo-relative sibling, never a hardcoded machine path"
+    );
+}
+
+#[test]
+fn suite_spawns_lumio_client_bot_host() {
+    let bots = fs::read_to_string(process_root().join("src/entity_chat/bots.rs")).expect("bots.rs");
+    assert!(
+        bots.contains("Lumio.Client.Bot.Host")
+            && (bots.contains("DOTNET_STARTUP_HOOKS") || bots.contains("dotnet")),
+        "suite must spawn Lumio.Client.Bot.Host as a child process"
+    );
+    assert!(
+        bots.contains("ClientTimerManager"),
+        "spawned Bot.Host must drain ClientTimerManager, not a second timer"
+    );
+}
+
+#[test]
+fn suite_s6_tick_source_is_native_kernel_tick_frame() {
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    assert!(
+        suite.contains("native-kernel/tickFrame"),
+        "S6 tickSource must be native-kernel/tickFrame from Client Timer Manager"
+    );
+    assert!(
+        !suite.contains("\"tickSource\": if timer_ok { \"kernel:tickFrame\""),
+        "must not impersonate Client Timer Manager with host kernel:tickFrame"
+    );
+}
+
+#[test]
+fn suite_s6_utterance_ticks_come_from_client_timer_drain() {
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    let bots = fs::read_to_string(process_root().join("src/entity_chat/bots.rs")).expect("bots.rs");
+    let blob = format!("{suite}\n{bots}");
+    assert!(
+        blob.contains("utteranceTicks") || blob.contains("utterance_ticks"),
+        "S6 must record Client Timer Manager utteranceTicks"
+    );
+    assert!(
+        !suite.contains("vec![5, 10, 15]")
+            && !suite.contains("vec![5,10,15]")
+            && !suite.contains("[5, 10, 15]")
+            && !suite.contains("[5,10,15]"),
+        "must not hard-code Client Timer ticks 5,10,15 in suite evidence"
+    );
+}
+
+#[test]
+fn suite_chat_burst_does_not_host_admit_bot_utterances() {
+    let text =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    assert!(
+        !text.contains("admit_chat_input(connection.clone()"),
+        "101 bot chats must come from Client Bot.Host over Room WS, not host.admit_chat_input"
+    );
+    assert!(
+        text.contains("write_blocked") && text.contains("discover_bot_host"),
+        "missing Client Bot.Host must BLOCKED rather than skip"
     );
 }
 

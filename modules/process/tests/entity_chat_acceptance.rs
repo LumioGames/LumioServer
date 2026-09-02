@@ -103,9 +103,25 @@ fn assert_identical_suite_stamps(evidence: &Value) {
         "S6 tickSource must be kernel tickFrame, got {tick_source:?}"
     );
     assert_eq!(
-        s6.get("cadence").and_then(Value::as_str),
-        Some("kernel:tickFrame")
+        s6.get("tickSource").and_then(Value::as_str),
+        Some("native-kernel/tickFrame")
     );
+    assert_eq!(
+        s6.get("cadence").and_then(Value::as_str),
+        Some("native-kernel/tickFrame")
+    );
+    let cadence_ticks = s6
+        .get("utteranceTicks")
+        .or_else(|| evidence.pointer("/traces/chat/utteranceTicks"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for needed in [5_u64, 10, 15] {
+        assert!(
+            cadence_ticks.iter().any(|tick| tick.as_u64() == Some(needed)),
+            "S6 utteranceTicks must include {needed} from Client Timer Manager drain, got {cadence_ticks:?}"
+        );
+    }
 
     let s7 = evidence.pointer("/scenarios/7").unwrap_or(&empty);
     let source = s7
