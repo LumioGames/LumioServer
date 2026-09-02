@@ -301,6 +301,63 @@ fn suite_chat_burst_does_not_host_admit_bot_utterances() {
 }
 
 #[test]
+fn bot_host_must_not_exit_or_dispose_sockets_before_room_observes_chat_events() {
+    let hook =
+        fs::read_to_string(process_root().join("src/entity_chat/bot_startup_hook/StartupHook.cs"))
+            .expect("StartupHook.cs");
+    let bots = fs::read_to_string(process_root().join("src/entity_chat/bots.rs")).expect("bots.rs");
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    let production_bots = bots
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production bots.rs");
+
+    let run_start = hook
+        .find("private static int Run(")
+        .expect("StartupHook.Run");
+    let run_end = hook
+        .find("private static void SendText")
+        .expect("StartupHook.Run end");
+    let run = &hook[run_start..run_end];
+    let write_trace = run
+        .find("WriteTrace(spec, invoked && sent == n")
+        .expect("success path writes timer-trace");
+    assert!(
+        run[write_trace..].contains("ReleasePath") && run[write_trace..].contains("File.Exists"),
+        "after timer-trace, Bot.Host must wait for a suite ReleasePath before returning to Environment.Exit / finally dispose"
+    );
+    assert!(
+        !run[write_trace..].contains("Thread.Sleep(400)"),
+        "must not treat Sleep(400) after timer-trace as SUCCESS; hold is suite/Room observation"
+    );
+    assert!(
+        hook.contains("public string ReleasePath"),
+        "fleet spec must carry ReleasePath so the suite can release the held sockets"
+    );
+
+    assert!(
+        production_bots.contains("releasePath")
+            && (production_bots.contains("fn release")
+                || production_bots.contains("fn release_mut")),
+        "bots.rs must keep Lumio.Client.Bot.Host alive and expose an explicit suite release"
+    );
+    assert!(
+        !suite.contains("sent.saturating_sub"),
+        "suite must not schedule ticks from sent.txt; that races host receive"
+    );
+    assert!(
+        host.contains("pending_wire_chat_inputs") && suite.contains("pending_wire_chat_inputs"),
+        "tick budget must follow Room wire observation of chat.input, not Bot.Host sent.txt"
+    );
+    assert!(
+        suite.contains("release(") && suite.contains("drain_chat_event_deltas"),
+        "suite must hold the fleet until Room observed chat.event, then release"
+    );
+}
+
+#[test]
 fn generated_hook_build_isolates_from_parent_directory_build_props() {
     let bots = fs::read_to_string(process_root().join("src/entity_chat/bots.rs")).expect("bots.rs");
     let production = bots

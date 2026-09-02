@@ -99,6 +99,43 @@ fn room_client_chat_input_over_wire_then_tick_sends_chat_event_delta() {
 }
 
 #[test]
+fn pending_wire_chat_inputs_counts_room_ingress_until_tick() {
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(SharedRuntime::new()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    let admit = host.admit(
+        "room-main".to_owned(),
+        "c-bot01".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(admit.accepted);
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
+    let _ = client.recv_text();
+    client
+        .send_text(&InputCommand::from_chat_text("hello-Bot01").to_json())
+        .expect("wire chat.input");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while host.pending_wire_chat_inputs() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        host.pending_wire_chat_inputs(),
+        1,
+        "Room WS chat.input must be observed as pending before tick"
+    );
+    let tick = host.run_tick("room-main".to_owned());
+    assert!(tick.ok, "kernel tickFrame must run, got {tick:?}");
+    assert_eq!(host.pending_wire_chat_inputs(), 0);
+}
+
+#[test]
 fn admit_chat_input_then_tick_sends_chat_event_delta_to_room_client() {
     let keys = generate_keys();
     let host = EntityChatHost::new(

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use super::account::{login_or_register, AccountServerProcess};
 use super::admission::{generate_keys, issue_bot_tool_credential, verify_admission};
-use super::bots::{discover_bot_host, run_client_bot_fleet, ClientBotTrace};
+use super::bots::{discover_bot_host, run_client_bot_fleet, ClientBotFleet, ClientBotTrace};
 use super::browser::capture_browser_login;
 use super::clr::{ClrGameplay, ClrGameplayConfig};
 use super::crypto::hex_lower;
@@ -469,11 +469,10 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         })
         .collect();
     let first_envelope = envelopes.first().map(|(_, envelope)| envelope.clone());
-    let mut pending_chats = 0usize;
-    let mut last_ticked = 0u32;
     let mut tick = RuntimeTick::default();
     let mut received = Vec::new();
     let fleet_dir = out_dir.join("client-bots");
+    let mut bot_fleet: Option<ClientBotFleet> = None;
     let bot_trace = match run_client_bot_fleet(
         &bot_host,
         &engine_native,
@@ -481,36 +480,41 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         &envelopes,
         &fleet_dir,
         &options.dotnet,
-        |sent| {
-            pending_chats = sent.saturating_sub(last_ticked) as usize;
-            if pending_chats >= MAX_CHAT_INPUTS_PER_TICK {
-                tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
-                drain_chat_event_deltas(&mut browser_wire, &mut received);
-                last_ticked = sent;
-                pending_chats = 0;
-            }
+        || {
+            apply_pending_chat_ticks(&host, &mut tick, &mut browser_wire, &mut received);
         },
     ) {
-        Ok(trace) => trace,
+        Ok(fleet) => {
+            let trace = fleet.trace.clone();
+            bot_fleet = Some(fleet);
+            trace
+        }
         Err(reason) => {
             blocked = blocked.or(Some(reason));
             ClientBotTrace::default()
         }
     };
+    wait_for_observed_chat_events(
+        &host,
+        &mut tick,
+        &mut browser_wire,
+        &mut received,
+        BOT_COUNT as usize,
+        Duration::from_secs(30),
+    );
     if let Some(client) = browser_wire.as_mut() {
         let _ = client.send_text(&InputCommand::from_chat_text("hello-browser").to_json());
     }
-    pending_chats = pending_chats.saturating_add(1);
-    if pending_chats > 0 {
-        tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
-        drain_chat_event_deltas(&mut browser_wire, &mut received);
-    }
-    for _ in 0..6 {
-        if received.len() >= 101 {
-            break;
-        }
-        tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
-        drain_chat_event_deltas(&mut browser_wire, &mut received);
+    wait_for_observed_chat_events(
+        &host,
+        &mut tick,
+        &mut browser_wire,
+        &mut received,
+        101,
+        Duration::from_secs(10),
+    );
+    if let Some(fleet) = bot_fleet.take() {
+        fleet.release();
     }
     let timer_ok = bot_trace.timer_manager_invoked
         && bot_trace.tick_source == "native-kernel/tickFrame"
@@ -949,6 +953,51 @@ fn drain_chat_event_deltas(client: &mut Option<RoomClient>, received: &mut Vec<S
             Ok(_) => {}
             Err(_) => break,
         }
+    }
+}
+
+fn apply_pending_chat_ticks(
+    host: &EntityChatHost,
+    tick: &mut RuntimeTick,
+    browser_wire: &mut Option<RoomClient>,
+    received: &mut Vec<String>,
+) {
+    loop {
+        let pending_chats = host.pending_wire_chat_inputs();
+        if pending_chats >= MAX_CHAT_INPUTS_PER_TICK {
+            *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
+            drain_chat_event_deltas(browser_wire, received);
+            continue;
+        }
+        if pending_chats > 0 {
+            *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
+            drain_chat_event_deltas(browser_wire, received);
+        }
+        break;
+    }
+}
+
+fn wait_for_observed_chat_events(
+    host: &EntityChatHost,
+    tick: &mut RuntimeTick,
+    browser_wire: &mut Option<RoomClient>,
+    received: &mut Vec<String>,
+    want: usize,
+    budget: Duration,
+) {
+    let deadline = Instant::now() + budget;
+    loop {
+        apply_pending_chat_ticks(host, tick, browser_wire, received);
+        drain_chat_event_deltas(browser_wire, received);
+        if received.len() >= want {
+            return;
+        }
+        if Instant::now() >= deadline {
+            apply_pending_chat_ticks(host, tick, browser_wire, received);
+            drain_chat_event_deltas(browser_wire, received);
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

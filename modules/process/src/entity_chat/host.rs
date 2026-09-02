@@ -15,8 +15,8 @@ use super::envelope::{
 };
 use super::runtime::BoundEntityKind;
 use super::runtime::{
-    AttributeQueryScope, ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit,
-    RuntimeBinding, RuntimeQuery, RuntimeSurface, RuntimeTick,
+    AttributeQueryScope, ChatOpKind, ChatOperation, PersistRecord, QueryResult, RebindMode,
+    RuntimeAdmit, RuntimeBinding, RuntimeQuery, RuntimeSurface, RuntimeTick,
 };
 use super::wire::{RoomListener, WireEvent, WireSender};
 
@@ -154,6 +154,7 @@ struct Inner {
     expire_watch: HashMap<KernelHandle, String>,
     pending_egress: HashMap<String, Vec<WireSender>>,
     tick_id: u64,
+    wire_chat_pending: u64,
 }
 
 enum OwnerWork {
@@ -213,6 +214,7 @@ impl EntityChatHost {
                 expire_watch: HashMap::new(),
                 pending_egress: HashMap::new(),
                 tick_id: 0,
+                wire_chat_pending: 0,
             };
             if inner
                 .kernel
@@ -356,6 +358,12 @@ impl EntityChatHost {
     ) -> Option<EntityResolution> {
         let net_entity_id = normalize_net_entity_id(&net_entity_id);
         self.on_owner(move |inner| inner.try_resolve_by_net_entity_id(&room_id, &net_entity_id))
+    }
+
+    /// Chat.input frames admitted from Room WS and not yet applied by a tick.
+    #[must_use]
+    pub fn pending_wire_chat_inputs(&self) -> usize {
+        self.on_owner(move |inner| usize::try_from(inner.wire_chat_pending).unwrap_or(usize::MAX))
     }
 
     /// Count live Room WS observers for a connection (harness wait).
@@ -625,6 +633,7 @@ impl Inner {
         if !tick.ok {
             return tick;
         }
+        self.wire_chat_pending = 0;
         let frames = self
             .runtime
             .build_delta(room_id, tick.applied_tick, tick.revision);
@@ -699,7 +708,10 @@ impl Inner {
                 text,
             } => {
                 if let Ok(envelope) = parse_input_command_json(&text) {
-                    let _ = self.admit_chat_input(&connection_id, &envelope);
+                    let admitted = self.admit_chat_input(&connection_id, &envelope);
+                    if admitted.kind == ChatOpKind::Admitted {
+                        self.wire_chat_pending = self.wire_chat_pending.saturating_add(1);
+                    }
                 }
             }
             WireEvent::Closed { .. } => {
