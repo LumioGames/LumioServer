@@ -5,11 +5,16 @@ using Lumio.Server.MvpHost.Observability;
 
 namespace Lumio.Server.MvpHost.App;
 
+internal interface IBindingTraceProjection
+{
+    void ProjectBinding(string sessionId, string netEntityId, string accountId, string entityKind);
+}
+
 /// <summary>
 /// The cross-process server trace is deliberately a write-only sink. Every line
 /// has the same fixed field set so integration checks never need to parse log text.
 /// </summary>
-public sealed class JsonLinesHostTraceSink : IHostTraceSink, IDisposable
+public sealed class JsonLinesHostTraceSink : IHostTraceSink, IBindingTraceProjection, IDisposable
 {
     private readonly object gate = new();
     private readonly StreamWriter writer;
@@ -82,6 +87,23 @@ public sealed class JsonLinesHostTraceSink : IHostTraceSink, IDisposable
         });
     }
 
+    public void ProjectBinding(string sessionId, string netEntityId, string accountId, string entityKind)
+    {
+        Write(new JsonObject
+        {
+            ["kind"] = "state",
+            ["sessionId"] = sessionId,
+            ["sessionState"] = "Active",
+            ["authorityRevision"] = ToNode(1),
+            ["slotEpoch"] = ToNode(1),
+            ["grantEpoch"] = ToNode(1),
+            ["netEntityId"] = netEntityId,
+            ["accountId"] = accountId,
+            ["entityKind"] = entityKind,
+            ["entityType"] = entityKind,
+        });
+    }
+
     public void Dispose()
     {
         lock (gate)
@@ -125,6 +147,13 @@ public sealed class JsonLinesHostTraceSink : IHostTraceSink, IDisposable
                 ["connectionEpoch"] = values["connectionEpoch"]?.DeepClone(),
                 ["grantEpoch"] = values["grantEpoch"]?.DeepClone(),
             };
+            foreach (var pair in values)
+            {
+                if (!line.ContainsKey(pair.Key))
+                {
+                    line[pair.Key] = pair.Value?.DeepClone();
+                }
+            }
 
             writer.WriteLine(line.ToJsonString());
         }

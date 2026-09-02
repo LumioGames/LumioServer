@@ -35,6 +35,15 @@
         "resolved": "2.0.0",
         "contentHash": "oWbRv/BTztKJxKFr3FBurWBBCgE1+nUTm3pwtA3Yg7Xeo4wDpaLstAwqx8HeQG3/b9yOs2qykpqfbNPJ40McIw=="
       },
+      "lumio.engine.nativeloader": {
+        "type": "Project"
+      },
+      "lumio.engine.sdk": {
+        "type": "Project",
+        "dependencies": {
+          "Lumio.Engine.NativeLoader": "[1.0.0, )"
+        }
+      },
       "lumio.server.account": {
         "type": "Project",
         "dependencies": {

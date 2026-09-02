@@ -240,6 +240,7 @@
       "lumio-mvp-host": {
         "type": "Project",
         "dependencies": {
+          "Lumio.Engine.SDK": "[1.0.0, )",
           "Lumio.Server.MvpHost.Admission": "[1.0.0, )",
           "Lumio.Server.MvpHost.Auth": "[1.0.0, )",
           "Lumio.Server.MvpHost.GeneratedContracts": "[1.0.0, )",
@@ -259,6 +260,15 @@
         "dependencies": {
           "Lumio.Server.MvpHost.Platform": "[1.0.0, )",
           "Lumio.Server.MvpHost.Wire": "[1.0.0, )"
+        }
+      },
+      "lumio.engine.nativeloader": {
+        "type": "Project"
+      },
+      "lumio.engine.sdk": {
+        "type": "Project",
+        "dependencies": {
+          "Lumio.Engine.NativeLoader": "[1.0.0, )"
         }
       },
       "lumio.server.account": {

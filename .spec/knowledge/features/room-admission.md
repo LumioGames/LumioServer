@@ -1,6 +1,6 @@
 ---
 name: room-admission
-description: Game Server Room 准入、绑定登记与五分钟重连窗；改 verify_admission、顶号、断线过期或跨 Room 隔离时查
+description: Game Server Room 准入、绑定登记、nent 投影与 test-control 查询；改 verify_admission、顶号、过期或跨 Room 隔离时查
 metadata:
   type: doc
   status: 已交付
@@ -8,7 +8,7 @@ metadata:
 
 # Room 准入与绑定登记
 
-`mvp-host` 的 `Lumio.Server.MvpHost.Admission` 是 RM-00011 在 C# MVP 宿主上的 Room 准入与连接绑定登记：离线 `verify_admission`、Player/Bot 分类、五元组绑定、顶号重绑、五分钟断线保留与 Room 隔离。它是 Host 身份面，不是第二套 ECS。R-00359 通过后该 C# MVP 面冻结为 reference；切片交付宿主是 Rust `entity_chat` world-slot。
+`mvp-host` 的 `Lumio.Server.MvpHost.Admission` 是 RM-00011 在 C# MVP 宿主上的 Room 准入与连接绑定登记：离线 `verify_admission`、Player/Bot 分类、五元组绑定、顶号重绑、五分钟断线保留与 Room 隔离。它是 Host 身份面，不是第二套 ECS。11 场景 live-green 之前 C# MVP 仍是交付面（[0005](../../decisions/0005-csharp-mvp-host-unfrozen-until-live-11.md)）；Rust `entity_chat` 是 C-5 复跑目标。
 
 ## 背景 / 目标
 
@@ -27,7 +27,8 @@ Game Server 只在 Account Server 准入凭证验证通过后才为连接分配�
 - **重绑**：窗内新准入复用同一 `NetEntityId`，`connectionGeneration` 严格递增；复制 FullSnapshot 只含当前纪元，不含墓碑与旧代。这不是持久化 Snapshot/Restore。
 - **过期**：到期墓碑化 A（`tombstoned`）；之后同 AccountId 登录创建 B，新的 `NetEntityId`。旧引用永不改指 B。
 - **进程重启**：登记是进程内状态，不保留旧连接窗；重启后必须重新 login。`NetEntityId` 含进程实例前缀，避免重启后序号撞车。
-- **组装**：`FullGraphComposition.Create` 经 `HostComposition.CreateRoomAdmissionRegistry` 接线 Host 时钟与 Timer。通道升级在共享密钥之外还接受 C-3 `admissionCredential`；握手路径 `Admit` + 绑定查找把活连接分类为 Bot/Player。公钥来自 `LUMIO_ACCOUNT_ADMISSION_PUBLIC_KEY_HEX`（缺省则进程内临时密钥，仅供未对接账号服的 smoke）。契约真值是架构仓 `engine/wire/entity-binding-and-query-v1.json`（本仓镜像 `mvp-host/contract/`）。
+- **组装**：`FullGraphComposition.Create` 经 `HostComposition.CreateRoomAdmissionRegistry` 接线 Host 时钟与 Timer。通道升级在共享密钥之外还接受 C-3 `admissionCredential`；握手路径 `Admit` 保留 `ConnectionBinding`，经 `LiveElevenHost.OnAdmitted` 投影 `nent_*` 到 17-key host-audit，并 `Assembly.LoadFrom` 宿主 sibling `ChatRoomWorld`。公钥来自 `LUMIO_ACCOUNT_ADMISSION_PUBLIC_KEY_HEX`（缺省则进程内临时密钥，仅供未对接账号服的 smoke）。契约真值是架构仓 `engine/wire/entity-binding-and-query-v1.json`（本仓镜像 `mvp-host/contract/`）。
+- **test-control（loopback）**：`GET /test-control/bindings` 列出 `nent_*`；`POST` query/chat/tick/expire/snapshot/restore/room-admit 驱动 S5–S11。Tick 走 `ITimerService`，不 for-loop。FullSnapshot body 不加 `netEntityId`。
 
 ## 待解决
 

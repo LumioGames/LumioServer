@@ -257,10 +257,15 @@ public sealed class HostComposition : IAsyncDisposable
         if (Options.EnableTestControl)
         {
             var requested = Options.TestControlListenUri ?? "http://127.0.0.1:0";
+            LiveElevenHost? liveEleven = null;
+#if MVP_HOST_FULL_GRAPH
+            liveEleven = fullGraph?.LiveEleven;
+#endif
             TestControl = await TestControlServer.StartAsync(
                 requested,
                 () => Admin,
                 Clock,
+                liveEleven,
                 cancellationToken).ConfigureAwait(false);
         }
     }

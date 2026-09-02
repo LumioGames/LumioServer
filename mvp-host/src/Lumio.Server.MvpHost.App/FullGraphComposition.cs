@@ -55,6 +55,7 @@ internal sealed class FullGraphComposition : IAsyncDisposable
     private readonly IHostTraceSink trace;
     private readonly RoomAdmissionRegistry admission;
     private readonly AdmissionCredentialCapture capture;
+    private readonly LiveElevenHost liveEleven;
     private readonly Dictionary<ulong, ActiveConnection> connections = new();
     private readonly object sessionsGate = new();
     private readonly TaskCompletionSource<object?> faultSignal = new(
@@ -80,7 +81,8 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         INamedThreadSupervisor threads,
         IHostTraceSink trace,
         RoomAdmissionRegistry admission,
-        AdmissionCredentialCapture capture)
+        AdmissionCredentialCapture capture,
+        LiveElevenHost liveEleven)
     {
         this.productId = productId;
         this.gameReleaseId = gameReleaseId;
@@ -97,9 +99,12 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         this.trace = trace;
         this.admission = admission;
         this.capture = capture;
+        this.liveEleven = liveEleven;
     }
 
     internal string BoundUri => carrier.BoundUri;
+
+    internal LiveElevenHost LiveEleven => liveEleven;
 
     internal ISessionAdminPort? Admin => sessions.Admin;
 
@@ -244,6 +249,7 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         sessions.AttachEventInbox(sessionEvents);
         worldSlot.AttachEventInbox(worldEvents);
         var pacing = new MvpPacingController(worldSlot, clock, timers);
+        var liveEleven = LiveElevenHost.Create(admission, clock, timers, threads, trace);
 
         return new FullGraphComposition(
             options.ProductId,
@@ -260,7 +266,8 @@ internal sealed class FullGraphComposition : IAsyncDisposable
             threads,
             trace,
             admission,
-            capture);
+            capture,
+            liveEleven);
     }
 
     internal static bool TryAdmitLiveWebsocketClient(
@@ -345,7 +352,7 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                 return channel;
             }
 
-            capture.Remember(accepted.AccountId, text);
+            capture.Remember(accepted.AccountId, text, accepted.LoginName);
             return new CredentialVerification(
                 CredentialVerdict.Accepted,
                 new PrincipalId(accepted.AccountId),
@@ -370,24 +377,26 @@ internal sealed class FullGraphComposition : IAsyncDisposable
     private sealed class AdmissionCredentialCapture
     {
         private readonly object gate = new();
-        private readonly Dictionary<string, string> byAccount = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, CapturedAdmission> byAccount = new(StringComparer.Ordinal);
 
-        internal void Remember(string accountId, string credential)
+        internal void Remember(string accountId, string credential, string loginName)
         {
             lock (gate)
             {
-                byAccount[accountId] = credential;
+                byAccount[accountId] = new CapturedAdmission(credential, loginName);
             }
         }
 
-        internal bool TryTake(string accountId, out string credential)
+        internal bool TryTake(string accountId, out CapturedAdmission captured)
         {
             lock (gate)
             {
-                return byAccount.Remove(accountId, out credential!);
+                return byAccount.Remove(accountId, out captured!);
             }
         }
     }
+
+    private readonly record struct CapturedAdmission(string Credential, string LoginName);
 
     internal void Start()
     {
@@ -427,6 +436,7 @@ internal sealed class FullGraphComposition : IAsyncDisposable
         }
 
         disposed = true;
+        liveEleven.Dispose();
         pacing.Dispose();
         sessions.Dispose();
         // Closing the carrier first releases the blocking AcceptAsync call in
@@ -584,20 +594,33 @@ internal sealed class FullGraphComposition : IAsyncDisposable
                         else
                         {
                             var connectionId = handshakeEvent.Id.Value.ToString(CultureInfo.InvariantCulture);
-                            if (capture.TryTake(principal.Value, out var admissionCredential)
-                                && !TryAdmitLiveWebsocketClient(
+                            var admitted = true;
+                            if (capture.TryTake(principal.Value, out var capturedAdmission))
+                            {
+                                if (!TryAdmitLiveWebsocketClient(
                                     admission,
                                     ProductionRoomId,
                                     connectionId,
-                                    admissionCredential,
-                                    out _))
-                            {
-                                _ = transport.TrySend(new ConnectionCommand.Close(
-                                    handshakeEvent.Id,
-                                    handshakeEvent.Epoch,
-                                    ConnectionCloseReason.PolicyReject));
+                                    capturedAdmission.Credential,
+                                    out var binding))
+                                {
+                                    admitted = false;
+                                    _ = transport.TrySend(new ConnectionCommand.Close(
+                                        handshakeEvent.Id,
+                                        handshakeEvent.Epoch,
+                                        ConnectionCloseReason.PolicyReject));
+                                }
+                                else
+                                {
+                                    liveEleven.OnAdmitted(
+                                        binding,
+                                        connectionId,
+                                        handshakeEvent.Envelope.Header.SessionId,
+                                        capturedAdmission.LoginName);
+                                }
                             }
-                            else
+
+                            if (admitted)
                             {
                                 _ = sessions.HandleAuthenticatedConnectionEvent(
                                     in handshakeEvent,
