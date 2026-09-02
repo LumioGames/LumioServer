@@ -22,9 +22,16 @@ pub enum RecvError {
 }
 
 /// Sending end of a bounded channel.
-#[derive(Clone)]
 pub struct Sender<T> {
     inner: mpsc::SyncSender<T>,
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 /// Receiving end of a bounded channel.
@@ -129,5 +136,15 @@ mod tests {
         let (tx, rx) = bounded_channel::<u8>(1);
         drop(tx);
         assert_eq!(rx.recv(), Err(RecvError::Closed));
+    }
+
+    #[test]
+    fn sender_clones_without_clone_payload() {
+        struct NoClone;
+        let (tx, rx) = bounded_channel::<NoClone>(1);
+        let tx2 = tx.clone();
+        assert!(tx2.try_send(NoClone).is_ok());
+        drop(tx);
+        assert!(rx.recv().is_ok());
     }
 }

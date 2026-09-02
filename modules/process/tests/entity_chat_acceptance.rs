@@ -7,6 +7,11 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
+fn game_root() -> String {
+    std::env::var("LUMIO_GAME_ROOT")
+        .unwrap_or_else(|_| r"C:\Work\LumioGames\wt-game\r-00354-live11".to_owned())
+}
+
 fn run_round(bin: &Path, out_dir: &Path) -> Value {
     let _ = std::fs::remove_dir_all(out_dir);
     std::fs::create_dir_all(out_dir).expect("round dir");
@@ -15,8 +20,9 @@ fn run_round(bin: &Path, out_dir: &Path) -> Value {
         .arg(out_dir)
         .env(
             "DOTNET_ROOT",
-            std::env::var("DOTNET_ROOT").unwrap_or_default(),
+            std::env::var("DOTNET_ROOT").unwrap_or_else(|_| r"C:\Users\g923\.dotnet".to_owned()),
         )
+        .env("LUMIO_GAME_ROOT", game_root())
         .status()
         .expect("spawn lumio-entity-chat-replay");
     let evidence_path = out_dir.join("evidence.json");
@@ -32,23 +38,91 @@ fn run_round(bin: &Path, out_dir: &Path) -> Value {
     evidence
 }
 
-fn oracle_js() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/verify_rust_evidence.mjs")
+fn game_oracle_js() -> PathBuf {
+    PathBuf::from(game_root()).join("integration/entity-chat/verify-evidence.mjs")
 }
 
 fn run_oracle(dir: &Path) {
     let output = Command::new("node")
-        .arg(oracle_js())
+        .arg(game_oracle_js())
         .arg("--dir")
         .arg(dir)
         .output()
-        .expect("spawn rust evidence oracle");
+        .expect("spawn Game verify-evidence.mjs");
     assert!(
         output.status.success(),
-        "rust evidence oracle failed for {}: {}",
+        "Game 1169a66 verify-evidence.mjs failed for {}: {}",
         dir.display(),
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+fn assert_identical_suite_stamps(evidence: &Value) {
+    let empty = json!({});
+    let pw = evidence.get("playwright").unwrap_or(&empty);
+    assert_eq!(
+        pw.get("ran"),
+        Some(&Value::Bool(true)),
+        "S3 requires a real Playwright run"
+    );
+    let browser = pw.get("browser").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        browser.to_ascii_lowercase().contains("chromium")
+            || browser.to_ascii_lowercase().contains("firefox")
+            || browser.to_ascii_lowercase().contains("webkit"),
+        "S3 browser must match chromium|firefox|webkit, got {browser:?}"
+    );
+    assert_eq!(pw.get("receivedFromNetwork"), Some(&Value::Bool(true)));
+    assert_ne!(pw.get("injected"), Some(&Value::Bool(true)));
+    let s3 = evidence.pointer("/scenarios/3").unwrap_or(&empty);
+    assert_eq!(s3.get("playwrightRan"), Some(&Value::Bool(true)));
+
+    let s6 = evidence.pointer("/scenarios/6").unwrap_or(&empty);
+    assert_eq!(s6.get("timerManagerInvoked"), Some(&Value::Bool(true)));
+    let tick_source = s6
+        .get("tickSource")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            evidence
+                .pointer("/traces/chat/tickSource")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("");
+    let tick_l = tick_source.to_ascii_lowercase();
+    assert!(
+        !tick_l.contains("for-loop") && !tick_l.contains("forloop"),
+        "S6 tickSource must not be a for-loop, got {tick_source:?}"
+    );
+    assert!(
+        tick_l.contains("host-timer")
+            || tick_l.contains("itimer")
+            || tick_source.contains("test-control/tick"),
+        "S6 tickSource must match host-timer|itimer|test-control/tick, got {tick_source:?}"
+    );
+    assert_eq!(
+        s6.get("cadence").and_then(Value::as_str),
+        Some("host-timer")
+    );
+
+    let s7 = evidence.pointer("/scenarios/7").unwrap_or(&empty);
+    let source = s7
+        .get("snapshotSource")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        source == "lumio-entity-chat-replay" || source == "live-replay",
+        "S7 snapshotSource must be lumio-entity-chat-replay or live-replay, got {source:?}"
+    );
+    assert_ne!(source, "live-rust-host");
+    assert_ne!(source, "live-mvp-host");
+    assert!(
+        s7.get("windowBeforeSnapshot")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0
+    );
+    assert_eq!(s7.get("historyCountMax").and_then(Value::as_i64), Some(0));
+    assert_eq!(s7.get("restoredWindow").and_then(Value::as_u64), Some(0));
 }
 
 fn is_launcher_loop_index(id: &str) -> bool {
@@ -207,20 +281,19 @@ fn assert_round_shape(round_dir: &Path, evidence: &Value) {
     assert!(!is_launcher_loop_index(nent));
 }
 
-#[test]
-fn replays_the_r00354_suite_twice_on_the_rust_host() {
-    let bin = env!("CARGO_BIN_EXE_lumio-entity-chat-replay");
-    let out_dir = std::env::temp_dir().join("lumio-r-00359-entity-chat-evidence");
-    let _ = std::fs::remove_dir_all(&out_dir);
-    std::fs::create_dir_all(&out_dir).expect("out dir");
+fn produce_two_round_pack(bin: &Path, out_dir: &Path) {
+    let _ = std::fs::remove_dir_all(out_dir);
+    std::fs::create_dir_all(out_dir).expect("out dir");
 
     let round1_dir = out_dir.join("round-1");
     let round2_dir = out_dir.join("round-2");
-    let round1 = run_round(Path::new(bin), &round1_dir);
-    let round2 = run_round(Path::new(bin), &round2_dir);
+    let round1 = run_round(bin, &round1_dir);
+    let round2 = run_round(bin, &round2_dir);
 
     assert_round_shape(&round1_dir, &round1);
     assert_round_shape(&round2_dir, &round2);
+    assert_identical_suite_stamps(&round1);
+    assert_identical_suite_stamps(&round2);
 
     let order1: Vec<String> = round1["scenarios"]["11"]["eventOrder"]
         .as_array()
@@ -260,5 +333,18 @@ fn replays_the_r00354_suite_twice_on_the_rust_host() {
     )
     .expect("write manifest");
 
-    run_oracle(&out_dir);
+    run_oracle(out_dir);
+}
+
+#[test]
+fn replays_the_r00354_suite_twice_on_the_rust_host() {
+    let bin = Path::new(env!("CARGO_BIN_EXE_lumio-entity-chat-replay"));
+    produce_two_round_pack(
+        bin,
+        &std::env::temp_dir().join("lumio-r-00359-entity-chat-evidence"),
+    );
+    produce_two_round_pack(
+        bin,
+        &std::env::temp_dir().join("lumio-r-00359-entity-chat-evidence-b"),
+    );
 }
