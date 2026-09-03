@@ -114,7 +114,6 @@ impl HostTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::HostClock;
     use crate::kernel::KernelError;
     use crate::SharedClock;
 

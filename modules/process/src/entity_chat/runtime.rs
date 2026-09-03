@@ -62,6 +62,16 @@ impl RuntimeAdmit {
             binding: None,
         }
     }
+
+    /// C-2′ `account_already_online`: live entity exists; host must supersede then Rebind.
+    #[must_use]
+    pub fn already_online(binding: RuntimeBinding) -> Self {
+        Self {
+            accepted: false,
+            code: Some("account_already_online".to_owned()),
+            binding: Some(binding),
+        }
+    }
 }
 
 /// Attribute query forwarded to Runtime.

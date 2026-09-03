@@ -3,23 +3,24 @@
 use std::collections::HashMap;
 use std::thread;
 use std::thread::ThreadId;
+use std::time::Duration;
 
 use lumio_host_runtime::{
-    bounded_channel, spawn_supervised, HostClock, KernelHandle, KernelTimer, Sender, SharedClock,
-    SupervisedTask, TimerMode,
+    bounded_channel, spawn_supervised, HostClock, KernelHandle, KernelTimer, RecvError, Sender,
+    SharedClock, SupervisedTask, TimerMode,
 };
+use serde_json::{json, Map, Value};
 
 use super::admission::{is_bot_namespace, verify_admission, AdmissionPayload};
-use super::envelope::{
-    connection_superseded_json, net_entity_id_to_u64, normalize_net_entity_id, InputCommand,
-};
+use super::envelope::{connection_superseded_json, normalize_net_entity_id, InputCommand};
+use super::log::NdjsonLog;
 use super::runtime::BoundEntityKind;
 use super::runtime::{
     AttributeQueryScope, ChatOpKind, ChatOperation, PersistRecord, QueryResult, RebindMode,
     RuntimeAdmit, RuntimeBinding, RuntimeQuery, RuntimeSurface, RuntimeTick,
 };
 use super::wire::{RoomListener, WireEvent, WireSender};
-use super::MAX_CHAT_INPUTS_PER_TICK;
+use super::{MAX_CHAT_INPUTS_PER_TICK, OWNER_PUMP_INTERVAL_MS};
 
 /// WallClock expire dispatch id (NativeCore slot).
 pub const DISPATCH_EXPIRE: u32 = 1;
@@ -151,11 +152,12 @@ struct Inner {
     runtime: Box<dyn RuntimeSurface>,
     kernel: Box<dyn KernelTimer>,
     sessions: HashMap<String, Session>,
-    account_sessions: HashMap<String, String>,
     expire_watch: HashMap<KernelHandle, String>,
     pending_egress: HashMap<String, Vec<WireSender>>,
-    tick_id: u64,
+    kernel_frame: u64,
     wire_chat_pending: u64,
+    log: NdjsonLog,
+    last_applied_tick: u64,
 }
 
 enum OwnerWork {
@@ -172,6 +174,7 @@ pub struct EntityChatHost {
     owner_id: ThreadId,
     listen_uri: String,
     clock: SharedClock,
+    log: NdjsonLog,
 }
 
 impl EntityChatHost {
@@ -200,6 +203,8 @@ impl EntityChatHost {
             }
         });
         let owner_clock = clock.clone();
+        let owner_log = NdjsonLog::buffer();
+        let host_log = owner_log.clone();
         let owner = spawn_supervised("lumio-entity-chat-owner", move |_cancel| {
             let _ = id_tx.send(thread::current().id());
             let mut inner = Inner {
@@ -211,11 +216,12 @@ impl EntityChatHost {
                 runtime,
                 kernel,
                 sessions: HashMap::new(),
-                account_sessions: HashMap::new(),
                 expire_watch: HashMap::new(),
                 pending_egress: HashMap::new(),
-                tick_id: 0,
+                kernel_frame: 0,
                 wire_chat_pending: 0,
+                log: owner_log,
+                last_applied_tick: 0,
             };
             if inner
                 .kernel
@@ -225,10 +231,12 @@ impl EntityChatHost {
                 return;
             }
             loop {
-                match rx.recv() {
+                inner.drive_wall();
+                match rx.recv_timeout(Duration::from_millis(OWNER_PUMP_INTERVAL_MS)) {
                     Ok(OwnerWork::Run(work)) => work(&mut inner),
                     Ok(OwnerWork::Wire(event)) => inner.on_wire(event),
-                    Err(_) => break,
+                    Err(RecvError::Empty) => {}
+                    Err(RecvError::Closed) => break,
                 }
             }
         });
@@ -241,6 +249,7 @@ impl EntityChatHost {
             owner_id,
             listen_uri,
             clock,
+            log: host_log,
         }
     }
 
@@ -313,6 +322,12 @@ impl EntityChatHost {
     #[must_use]
     pub fn clock(&self) -> SharedClock {
         self.clock.clone()
+    }
+
+    /// Structured JSON lines emitted by this host (tests / oracle).
+    #[must_use]
+    pub fn log_lines(&self) -> Vec<String> {
+        self.log.lines()
     }
 
     /// Decodes a frozen InputCommand (chat.input) envelope, then queues ChatInput.
@@ -455,12 +470,12 @@ impl Inner {
             return RoomAdmitResult::reject("invalid_request");
         }
         let kind = super::runtime::entity_type_of(&payload.login_name, payload.bot_tool_context);
-        if let Some(old_id) = self.account_sessions.get(&payload.account_id).cloned() {
-            return self.takeover(room_id, connection_id, payload, kind, &old_id);
-        }
         let admitted = self
             .runtime
             .admit(connection_id, &payload.account_id, room_id, kind);
+        if admitted.code.as_deref() == Some("account_already_online") {
+            return self.takeover(room_id, connection_id, payload, admitted);
+        }
         if admitted.accepted {
             return self.commit_session(connection_id, payload, admitted, false, false);
         }
@@ -490,32 +505,70 @@ impl Inner {
         room_id: &str,
         connection_id: &str,
         payload: &AdmissionPayload,
-        _kind: BoundEntityKind,
-        old_id: &str,
+        already: RuntimeAdmit,
     ) -> RoomAdmitResult {
-        if let Some(old) = self.sessions.get(old_id) {
-            if old.room_id != room_id {
-                return RoomAdmitResult::reject("invalid_request");
-            }
+        let Some(existing) = already.binding.clone() else {
+            self.log_event(
+                "admit",
+                json_map(&[
+                    ("reason", json!("account_already_online_missing_binding")),
+                    ("accepted", json!(false)),
+                ]),
+            );
+            return RoomAdmitResult::reject("account_already_online");
+        };
+        if existing.room_id != room_id {
+            return RoomAdmitResult::reject("invalid_request");
         }
+        let old_id = self
+            .sessions
+            .iter()
+            .find(|(_, session)| session.net_entity_id == existing.net_entity_id)
+            .map(|(id, _)| id.clone());
         let rebound = self.runtime.rebind(
             connection_id,
             &payload.account_id,
             room_id,
             RebindMode::Takeover,
         );
-        let Some(binding) = rebound.binding.clone() else {
+        if !rebound.accepted {
+            self.log_event(
+                "admit",
+                json_map(&[
+                    ("reason", json!("rebind_failed")),
+                    ("accepted", json!(false)),
+                    ("netEntityId", json!(existing.net_entity_id)),
+                ]),
+            );
             return RoomAdmitResult::reject(rebound.code.as_deref().unwrap_or("invalid_request"));
+        }
+        let Some(binding) = rebound.binding.clone() else {
+            return RoomAdmitResult::reject("invalid_request");
         };
         let new_generation = binding.connection_generation;
-        let net_u64 = net_entity_id_to_u64(&binding.net_entity_id).unwrap_or(0);
-        if let Some(old) = self.sessions.remove(old_id) {
-            for egress in &old.egresses {
-                let _ = egress.send_text(connection_superseded_json(net_u64, new_generation));
-                let _ = egress.close();
+        if let Some(old_id) = old_id {
+            if let Some(old) = self.sessions.remove(&old_id) {
+                let frame = connection_superseded_json(&binding.net_entity_id, new_generation);
+                for egress in &old.egresses {
+                    let _ = egress.try_send_text(frame.clone());
+                    let _ = egress.close();
+                }
+                self.log_event(
+                    "superseded",
+                    json_map(&[
+                        ("netEntityId", json!(binding.net_entity_id.clone())),
+                        ("reason", json!("account_already_online")),
+                    ]),
+                );
             }
         }
-        self.account_sessions.remove(&payload.account_id);
+        self.log_event(
+            "rebind",
+            json_map(&[
+                ("netEntityId", json!(binding.net_entity_id.clone())),
+                ("previousNetEntityId", json!(existing.net_entity_id)),
+            ]),
+        );
         self.commit_session(connection_id, payload, rebound, false, true)
     }
 
@@ -554,10 +607,31 @@ impl Inner {
             egresses,
         };
         let binding = ConnectionBinding::from_runtime(runtime_binding, session_id);
-        self.account_sessions
-            .insert(payload.account_id.clone(), connection_id.to_owned());
+        let snapshot =
+            self.runtime
+                .build_full_snapshot(&binding.room_id, self.last_applied_tick, 0);
+        if snapshot.is_empty() {
+            let _ = self.runtime.disconnect(connection_id);
+            self.log_event(
+                "admit",
+                json_map(&[
+                    ("reason", json!("runtime_failure")),
+                    ("accepted", json!(false)),
+                    ("netEntityId", json!(binding.net_entity_id)),
+                ]),
+            );
+            return RoomAdmitResult::reject("runtime_failure");
+        }
         self.sessions.insert(connection_id.to_owned(), session);
-        self.send_full_snapshot(connection_id);
+        self.send_snapshot_bytes(connection_id, &snapshot);
+        self.log_event(
+            "admit",
+            json_map(&[
+                ("accepted", json!(true)),
+                ("netEntityId", json!(binding.net_entity_id.clone())),
+                ("entityType", json!(binding.entity_type.as_str())),
+            ]),
+        );
         RoomAdmitResult::ok(binding, reconnected, takeover)
     }
 
@@ -565,7 +639,6 @@ impl Inner {
         let Some(session) = self.sessions.remove(connection_id) else {
             return false;
         };
-        self.account_sessions.remove(&session.account_id);
         for egress in &session.egresses {
             let _ = egress.close();
         }
@@ -608,6 +681,14 @@ impl Inner {
             }
             if let Some(net_entity_id) = self.expire_watch.remove(&event.handle) {
                 let _ = self.runtime.expire(&net_entity_id);
+                self.log_event(
+                    "expire",
+                    json_map(&[
+                        ("netEntityId", json!(net_entity_id)),
+                        ("reason", json!("kernel")),
+                        ("source", json!("native-kernel/wallClock")),
+                    ]),
+                );
             }
         }
     }
@@ -626,55 +707,93 @@ impl Inner {
         if self.wire_chat_pending > MAX_CHAT_INPUTS_PER_TICK as u64 {
             return RuntimeTick::failed("runtime_failure");
         }
-        self.tick_id = self.tick_id.saturating_add(1);
-        let Ok(fired) = self.kernel.advance_tick_frame(self.tick_id) else {
+        self.kernel_frame = self.kernel_frame.saturating_add(1);
+        let Ok(fired) = self.kernel.advance_tick_frame(self.kernel_frame) else {
             return RuntimeTick::failed("runtime_failure");
         };
         if !fired.iter().any(|row| row.dispatch_id == DISPATCH_TICK) {
             return RuntimeTick::failed("runtime_failure");
         }
-        let tick = self.runtime.run_tick(room_id, self.tick_id);
+        let tick = self.runtime.run_tick(room_id, 0);
         if !tick.ok {
             return tick;
         }
+        self.last_applied_tick = tick.applied_tick;
         self.wire_chat_pending = 0;
         let frames = self
             .runtime
             .build_delta(room_id, tick.applied_tick, tick.revision);
         self.broadcast(room_id, &frames);
+        self.log_event(
+            "tick",
+            json_map(&[
+                ("appliedTick", json!(tick.applied_tick)),
+                ("tickSource", json!("native-kernel/tickFrame")),
+            ]),
+        );
         tick
     }
 
     fn broadcast(&mut self, room_id: &str, frames: &[Vec<u8>]) {
-        for session in self.sessions.values_mut() {
+        let texts: Option<Vec<String>> = frames.iter().map(|frame| utf8_frame(frame)).collect();
+        let Some(texts) = texts else {
+            self.log_event("event", json_map(&[("reason", json!("invalid_utf8"))]));
+            return;
+        };
+        let mut drop_ids = Vec::new();
+        for (connection_id, session) in &mut self.sessions {
             if session.room_id != room_id {
                 continue;
             }
+            let mut backpressure = false;
             session.egresses.retain(|egress| {
-                frames
-                    .iter()
-                    .all(|frame| egress.send_text(String::from_utf8_lossy(frame).into_owned()))
+                for text in &texts {
+                    match egress.try_send_text(text.clone()) {
+                        Ok(()) => {}
+                        Err(true) => {
+                            backpressure = true;
+                            let _ = egress.close();
+                            return false;
+                        }
+                        Err(false) => return false,
+                    }
+                }
+                true
             });
+            if backpressure {
+                drop_ids.push(connection_id.clone());
+            }
+        }
+        for connection_id in drop_ids {
+            self.log_event(
+                "event",
+                json_map(&[
+                    ("reason", json!("backpressure")),
+                    ("connectionId", json!(connection_id)),
+                ]),
+            );
+            let _ = self.disconnect(&connection_id);
         }
     }
 
-    fn send_full_snapshot(&mut self, connection_id: &str) {
+    fn send_snapshot_bytes(&mut self, connection_id: &str, bytes: &[u8]) {
+        let Some(text) = utf8_frame(bytes) else {
+            self.log_event("snapshot", json_map(&[("reason", json!("invalid_utf8"))]));
+            return;
+        };
         let Some(session) = self.sessions.get(connection_id) else {
             return;
         };
-        let room_id = session.room_id.clone();
-        let egresses = session.egresses.clone();
-        if egresses.is_empty() {
-            return;
+        for egress in &session.egresses {
+            let _ = egress.try_send_text(text.clone());
         }
-        let bytes = self.runtime.build_full_snapshot(&room_id, self.tick_id, 0);
-        if bytes.is_empty() {
-            return;
-        }
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        for egress in &egresses {
-            let _ = egress.send_text(text.clone());
-        }
+        self.log_event(
+            "snapshot",
+            json_map(&[
+                ("netEntityId", json!(session.net_entity_id.clone())),
+                ("appliedTick", json!(self.last_applied_tick)),
+            ]),
+        );
     }
 
     fn send_full_snapshot_to(&mut self, connection_id: &str, egress: &WireSender) {
@@ -682,11 +801,15 @@ impl Inner {
             return;
         };
         let room_id = session.room_id.clone();
-        let bytes = self.runtime.build_full_snapshot(&room_id, self.tick_id, 0);
+        let bytes = self
+            .runtime
+            .build_full_snapshot(&room_id, self.last_applied_tick, 0);
         if bytes.is_empty() {
             return;
         }
-        let _ = egress.send_text(String::from_utf8_lossy(&bytes).into_owned());
+        if let Some(text) = utf8_frame(&bytes) {
+            let _ = egress.try_send_text(text);
+        }
     }
 
     fn on_wire(&mut self, event: WireEvent) {
@@ -721,6 +844,15 @@ impl Inner {
             WireEvent::Closed { .. } => {
                 // One socket close must not drop other c-browser observers (Playwright + harness).
             }
+            WireEvent::WriteFailed { connection_id } => {
+                self.log_event(
+                    "event",
+                    json_map(&[
+                        ("reason", json!("write_failed")),
+                        ("connectionId", json!(connection_id)),
+                    ]),
+                );
+            }
         }
     }
 
@@ -739,15 +871,7 @@ impl Inner {
         net_entity_id: &str,
     ) -> Option<EntityResolution> {
         let id = normalize_net_entity_id(net_entity_id);
-        let runtime = self
-            .runtime
-            .resolve_by_net_entity_id(room_id, &id)
-            .or_else(|| {
-                self.runtime
-                    .list_bindings(room_id)
-                    .into_iter()
-                    .find(|row| normalize_net_entity_id(&row.net_entity_id) == id)
-            })?;
+        let runtime = self.runtime.resolve_by_net_entity_id(room_id, &id)?;
         Some(EntityResolution {
             net_entity_id: runtime.net_entity_id,
             room_id: runtime.room_id,
@@ -807,6 +931,22 @@ impl Inner {
         rows.sort_by(|left, right| left.net_entity_id.cmp(&right.net_entity_id));
         rows
     }
+
+    fn log_event(&self, kind: &str, extra: Map<String, Value>) {
+        self.log.emit(kind, self.last_applied_tick, extra);
+    }
+}
+
+fn json_map(pairs: &[(&str, Value)]) -> Map<String, Value> {
+    let mut map = Map::new();
+    for (key, value) in pairs {
+        map.insert((*key).to_owned(), value.clone());
+    }
+    map
+}
+
+fn utf8_frame(bytes: &[u8]) -> Option<String> {
+    String::from_utf8(bytes.to_vec()).ok()
 }
 
 fn parse_input_command_json(text: &str) -> Result<InputCommand, ()> {

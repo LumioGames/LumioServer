@@ -107,9 +107,9 @@ impl InputCommand {
     }
 }
 
-/// C-1 ConnectionSuperseded text frame.
+/// C-1 ConnectionSuperseded text frame. `netEntityId` is the Runtime 32-hex identity.
 #[must_use]
-pub fn connection_superseded_json(net_entity_id: u64, new_generation: u64) -> String {
+pub fn connection_superseded_json(net_entity_id: &str, new_generation: u64) -> String {
     serde_json::json!({
         "messageType": "ConnectionSuperseded",
         "reasonCode": "connection_superseded",
@@ -140,12 +140,6 @@ pub fn normalize_net_entity_id(net_entity_id: &str) -> String {
         return format!("{value:032x}");
     }
     lower
-}
-
-/// Runtime issues 32-char lowercase hex of a u64 sequence.
-#[must_use]
-pub fn net_entity_id_to_u64(net_entity_id: &str) -> Option<u64> {
-    u64::from_str_radix(&normalize_net_entity_id(net_entity_id), 16).ok()
 }
 
 fn is_lower_sha256(value: &str) -> bool {

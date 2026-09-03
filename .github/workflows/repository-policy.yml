@@ -64,7 +64,11 @@ jobs:
 
   cargo-entity-chat:
     name: Cargo entity-chat acceptance
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain

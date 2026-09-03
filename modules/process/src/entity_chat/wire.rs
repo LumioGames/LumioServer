@@ -23,14 +23,23 @@ pub enum WireOut {
 }
 
 impl WireSender {
+    /// Non-blocking text send. `Err(true)` means the bounded queue is full.
+    pub fn try_send_text(&self, text: String) -> Result<(), bool> {
+        match self.inner.try_send(WireOut::Text(text)) {
+            Ok(()) => Ok(()),
+            Err(lumio_host_runtime::SendError::Full(_)) => Err(true),
+            Err(lumio_host_runtime::SendError::Closed(_)) => Err(false),
+        }
+    }
+
     #[must_use]
     pub fn send_text(&self, text: String) -> bool {
-        self.inner.send(WireOut::Text(text)).is_ok()
+        self.try_send_text(text).is_ok()
     }
 
     #[must_use]
     pub fn close(&self) -> bool {
-        self.inner.send(WireOut::Close).is_ok()
+        self.inner.try_send(WireOut::Close).is_ok()
     }
 }
 
@@ -45,6 +54,9 @@ pub enum WireEvent {
         text: String,
     },
     Closed {
+        connection_id: String,
+    },
+    WriteFailed {
         connection_id: String,
     },
 }
@@ -118,7 +130,7 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
         Some(id) => id,
         None => return,
     };
-    let (out_tx, out_rx) = bounded_channel(64);
+    let (out_tx, out_rx) = bounded_channel(super::EGRESS_QUEUE_PER_CONNECTION);
     let egress = WireSender { inner: out_tx };
     if event_tx
         .send(WireEvent::Attached {
@@ -139,6 +151,9 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
         match out_rx.try_recv() {
             Ok(WireOut::Text(text)) => {
                 if ws.send(Message::Text(text.into())).is_err() {
+                    let _ = event_tx.send(WireEvent::WriteFailed {
+                        connection_id: connection_id.clone(),
+                    });
                     break;
                 }
             }

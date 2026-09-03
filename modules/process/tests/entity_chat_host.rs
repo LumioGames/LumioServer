@@ -3,7 +3,7 @@
 mod common;
 
 use common::{SharedRuntime, TestKernel};
-use lumio_host_runtime::{HostClock, SharedClock};
+use lumio_host_runtime::SharedClock;
 use lumio_server_process::entity_chat::{
     generate_keys, issue_admission_credential, AttributeQueryOutcome, AttributeQueryRequest,
     AttributeQueryScope, BoundEntityKind, ChatOpKind, EntityChatHost, InputCommand, QueryResult,
@@ -421,6 +421,139 @@ fn claimed_mark_client_replica_is_contract_unauthorized() {
         AttributeQueryOutcome::Unauthorized,
         "claim-scoped claimedMark without a claim is contract Unauthorized, not {:?}",
         unauthorized.outcome
+    );
+}
+
+#[test]
+fn owner_loop_expire_fires_without_harness_drive_kernel() {
+    let clock = SharedClock::test();
+    let runtime = SharedRuntime::new();
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        clock.clone(),
+        Box::new(runtime.clone()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    let _ = host.admit(
+        "room-main".to_owned(),
+        "c-bot01".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    let entity_a = host.must_self("c-bot01").net_entity_id;
+    assert!(host.disconnect("c-bot01".to_owned()));
+    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while runtime.lock().expire_calls().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        runtime
+            .lock()
+            .expire_calls()
+            .iter()
+            .any(|id| id == &entity_a),
+        "owner loop must pump wallClock and expire without harness drive_kernel"
+    );
+    let lines = host.log_lines();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("\"kind\":\"expire\"")),
+        "expire must be a structured log event, got {lines:?}"
+    );
+}
+
+#[test]
+fn second_live_admit_is_account_already_online_then_superseded_rebind() {
+    let (host, keys) = host_with(SharedRuntime::new());
+    let first = host.admit(
+        "room-main".to_owned(),
+        "c-bot01".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(first.accepted);
+    let entity_a = first.binding.expect("binding").net_entity_id;
+    let mut old =
+        lumio_server_process::entity_chat::RoomClient::connect(&host.listen_uri(), "c-bot01")
+            .expect("old socket");
+    let _ = old.recv_text();
+    let second = host.admit(
+        "room-main".to_owned(),
+        "c-bot01-re".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(
+        second.takeover && second.accepted,
+        "account_already_online must take over, got {second:?}"
+    );
+    let rebound = second.binding.expect("rebind binding");
+    assert_eq!(rebound.net_entity_id, entity_a);
+    let frame = old.recv_text().expect("ConnectionSuperseded");
+    assert!(
+        frame.contains("\"messageType\":\"ConnectionSuperseded\""),
+        "old socket must recv ConnectionSuperseded, got {frame}"
+    );
+    assert!(old.is_closed_after());
+}
+
+#[test]
+fn empty_runtime_full_snapshot_rejects_admit() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().fail_snapshot();
+    let (host, keys) = host_with(runtime);
+    let admit = host.admit(
+        "room-main".to_owned(),
+        "c-bot01".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(
+        !admit.accepted,
+        "Runtime empty FullSnapshot must not admit as accepted, got {admit:?}"
+    );
+}
+
+#[test]
+fn applied_tick_comes_from_runtime_not_host_counter() {
+    let (host, keys) = host_with(SharedRuntime::new());
+    let _ = host.admit(
+        "room-main".to_owned(),
+        "c-bot01".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    let first = host.run_tick("room-main".to_owned());
+    let second = host.run_tick("room-main".to_owned());
+    assert!(first.ok && second.ok);
+    assert_eq!(first.applied_tick, 1);
+    assert_eq!(second.applied_tick, 2);
+}
+
+#[test]
+fn slow_client_is_disconnected_for_backpressure_and_owner_keeps_ticking() {
+    let (host, keys) = host_with(SharedRuntime::new());
+    admit_n(&host, &keys, 1);
+    let mut slow =
+        lumio_server_process::entity_chat::RoomClient::connect(&host.listen_uri(), "c-001")
+            .expect("slow client");
+    let _ = slow.recv_text();
+    for i in 0..80 {
+        let _ = host.admit_chat_input(
+            "c-001".to_owned(),
+            InputCommand::from_chat_text(&format!("flood-{i}")),
+        );
+        let tick = host.run_tick("room-main".to_owned());
+        assert!(
+            tick.ok,
+            "owner Tick must not block on a slow client, got {tick:?} at {i}"
+        );
+    }
+    let lines = host.log_lines();
+    assert!(
+        lines.iter().any(|line| line.contains("backpressure")),
+        "over-limit egress must log reason=backpressure, got {lines:?}"
     );
 }
 

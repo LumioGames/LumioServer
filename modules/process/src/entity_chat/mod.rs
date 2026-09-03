@@ -27,6 +27,7 @@ mod crypto;
 mod discover;
 mod envelope;
 mod host;
+mod log;
 mod runtime;
 mod suite;
 mod wire;
@@ -46,6 +47,7 @@ pub use host::{
     AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution,
     RoomAdmitResult, RoomCensus, DISPATCH_EXPIRE, DISPATCH_TICK,
 };
+pub use log::NdjsonLog;
 pub use runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, ChatOperation,
     PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding, RuntimeQuery,
@@ -63,7 +65,13 @@ pub const BROWSER_NAME: &str = "Browser01";
 pub const TEST_PASSWORD: &str = "123456";
 pub const ADMISSION_KEY_ID: u8 = 1;
 pub const RECONNECT_WINDOW_MS: u64 = 300_000;
+/// Default World Manager instance id (high 64 of NetEntityId). Overridable via `--instance-id`.
+pub const DEFAULT_INSTANCE_ID: u64 = 0x1000_0000_0000_0001;
+/// Owner-loop wallClock pump interval. Tick cadence stays on kernel tickFrame.
+pub const OWNER_PUMP_INTERVAL_MS: u64 = 5;
 pub const INGRESS_QUEUE_PER_CONNECTION: usize = 64;
+/// Per-connection egress bound. Over-limit disconnects with `reason=backpressure`.
+pub const EGRESS_QUEUE_PER_CONNECTION: usize = 64;
 /// Runtime `ChatIngressWorld` default `MaxChangeEntries` is 128; each chat.input
 /// commits two ChatComponent fields, so one `RunTick` can take at most 64 chats.
 pub const MAX_CHAT_INPUTS_PER_TICK: usize = 64;
