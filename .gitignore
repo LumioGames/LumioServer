@@ -15,3 +15,6 @@ node_modules/
 *.suo
 TestResults/
 artifacts/
+
+# CI / local checkout of LumioGameEngine for mvp-host Engine SDK discovery
+.architecture-source/

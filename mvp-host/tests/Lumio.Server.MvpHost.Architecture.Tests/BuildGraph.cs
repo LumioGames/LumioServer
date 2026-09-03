@@ -84,7 +84,7 @@ internal static class BuildGraph
         var projectReferences = doc.Descendants("ProjectReference")
             .Select(e => e.Attribute("Include")?.Value)
             .Where(v => !string.IsNullOrEmpty(v))
-            .Select(v => Path.GetFileNameWithoutExtension(v!.Replace('\\', '/')))
+            .Select(v => ProjectReferenceName(v!))
             .OrderBy(v => v, StringComparer.Ordinal)
             .ToList();
 
@@ -102,6 +102,18 @@ internal static class BuildGraph
             IsProduction: !string.Equals(productionText, "false", StringComparison.OrdinalIgnoreCase),
             ProjectReferences: projectReferences,
             PackageReferences: packageReferences);
+    }
+
+    private static string ProjectReferenceName(string include)
+    {
+        var normalized = include.Replace('\\', '/');
+        if (normalized.Contains("LumioEngineSdkProject", StringComparison.Ordinal)
+            || normalized.Contains("Lumio.Engine.SDK", StringComparison.Ordinal))
+        {
+            return "Lumio.Engine.SDK";
+        }
+
+        return Path.GetFileNameWithoutExtension(normalized);
     }
 
     private static List<string> LoadTraversalGlobs()

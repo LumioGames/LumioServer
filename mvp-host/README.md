@@ -45,8 +45,15 @@ cd mvp-host && bash eng/generate-contracts.sh          # 重拷架构源 .cs 到
 cd mvp-host && bash eng/verify-generated-contracts.sh  # 生成物守护，漂移退出码 32
 ```
 
-`sync` 与 `generate` 需要 `$LUMIO_ARCHITECTURE_ROOT` 指向 `LumioGameEngineArchitecture`
-（可用 `$LUMIO_ARCHITECTURE_REF` 覆盖默认的 `origin/main`）；两条 `verify` 的门禁部分不需要。
+`sync` 与 `generate` 需要 `$LUMIO_ARCHITECTURE_ROOT` 指向 `LumioGameEngine`
+（旧名 `LumioGameEngineArchitecture`；可用 `$LUMIO_ARCHITECTURE_REF` 覆盖默认的 `origin/main`）；
+两条 `verify` 的门禁部分不需要。
+
+`Lumio.Server.MvpHost.App` 还要编译期引用架构源 `engine/managed/Lumio.Engine.SDK`。
+发现顺序由 `Directory.Build.props` 固定：`$LUMIO_ARCHITECTURE_ROOT` → 本仓兄弟目录
+`LumioGameEngine` → 兄弟目录旧名 `LumioGameEngineArchitecture`。找不到即
+`BLOCKED`，不得静默跳过 Engine 类型。CI 把 `LumioGames/LumioGameEngine` 检到
+工作区 `.architecture-source` 并设置 `$LUMIO_ARCHITECTURE_ROOT`。
 **`contract-mirror/` 与 `src/Lumio.Server.MvpHost.GeneratedContracts/Generated/` 都是不得手改的
 镜像/生成物**，只能经上述命令更新，并与各自的哈希清单一起提交。
 
