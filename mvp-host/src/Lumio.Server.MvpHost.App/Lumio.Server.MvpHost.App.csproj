@@ -36,7 +36,12 @@
     <ProjectReference Include="../Lumio.Server.MvpHost.Simulation.Reference/Lumio.Server.MvpHost.Simulation.Reference.csproj" Condition="Exists('../Lumio.Server.MvpHost.Simulation.Reference/Lumio.Server.MvpHost.Simulation.Reference.csproj')" />
     <ProjectReference Include="../Lumio.Server.MvpHost.Session/Lumio.Server.MvpHost.Session.csproj" Condition="Exists('../Lumio.Server.MvpHost.Session/Lumio.Server.MvpHost.Session.csproj')" />
     <ProjectReference Include="../Lumio.Server.MvpHost.Admission/Lumio.Server.MvpHost.Admission.csproj" />
-    <ProjectReference Include="../../../../LumioGameEngineArchitecture/engine/managed/Lumio.Engine.SDK/Lumio.Engine.SDK.csproj" />
+    <ProjectReference Include="$(LumioEngineSdkProject)" Condition="'$(LumioEngineSdkProject)' != ''" />
   </ItemGroup>
+
+  <Target Name="RequireLumioEngineSdk" BeforeTargets="CollectPackageReferences;ResolveProjectReferences;PrepareForBuild">
+    <Error Condition="'$(LumioEngineSdkProject)' == ''"
+           Text="BLOCKED: Lumio.Engine.SDK not found. Set LUMIO_ARCHITECTURE_ROOT to a LumioGameEngine checkout containing engine/managed/Lumio.Engine.SDK/Lumio.Engine.SDK.csproj, or clone LumioGameEngine (legacy LumioGameEngineArchitecture) as a sibling of this repository." />
+  </Target>
 
 </Project>

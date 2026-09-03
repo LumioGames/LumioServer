@@ -53,6 +53,11 @@ public sealed class LayeringTest
                 var target = BuildGraph.ByName(reference);
                 if (target is null)
                 {
+                    if (IsAllowedExtraGraph(project.Name, reference))
+                    {
+                        continue;
+                    }
+
                     violations.Add($"{project.Name} 引用了构建图外的 {reference}");
                     continue;
                 }
@@ -172,6 +177,15 @@ public sealed class LayeringTest
 
         Assert.Empty(offenders);
     }
+
+    /// <summary>
+    /// App 必须引用架构源 <c>Lumio.Engine.SDK</c>；该工程不在本仓构建图内，
+    /// 是唯一特许的构建图外边。路径由 <c>LUMIO_ARCHITECTURE_ROOT</c> / 兄弟仓发现，见
+    /// <see cref="EngineSdkDiscoveryTest"/>。
+    /// </summary>
+    private static bool IsAllowedExtraGraph(string from, string to)
+        => string.Equals(from, "Lumio.Server.MvpHost.App", StringComparison.Ordinal)
+           && string.Equals(to, "Lumio.Engine.SDK", StringComparison.Ordinal);
 
     /// <summary>所有 <c>PackageReference</c> 一律不带 <c>Version</c>——版本只在中央文件声明。</summary>
     [Fact]

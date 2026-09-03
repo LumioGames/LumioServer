@@ -43,6 +43,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # App 编译依赖架构源 Lumio.Engine.SDK。本 job 不得 skip verify-all。
+      - name: Checkout architecture source
+        uses: actions/checkout@v4
+        with:
+          repository: LumioGames/LumioGameEngine
+          path: .architecture-source
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
@@ -52,6 +58,8 @@ jobs:
         run: bash eng/verify-isolation.sh
       - name: Validate mvp-host build and tests
         working-directory: mvp-host
+        env:
+          LUMIO_ARCHITECTURE_ROOT: ${{ github.workspace }}/.architecture-source
         run: bash eng/verify-all.sh
 
   cargo-entity-chat:

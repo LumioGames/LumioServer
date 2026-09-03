@@ -311,13 +311,12 @@ fn suite_discovers_client_bot_host_via_env_or_sibling() {
 fn suite_spawns_lumio_client_bot_host() {
     let bots = fs::read_to_string(process_root().join("src/entity_chat/bots.rs")).expect("bots.rs");
     assert!(
-        bots.contains("Lumio.Client.Bot.Host")
-            && (bots.contains("DOTNET_STARTUP_HOOKS") || bots.contains("dotnet")),
+        bots.contains("Lumio.Client.Bot.Host") && bots.contains("dotnet"),
         "suite must spawn Lumio.Client.Bot.Host as a child process"
     );
     assert!(
-        bots.contains("ClientTimerManager"),
-        "spawned Bot.Host must drain ClientTimerManager, not a second timer"
+        bots.contains("--log-dir") || bots.contains("log_dir"),
+        "spawned Bot.Host evidence must come from its log directory"
     );
 }
 
@@ -370,9 +369,6 @@ fn suite_chat_burst_does_not_host_admit_bot_utterances() {
 
 #[test]
 fn bot_host_must_not_exit_or_dispose_sockets_before_room_observes_chat_events() {
-    let hook =
-        fs::read_to_string(process_root().join("src/entity_chat/bot_startup_hook/StartupHook.cs"))
-            .expect("StartupHook.cs");
     let bots = fs::read_to_string(process_root().join("src/entity_chat/bots.rs")).expect("bots.rs");
     let suite =
         fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
@@ -382,31 +378,8 @@ fn bot_host_must_not_exit_or_dispose_sockets_before_room_observes_chat_events() 
         .next()
         .expect("production bots.rs");
 
-    let run_start = hook
-        .find("private static int Run(")
-        .expect("StartupHook.Run");
-    let run_end = hook
-        .find("private static void SendText")
-        .expect("StartupHook.Run end");
-    let run = &hook[run_start..run_end];
-    let write_trace = run
-        .find("WriteTrace(spec, invoked && sent == n")
-        .expect("success path writes timer-trace");
     assert!(
-        run[write_trace..].contains("ReleasePath") && run[write_trace..].contains("File.Exists"),
-        "after timer-trace, Bot.Host must wait for a suite ReleasePath before returning to Environment.Exit / finally dispose"
-    );
-    assert!(
-        !run[write_trace..].contains("Thread.Sleep(400)"),
-        "must not treat Sleep(400) after timer-trace as SUCCESS; hold is suite/Room observation"
-    );
-    assert!(
-        hook.contains("public string ReleasePath"),
-        "fleet spec must carry ReleasePath so the suite can release the held sockets"
-    );
-
-    assert!(
-        production_bots.contains("releasePath")
+        (production_bots.contains("release_path") || production_bots.contains("releasePath"))
             && (production_bots.contains("fn release")
                 || production_bots.contains("fn release_mut")),
         "bots.rs must keep Lumio.Client.Bot.Host alive and expose an explicit suite release"
@@ -433,15 +406,11 @@ fn generated_hook_build_isolates_from_parent_directory_build_props() {
         .next()
         .expect("production bots.rs");
     assert!(
-        production.contains("write_hook_isolation_files")
-            && production.contains("Directory.Build.props")
-            && production.contains("TreatWarningsAsErrors")
-            && production.contains(">false<"),
-        "generated Bot.Host hook must write isolating Directory.Build.props with TreatWarningsAsErrors false"
-    );
-    assert!(
-        production.contains("hook_compile_failure_text") || production.contains("output.stdout"),
-        "hook compile BLOCKED text must include dotnet stdout, not only empty stderr"
+        !production.contains("write_hook_isolation_files")
+            && !production.contains("BotHook.csproj")
+            && !production.contains("Lumio.EntityChat.BotStartupHook")
+            && !production.contains("TreatWarningsAsErrors"),
+        "generated Bot.Host hook csproj / isolation props must be deleted"
     );
 }
 
@@ -456,5 +425,141 @@ fn owned_sources_have_no_hardcoded_dev_machine_paths() {
     assert!(
         hits.is_empty(),
         "hardcoded C:/Work or C:/Users paths remain in {hits:?}"
+    );
+}
+
+fn collect_cs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_cs_files(&path, out);
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cs"))
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn banned_startup_hooks_token() -> &'static str {
+    concat!("DOTNET_STARTUP", "_HOOKS")
+}
+
+fn banned_bot_hook_dir_token() -> &'static str {
+    concat!("bot_startup", "_hook")
+}
+
+fn banned_load_library_token() -> &'static str {
+    concat!("LoadLibrary", "W")
+}
+
+fn scan_banned_tokens(dir: &Path, banned: &[&str], hits: &mut Vec<String>) {
+    let mut files = Vec::new();
+    collect_text_files(dir, &mut files);
+    for path in files {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for token in banned {
+            if text.contains(token) {
+                hits.push(format!("{}:{token}", path.display()));
+            }
+        }
+    }
+}
+
+#[test]
+fn process_src_has_no_csharp_files_or_injected_hook_dir() {
+    let src = process_root().join("src");
+    let mut csharp = Vec::new();
+    collect_cs_files(&src, &mut csharp);
+    assert!(
+        csharp.is_empty(),
+        "modules/process/src must not contain .cs files: {csharp:?}"
+    );
+    let hook_dir = process_root()
+        .join("src/entity_chat")
+        .join(banned_bot_hook_dir_token());
+    assert!(
+        !hook_dir.exists(),
+        "startup hook directory must be deleted: {}",
+        hook_dir.display()
+    );
+}
+
+#[test]
+fn process_entity_chat_has_no_startup_hook_injection_tokens() {
+    let banned = [banned_startup_hooks_token(), banned_bot_hook_dir_token()];
+    let mut hits = Vec::new();
+    scan_banned_tokens(&process_root().join("src"), &banned, &mut hits);
+    scan_banned_tokens(&process_root().join("tests"), &banned, &mut hits);
+    assert!(
+        hits.is_empty(),
+        "startup-hook injection tokens still present: {hits:?}"
+    );
+}
+
+#[test]
+fn entity_chat_sources_have_no_self_written_loadlibraryw() {
+    let banned = [banned_load_library_token()];
+    let mut hits = Vec::new();
+    scan_banned_tokens(&process_root().join("src/entity_chat"), &banned, &mut hits);
+    scan_banned_tokens(&process_root().join("tests"), &banned, &mut hits);
+    assert!(
+        hits.is_empty(),
+        "self-written ABI loader token remains in entity-chat sources: {hits:?}"
+    );
+}
+
+#[test]
+fn rust_second_oracle_verify_rust_evidence_is_removed() {
+    let path = process_root().join("tests/verify_rust_evidence.mjs");
+    assert!(
+        !path.exists(),
+        "second oracle {} must be deleted",
+        path.display()
+    );
+}
+
+#[test]
+fn bots_rs_spawns_bot_host_with_contract_args_and_reads_log_dir() {
+    let bots = fs::read_to_string(process_root().join("src/entity_chat/bots.rs")).expect("bots.rs");
+    let production = bots
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production bots.rs");
+    assert!(
+        production.contains("Lumio.Client.Bot.Host"),
+        "bots.rs must spawn Lumio.Client.Bot.Host"
+    );
+    assert!(
+        production.contains("LumioClientRoot"),
+        "Bot.Host path must be discovered via LumioClientRoot"
+    );
+    for flag in [
+        "--server",
+        "--account-from",
+        "--account-to",
+        "--engine-native",
+        "--log-dir",
+    ] {
+        assert!(
+            production.contains(flag),
+            "bots.rs must pass {flag} to Lumio.Client.Bot.Host"
+        );
+    }
+    assert!(
+        !production.contains(banned_startup_hooks_token())
+            && !production.contains("LUMIO_BOT_FLEET_SPEC")
+            && !production.contains("write_hook_isolation_files")
+            && !production.contains("BotHook.csproj"),
+        "bots.rs must not inject a startup hook or generate hook csproj"
     );
 }

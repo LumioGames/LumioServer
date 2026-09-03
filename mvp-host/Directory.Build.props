@@ -65,5 +65,29 @@
     Platform 之外的任何工程一律无例外。
   -->
 
+  <!--
+    Lumio.Engine.SDK 在 LumioGameEngine（旧名 LumioGameEngineArchitecture）仓内。
+    GitHub Actions 没有兄弟仓检出，因此发现顺序必须是：
+    LUMIO_ARCHITECTURE_ROOT → 兄弟仓 LumioGameEngine → 兄弟仓旧名。
+    找不到则由 App 的 RequireLumioEngineSdk 报 BLOCKED，不得静默跳过 Engine 类型。
+  -->
+  <PropertyGroup>
+    <LumioRepoRoot Condition="'$(LumioRepoRoot)' == ''">$([MSBuild]::NormalizePath('$(MSBuildThisFileDirectory)', '..'))</LumioRepoRoot>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(LumioEngineSdkProject)' == '' and '$(LUMIO_ARCHITECTURE_ROOT)' != ''">
+    <_LumioEngineSdkEnv>$([MSBuild]::NormalizePath('$(LUMIO_ARCHITECTURE_ROOT)', 'engine', 'managed', 'Lumio.Engine.SDK', 'Lumio.Engine.SDK.csproj'))</_LumioEngineSdkEnv>
+    <LumioEngineSdkProject Condition="Exists('$(_LumioEngineSdkEnv)')">$(_LumioEngineSdkEnv)</LumioEngineSdkProject>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(LumioEngineSdkProject)' == ''">
+    <_LumioEngineSdkSibling>$([MSBuild]::NormalizePath('$(LumioRepoRoot)', '..', 'LumioGameEngine', 'engine', 'managed', 'Lumio.Engine.SDK', 'Lumio.Engine.SDK.csproj'))</_LumioEngineSdkSibling>
+    <LumioEngineSdkProject Condition="Exists('$(_LumioEngineSdkSibling)')">$(_LumioEngineSdkSibling)</LumioEngineSdkProject>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(LumioEngineSdkProject)' == ''">
+    <_LumioEngineSdkLegacySibling>$([MSBuild]::NormalizePath('$(LumioRepoRoot)', '..', 'LumioGameEngineArchitecture', 'engine', 'managed', 'Lumio.Engine.SDK', 'Lumio.Engine.SDK.csproj'))</_LumioEngineSdkLegacySibling>
+    <LumioEngineSdkProject Condition="Exists('$(_LumioEngineSdkLegacySibling)')">$(_LumioEngineSdkLegacySibling)</LumioEngineSdkProject>
+  </PropertyGroup>
 
 </Project>
