@@ -1,7 +1,7 @@
 # 0006 · C# MVP host 冻结为 reference，identical suite 以 Rust replay 为交付面
 
 - 日期:2026-09-02
-- 状态:生效
+- 状态:被 [0008](0008-csharp-mvp-host-frozen-after-adr-056.md) 取代
 
 ## 背景
 

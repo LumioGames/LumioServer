@@ -33,5 +33,6 @@
 | [0003](0003-host-reconnect-window.md) | 五分钟重连窗由 Host Timer 持有，不用 Native Tick | 生效 |
 | [0004](0004-csharp-mvp-host-frozen-reference.md) | C# MVP host 在切片验收通过后冻结为 reference | 被 0005 取代 |
 | [0005](0005-csharp-mvp-host-unfrozen-until-live-11.md) | C# MVP host 在 11 场景 live-green 之前不得冻结为 reference | 被 0006 取代 |
-| [0006](0006-csharp-mvp-host-frozen-after-rust-identical-suite.md) | C# MVP host 冻结为 reference，identical suite 以 Rust replay 为交付面 | 生效 |
+| [0006](0006-csharp-mvp-host-frozen-after-rust-identical-suite.md) | C# MVP host 冻结为 reference，identical suite 以 Rust replay 为交付面 | 被 0008 取代 |
 | [0007](0007-rust-host-consume-runtime.md) | Rust entity-chat 宿主纯消费 Runtime 绑定/查询/快照与 NativeCore 定时 | 生效 |
+| [0008](0008-csharp-mvp-host-frozen-after-adr-056.md) | C# MVP host 继续冻结为 reference；冻结条件改为 Rust 宿主已按 ADR-056 通过 | 生效 |
