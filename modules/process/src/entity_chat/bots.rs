@@ -1,4 +1,4 @@
-//! Discover and spawn `Lumio.Client.Bot.Host`. S6 cadence is ClientTimerManager drain.
+//! Discover and spawn `Lumio.Client.Bot.Host`. Evidence is its log directory.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -6,11 +6,14 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::envelope::InputCommand;
 
-/// Observed Client Timer Manager drain from a Bot.Host process.
+const FLEET_WAIT: Duration = Duration::from_secs(15);
+const R4_04_BLOCKED: &str = "BLOCKED: 等 R4-04";
+
+/// Observed Bot.Host log evidence. Empty unless R4-04 Bot.Host wrote logs.
 #[derive(Debug, Clone, Default)]
 pub struct ClientBotTrace {
     pub tick_source: String,
@@ -21,7 +24,7 @@ pub struct ClientBotTrace {
     pub blocked: Option<String>,
 }
 
-/// Live Bot.Host process whose Room sockets stay open until [`ClientBotFleet::release`].
+/// Live Bot.Host process until [`ClientBotFleet::release`].
 pub struct ClientBotFleet {
     pub trace: ClientBotTrace,
     child: Option<Child>,
@@ -29,7 +32,7 @@ pub struct ClientBotFleet {
 }
 
 impl ClientBotFleet {
-    /// Lets the hook dispose Room sockets and exit after Room observed chat.event.
+    /// Signals Bot.Host to stop after Room observed chat.event.
     pub fn release(mut self) {
         self.release_mut();
     }
@@ -78,8 +81,16 @@ impl BotHostEnv for StdEnv {
     }
 }
 
-/// Locates `Lumio.Client.Bot.Host` via `LUMIO_BOT_HOST` / `LUMIO_CLIENT_ROOT` or
-/// a `LumioClient` sibling of this repo. Missing is BLOCKED.
+struct BotHostLaunch {
+    server: String,
+    account_from: String,
+    account_to: String,
+    engine_native: PathBuf,
+    log_dir: PathBuf,
+}
+
+/// Locates `Lumio.Client.Bot.Host` via `LumioClientRoot` / `LUMIO_CLIENT_ROOT` /
+/// `LUMIO_BOT_HOST` or a `LumioClient` sibling of this repo. Missing is BLOCKED.
 ///
 /// # Errors
 ///
@@ -89,7 +100,7 @@ pub fn discover_bot_host() -> Result<PathBuf, String> {
 }
 
 pub(crate) fn discover_bot_host_in(env: &dyn BotHostEnv, repo: &Path) -> Result<PathBuf, String> {
-    if let Ok(raw) = env.var("LUMIO_BOT_HOST") {
+    if let Some(raw) = env_first(env, &["LUMIO_BOT_HOST"]) {
         let path = PathBuf::from(raw);
         if path.is_file() {
             return Ok(path);
@@ -106,7 +117,7 @@ pub(crate) fn discover_bot_host_in(env: &dyn BotHostEnv, repo: &Path) -> Result<
     }
 
     let mut roots = Vec::new();
-    if let Ok(root) = env.var("LUMIO_CLIENT_ROOT") {
+    if let Some(root) = env_first(env, &["LumioClientRoot", "LUMIO_CLIENT_ROOT"]) {
         roots.push(PathBuf::from(root));
     }
     if let Some(parent) = repo.parent() {
@@ -128,7 +139,7 @@ pub(crate) fn discover_bot_host_in(env: &dyn BotHostEnv, repo: &Path) -> Result<
         }
     }
     Err(
-        "BLOCKED: Lumio.Client.Bot.Host not found (set LUMIO_CLIENT_ROOT or LUMIO_BOT_HOST)"
+        "BLOCKED: Lumio.Client.Bot.Host not found (set LumioClientRoot, LUMIO_CLIENT_ROOT, or LUMIO_BOT_HOST)"
             .to_owned(),
     )
 }
@@ -152,11 +163,11 @@ pub fn ensure_bot_host_executable(path: &Path, dotnet: &str) -> Result<PathBuf, 
     ))
 }
 
-/// Spawns `Lumio.Client.Bot.Host` so ClientTimerManager can drain native tickFrame.
+/// Spawns `Lumio.Client.Bot.Host` and reads its log directory. No injection.
 ///
 /// # Errors
 ///
-/// Returns BLOCKED when the host, hook, native ABI, or trace is missing.
+/// Returns BLOCKED when the host is missing, or when logs are absent (R4-04).
 pub fn run_client_bot_fleet<F>(
     bot_host: &Path,
     engine_native: &Path,
@@ -171,41 +182,15 @@ where
 {
     std::fs::create_dir_all(out_dir).map_err(|error| error.to_string())?;
     let host = ensure_bot_host_executable(bot_host, dotnet)?;
-    let bot_dll = bot_assembly_beside(&host)?;
-    let hook = compile_startup_hook(out_dir, &bot_dll, dotnet)?;
-    let spec_path = out_dir.join("fleet-spec.json");
-    let trace_path = out_dir.join("timer-trace.json");
-    let sent_path = out_dir.join("sent.txt");
-    let release_path = out_dir.join("release.flag");
-    let spec = json!({
-        "roomUri": room_uri,
-        "engineNative": engine_native.display().to_string(),
-        "tracePath": trace_path.display().to_string(),
-        "sentPath": sent_path.display().to_string(),
-        "releasePath": release_path.display().to_string(),
-        "advanceToTick": 15,
-        "bots": envelopes.iter().map(|(connection, envelope)| {
-            json!({
-                "connectionId": connection,
-                "envelope": envelope.to_json(),
-            })
-        }).collect::<Vec<_>>(),
-    });
-    std::fs::write(
-        &spec_path,
-        serde_json::to_string_pretty(&spec).map_err(|error| error.to_string())? + "\n",
-    )
-    .map_err(|error| error.to_string())?;
-
-    let stdout_path = out_dir.join("bot-host.stdout");
-    let stderr_path = out_dir.join("bot-host.stderr");
+    let launch = bot_host_launch(room_uri, envelopes, engine_native, out_dir);
+    let release_path = launch.log_dir.join("release.flag");
+    let stdout_path = launch.log_dir.join("bot-host.stdout");
+    let stderr_path = launch.log_dir.join("bot-host.stderr");
     let stdout = File::create(&stdout_path).map_err(|error| error.to_string())?;
     let stderr = File::create(&stderr_path).map_err(|error| error.to_string())?;
     let mut command = bot_host_command(dotnet, &host);
+    apply_bot_host_launch(&mut command, &launch);
     command
-        .env("DOTNET_STARTUP_HOOKS", &hook)
-        .env("LUMIO_BOT_FLEET_SPEC", &spec_path)
-        .env("LUMIO_ENGINE_NATIVE", engine_native)
         .env("DOTNET_NOLOGO", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -213,21 +198,22 @@ where
     let mut child = command
         .spawn()
         .map_err(|error| format!("BLOCKED: spawn Lumio.Client.Bot.Host: {error}"))?;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + FLEET_WAIT;
     loop {
         on_progress();
-        if trace_path.is_file() {
-            break;
+        if let Ok(trace) = read_bot_host_logs(&launch.log_dir) {
+            return Ok(ClientBotFleet {
+                trace,
+                child: Some(child),
+                release_path,
+            });
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                if !trace_path.is_file() {
-                    return Err(format!(
-                        "BLOCKED: Lumio.Client.Bot.Host exited {status} without ClientTimerManager trace{}",
-                        tail_logs(&stdout_path, &stderr_path)
-                    ));
-                }
-                break;
+                return Err(format!(
+                    "{R4_04_BLOCKED}: Lumio.Client.Bot.Host exited {status} without log evidence{}",
+                    tail_logs(&stdout_path, &stderr_path)
+                ));
             }
             Ok(None) => {}
             Err(error) => {
@@ -236,27 +222,14 @@ where
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
+            let _ = child.wait();
             return Err(format!(
-                "BLOCKED: Lumio.Client.Bot.Host timed out waiting for ClientTimerManager drain{}",
+                "{R4_04_BLOCKED}: Lumio.Client.Bot.Host timed out without log evidence{}",
                 tail_logs(&stdout_path, &stderr_path)
             ));
         }
         thread::sleep(Duration::from_millis(50));
     }
-    on_progress();
-    let trace = match parse_trace(&trace_path) {
-        Ok(trace) => trace,
-        Err(reason) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(reason);
-        }
-    };
-    Ok(ClientBotFleet {
-        trace,
-        child: Some(child),
-        release_path,
-    })
 }
 
 fn process_repo_root() -> PathBuf {
@@ -265,6 +238,17 @@ fn process_repo_root() -> PathBuf {
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn env_first(env: &dyn BotHostEnv, names: &[&str]) -> Option<String> {
+    for name in names {
+        if let Ok(value) = env.var(name) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 fn bot_host_under_client(root: &Path) -> Option<PathBuf> {
@@ -303,126 +287,46 @@ fn build_bot_host(csproj: &Path, dotnet: &str) -> Result<PathBuf, String> {
         .ok_or_else(|| "BLOCKED: Lumio.Client.Bot.Host.dll missing after dotnet build".to_owned())
 }
 
-fn bot_assembly_beside(host: &Path) -> Result<PathBuf, String> {
-    let dir = host
-        .parent()
-        .ok_or_else(|| "BLOCKED: Lumio.Client.Bot.Host has no directory".to_owned())?;
-    let dll = dir.join("Lumio.Client.Bot.dll");
-    if dll.is_file() {
-        Ok(dll)
+fn bot_host_launch(
+    server: &str,
+    envelopes: &[(String, InputCommand)],
+    engine_native: &Path,
+    log_dir: &Path,
+) -> BotHostLaunch {
+    let count = if envelopes.is_empty() {
+        super::BOT_COUNT
     } else {
-        Err("BLOCKED: Lumio.Client.Bot.dll missing beside Bot.Host".to_owned())
+        u32::try_from(envelopes.len())
+            .unwrap_or(super::BOT_COUNT)
+            .max(1)
+    };
+    BotHostLaunch {
+        server: server.to_owned(),
+        account_from: super::bot_name(1),
+        account_to: super::bot_name(count),
+        engine_native: engine_native.to_path_buf(),
+        log_dir: log_dir.to_path_buf(),
     }
 }
 
-fn hook_source() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src/entity_chat/bot_startup_hook/StartupHook.cs")
-}
-
-/// Stops parent (Game evidence) Directory.Build.props from failing the hook build.
-pub(crate) fn write_hook_isolation_files(hook_dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(hook_dir).map_err(|error| error.to_string())?;
-    std::fs::write(
-        hook_dir.join("Directory.Build.props"),
-        r"<Project>
-  <PropertyGroup>
-    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
-    <EnableNETAnalyzers>false</EnableNETAnalyzers>
-    <AnalysisLevel>none</AnalysisLevel>
-    <ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>
-  </PropertyGroup>
-</Project>
-",
-    )
-    .map_err(|error| error.to_string())?;
-    std::fs::write(hook_dir.join("Directory.Build.targets"), "<Project />\n")
-        .map_err(|error| error.to_string())?;
-    std::fs::write(
-        hook_dir.join("Directory.Packages.props"),
-        r"<Project>
-  <PropertyGroup>
-    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
-  </PropertyGroup>
-</Project>
-",
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-pub(crate) fn hook_compile_failure_text(stdout: &[u8], stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr);
-    let stdout = String::from_utf8_lossy(stdout);
-    let mut text = stderr.trim().to_owned();
-    let stdout = stdout.trim();
-    if !stdout.is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(stdout);
-    }
-    text
-}
-
-fn compile_startup_hook(out_dir: &Path, bot_dll: &Path, dotnet: &str) -> Result<PathBuf, String> {
-    let source = hook_source();
-    if !source.is_file() {
-        return Err(format!(
-            "BLOCKED: Bot.Host startup hook source missing: {}",
-            source.display()
-        ));
-    }
-    let hook_dir = out_dir.join("bot-hook");
-    write_hook_isolation_files(&hook_dir)?;
-    std::fs::copy(&source, hook_dir.join("StartupHook.cs")).map_err(|error| error.to_string())?;
-    let hint = bot_dll.display().to_string().replace('\\', "/");
-    let csproj = format!(
-        r#"<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
-    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
-    <EnableNETAnalyzers>false</EnableNETAnalyzers>
-    <AssemblyName>Lumio.EntityChat.BotStartupHook</AssemblyName>
-  </PropertyGroup>
-  <ItemGroup>
-    <Compile Include="StartupHook.cs" />
-    <Reference Include="Lumio.Client.Bot">
-      <HintPath>{hint}</HintPath>
-      <Private>true</Private>
-    </Reference>
-  </ItemGroup>
-</Project>
-"#
-    );
-    std::fs::write(hook_dir.join("BotHook.csproj"), csproj).map_err(|error| error.to_string())?;
-    let output = Command::new(dotnet)
-        .arg("build")
-        .arg("BotHook.csproj")
-        .arg("-c")
-        .arg("Debug")
-        .arg("--nologo")
-        .current_dir(&hook_dir)
-        .output()
-        .map_err(|error| format!("BLOCKED: compile Bot.Host startup hook: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "BLOCKED: compile Bot.Host startup hook failed: {}",
-            hook_compile_failure_text(&output.stdout, &output.stderr)
-        ));
-    }
-    let dll = hook_dir
-        .join("bin/Debug/net10.0/Lumio.EntityChat.BotStartupHook.dll")
-        .canonicalize()
-        .unwrap_or_else(|_| hook_dir.join("bin/Debug/net10.0/Lumio.EntityChat.BotStartupHook.dll"));
-    if dll.is_file() {
-        Ok(dll)
-    } else {
-        Err("BLOCKED: Bot.Host startup hook dll missing after build".to_owned())
-    }
+fn apply_bot_host_launch(command: &mut Command, launch: &BotHostLaunch) {
+    command
+        .arg("--server")
+        .arg(&launch.server)
+        .arg("--account-from")
+        .arg(&launch.account_from)
+        .arg("--account-to")
+        .arg(&launch.account_to)
+        .arg("--engine-native")
+        .arg(&launch.engine_native)
+        .arg("--log-dir")
+        .arg(&launch.log_dir)
+        .env("LumioBotServer", &launch.server)
+        .env("LumioBotAccountFrom", &launch.account_from)
+        .env("LumioBotAccountTo", &launch.account_to)
+        .env("LumioEngineNative", &launch.engine_native)
+        .env("LUMIO_ENGINE_NATIVE", &launch.engine_native)
+        .env("LumioBotLogDir", &launch.log_dir);
 }
 
 fn bot_host_command(dotnet: &str, host: &Path) -> Command {
@@ -451,53 +355,103 @@ fn tail_logs(stdout_path: &Path, stderr_path: &Path) -> String {
     logs
 }
 
-fn parse_trace(path: &Path) -> Result<ClientBotTrace, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("BLOCKED: ClientTimerManager trace missing: {error}"))?;
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("BLOCKED: ClientTimerManager trace is not JSON: {error}"))?;
-    let utterance_ticks = value
-        .get("utteranceTicks")
-        .and_then(Value::as_array)
-        .map(|rows| rows.iter().filter_map(Value::as_u64).collect::<Vec<u64>>())
-        .unwrap_or_default();
-    let tick_source = value
-        .get("tickSource")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    let blocked = value
-        .get("blocked")
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned);
-    if let Some(reason) = blocked.clone() {
-        return Err(reason);
+fn is_bot_host_log_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if name.eq_ignore_ascii_case("timer-trace.json")
+        || name.eq_ignore_ascii_case("fleet-spec.json")
+        || name.eq_ignore_ascii_case("release.flag")
+    {
+        return false;
     }
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "ndjson" | "jsonl" | "log") || name == "bot-host.stdout"
+}
+
+fn read_bot_host_logs(log_dir: &Path) -> Result<ClientBotTrace, String> {
+    let mut submitted = 0_u32;
+    let mut utterance_ticks = Vec::new();
+    let mut tick_source = String::new();
+    let mut pid = 0_u32;
+    let entries = match std::fs::read_dir(log_dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return Err(format!(
+                "{R4_04_BLOCKED}: Lumio.Client.Bot.Host logs missing"
+            ));
+        }
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() || !is_bot_host_log_file(&path) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            if let Some(source) = value.get("tickSource").and_then(Value::as_str) {
+                if tick_source.is_empty() || source == "native-kernel/tickFrame" {
+                    tick_source = source.to_owned();
+                }
+            }
+            if let Some(process_id) = value.get("pid").and_then(Value::as_u64) {
+                pid = u32::try_from(process_id).unwrap_or(pid);
+            }
+            if value.get("kind").and_then(Value::as_str) != Some("chat.input") {
+                continue;
+            }
+            submitted = submitted.saturating_add(1);
+            if let Some(tick) = value.get("tick").and_then(Value::as_u64) {
+                utterance_ticks.push(tick);
+            }
+            if let Some(ticks) = value.get("utteranceTicks").and_then(Value::as_array) {
+                for tick in ticks.iter().filter_map(Value::as_u64) {
+                    utterance_ticks.push(tick);
+                }
+            }
+        }
+    }
+    if submitted == 0 {
+        return Err(format!(
+            "{R4_04_BLOCKED}: Lumio.Client.Bot.Host logs missing chat.input lines"
+        ));
+    }
+    utterance_ticks.sort_unstable();
+    utterance_ticks.dedup();
     Ok(ClientBotTrace {
-        timer_manager_invoked: value
-            .get("timerManagerInvoked")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            && tick_source == "native-kernel/tickFrame"
+        timer_manager_invoked: tick_source == "native-kernel/tickFrame"
             && !utterance_ticks.is_empty(),
         tick_source,
         utterance_ticks,
-        submitted: u32::try_from(value.get("submitted").and_then(Value::as_u64).unwrap_or(0))
-            .unwrap_or(u32::MAX),
-        pid: u32::try_from(value.get("pid").and_then(Value::as_u64).unwrap_or(0)).unwrap_or(0),
-        blocked,
+        submitted,
+        pid,
+        blocked: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_bot_host_in, hook_compile_failure_text, write_hook_isolation_files, BotHostEnv,
-        ClientBotFleet, ClientBotTrace,
+        bot_host_launch, discover_bot_host_in, read_bot_host_logs, BotHostEnv, ClientBotFleet,
+        ClientBotTrace, R4_04_BLOCKED,
     };
     use std::collections::HashMap;
     use std::fs;
+    use std::path::Path;
 
     struct MapEnv(HashMap<String, String>);
 
@@ -516,7 +470,9 @@ mod tests {
         let err = discover_bot_host_in(&MapEnv(HashMap::new()), repo.path()).unwrap_err();
         assert!(err.starts_with("BLOCKED:"), "{err}");
         assert!(
-            err.contains("LUMIO_CLIENT_ROOT") || err.contains("LUMIO_BOT_HOST"),
+            err.contains("LumioClientRoot")
+                || err.contains("LUMIO_CLIENT_ROOT")
+                || err.contains("LUMIO_BOT_HOST"),
             "{err}"
         );
     }
@@ -552,106 +508,69 @@ mod tests {
         assert_eq!(found, csproj);
     }
 
-    const GAME_LIKE_PROPS: &str = r"<Project>
-  <PropertyGroup>
-    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <EnableNETAnalyzers>true</EnableNETAnalyzers>
-    <AnalysisLevel>latest-recommended</AnalysisLevel>
-  </PropertyGroup>
-</Project>
-";
-
-    const ANALYZER_WARN_CS: &str = r#"using System.Runtime.InteropServices;
-using System.Text.Json;
-internal static class Warn
-{
-    public static string Go(int n)
-    {
-        var options = new JsonSerializerOptions();
-        return n.ToString();
+    #[test]
+    fn lumio_client_root_pascal_is_discovered() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let csproj = tmp
+            .path()
+            .join("modules/bot/host/Lumio.Client.Bot.Host.csproj");
+        fs::create_dir_all(csproj.parent().expect("dir")).expect("dirs");
+        fs::write(&csproj, "<Project />").expect("csproj");
+        let mut env = HashMap::new();
+        env.insert(
+            "LumioClientRoot".to_owned(),
+            tmp.path().to_string_lossy().into_owned(),
+        );
+        let found = discover_bot_host_in(&MapEnv(env), tmp.path()).expect("discover");
+        assert_eq!(found, csproj);
     }
-    [DllImport("kernel32", CharSet = CharSet.Ansi)]
-    private static extern int Native(string path);
-}
-"#;
 
-    fn write_warn_csproj(dir: &std::path::Path) {
+    #[test]
+    fn launch_spec_uses_inclusive_bot_account_range() {
+        let spec = bot_host_launch(
+            "ws://127.0.0.1:1/",
+            &[],
+            Path::new("engine"),
+            Path::new("logs"),
+        );
+        assert_eq!(spec.server, "ws://127.0.0.1:1/");
+        assert_eq!(spec.account_from, "Bot01");
+        assert_eq!(spec.account_to, "Bot100");
+    }
+
+    #[test]
+    fn empty_log_dir_is_blocked_waiting_for_r4_04() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let err = read_bot_host_logs(tmp.path()).unwrap_err();
+        assert!(err.starts_with(R4_04_BLOCKED), "{err}");
+    }
+
+    #[test]
+    fn timer_trace_json_is_not_bot_host_log_evidence() {
+        let tmp = tempfile::tempdir().expect("tmp");
         fs::write(
-            dir.join("Warn.csproj"),
-            r#"<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
-    <AssemblyName>Lumio.EntityChat.BotHookWarn</AssemblyName>
-  </PropertyGroup>
-  <ItemGroup>
-    <Compile Include="Warn.cs" />
-  </ItemGroup>
-</Project>
-"#,
+            tmp.path().join("timer-trace.json"),
+            r#"{"kind":"chat.input","tickSource":"native-kernel/tickFrame","tick":5}"#,
         )
-        .expect("csproj");
-        fs::write(dir.join("Warn.cs"), ANALYZER_WARN_CS).expect("cs");
-    }
-
-    fn dotnet_build(dir: &std::path::Path) -> std::process::Output {
-        std::process::Command::new("dotnet")
-            .arg("build")
-            .arg("Warn.csproj")
-            .arg("-c")
-            .arg("Debug")
-            .arg("--nologo")
-            .current_dir(dir)
-            .output()
-            .expect("dotnet build")
+        .expect("trace");
+        let err = read_bot_host_logs(tmp.path()).unwrap_err();
+        assert!(err.starts_with(R4_04_BLOCKED), "{err}");
     }
 
     #[test]
-    fn game_parent_props_turn_hook_analyzer_warnings_into_errors() {
+    fn bot_host_ndjson_chat_input_is_log_evidence() {
         let tmp = tempfile::tempdir().expect("tmp");
-        fs::write(tmp.path().join("Directory.Build.props"), GAME_LIKE_PROPS).expect("game props");
-        let hook_dir = tmp
-            .path()
-            .join("integration/entity-chat/evidence/round-1/client-bots/bot-hook");
-        fs::create_dir_all(&hook_dir).expect("hook dir");
-        write_warn_csproj(&hook_dir);
-        let output = dotnet_build(&hook_dir);
-        assert!(
-            !output.status.success(),
-            "Game TreatWarningsAsErrors must fail an unisolated hook build"
-        );
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            text.contains("CA1869") || text.contains("CA2101") || text.contains("CA1305"),
-            "expected analyzer errors on stdout, got {text}"
-        );
-    }
-
-    #[test]
-    fn isolated_hook_dir_builds_under_game_treat_warnings_as_errors() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        fs::write(tmp.path().join("Directory.Build.props"), GAME_LIKE_PROPS).expect("game props");
-        let hook_dir = tmp
-            .path()
-            .join("integration/entity-chat/evidence/round-1/client-bots/bot-hook");
-        write_hook_isolation_files(&hook_dir).expect("isolate");
-        write_warn_csproj(&hook_dir);
-        let output = dotnet_build(&hook_dir);
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            output.status.success(),
-            "isolated hook must build under Game Directory.Build.props, got {text}"
-        );
+        fs::write(
+            tmp.path().join("bot-host.ndjson"),
+            "{\"kind\":\"chat.input\",\"tickSource\":\"native-kernel/tickFrame\",\"tick\":5}\n",
+        )
+        .expect("ndjson");
+        let trace = read_bot_host_logs(tmp.path()).expect("logs");
+        assert_eq!(trace.tick_source, "native-kernel/tickFrame");
+        assert!(trace.utterance_ticks.contains(&5));
+        assert_eq!(trace.submitted, 1);
+        assert!(trace.timer_manager_invoked);
+        assert!(trace.blocked.is_none());
     }
 
     #[test]
@@ -666,16 +585,7 @@ internal static class Warn
         fleet.release();
         assert!(
             release_path.is_file(),
-            "suite release must create the hook wait file"
-        );
-    }
-
-    #[test]
-    fn hook_compile_blocked_text_includes_stdout_when_stderr_empty() {
-        let text = hook_compile_failure_text(b"error CA1869: cache JsonSerializerOptions\n", b"");
-        assert!(
-            text.contains("CA1869"),
-            "BLOCKED suffix must keep analyzer text from stdout, got {text}"
+            "suite release must create the Bot.Host stop file"
         );
     }
 }
