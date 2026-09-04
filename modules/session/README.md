@@ -4,7 +4,7 @@
 
 ## 模块定位与目标
 
-`session` 拥有"一个连接如何成为会话、会话在断线后如何存续、会话属于哪个 WorldSlot"的全部编排。Session 一旦建立就精确固定 `productId + gameReleaseId`，跨越重连窗口保持身份与上下文。本模块的每连接记录（`ServerConnectionSession`）是 **Host 私有状态**：它不是、也不得被命名或建模为 Client 拥有的公共 `ClientReplicaSession` 状态机，不与其做状态映射，永不跨 wire（架构源 ADR-001，v1.1 明文）。Server 只保存远端 Client 的 Connection/Replication Context 句柄——Client ReplicaWorld 不是 Server WorldSlot 的物理对象。
+`session` 拥有"一个连接如何成为会话、会话在断线后如何存续、会话属于哪个 WorldSlot"的全部编排。Session 一旦建立就精确固定 `productId + gameReleaseId`，跨越重连窗口保持身份与上下文。本模块的每连接记录（`ServerConnectionSession`）是 **Host 私有状态**：它不是、也不得被命名或建模为 Client 拥有的公共 `ClientReplicaSession` 状态机，不与其做状态映射，永不跨 wire（架构源 ADR-001，v1.1 明文）。Server 只保存远端 Client 的 Connection/Replication Context 句柄——客户端 World 不是 Server WorldSlot 的物理对象。
 
 ## 负责什么
 
