@@ -24,6 +24,7 @@ use crate::wire::BUILD_INFO_SIDECAR;
 /// ABI version requested from `lumio_engine_get_api_v1`.
 pub const ABI_VERSION: u32 = 1;
 /// The only exported SDK symbol; everything else hangs off the root table.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const ENTRY_SYMBOL: &str = "lumio_engine_get_api_v1";
 
 /// SDK status codes (architecture repo `engine/abi/native-abi.json`).
@@ -111,6 +112,7 @@ pub(crate) struct ClrCall {
     pub written: u32,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 type GetApiV1 = unsafe extern "C" fn(u32, *mut *const RootApiV1) -> i32;
 
 #[cfg(windows)]
