@@ -131,8 +131,10 @@ fn host_entry_restore_persist_uses_readonly_memory() {
         .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
     let text = fs::read_to_string(&path).expect("HostEntry.cs");
     assert!(
-        text.contains("ReadOnlyMemory"),
-        "RestorePersist is ReadOnlyMemory<byte> on the Runtime public surface"
+        text.contains("CreateFromSnapshot")
+            || text.contains("Restore(")
+            || text.contains("ReadOnlyMemory"),
+        "restore must use WorldManager.CreateFromSnapshot / ServerBootstrap.Restore"
     );
     assert!(
         !text.contains("RestorePersist\", new[] { world.GetType(), typeof(byte[]) }"),
@@ -223,8 +225,12 @@ fn host_entry_resolve_forwards_ok_entity_as_binding() {
         .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
     let text = fs::read_to_string(&path).expect("HostEntry.cs");
     assert!(
-        text.contains("ListBindings") && text.contains("ResolveByNetEntityId"),
-        "Resolve OkEntity has no Binding; HostEntry must attach the listed ConnectionBinding"
+        text.contains("ResolveByNetEntityId"),
+        "Resolve must forward Runtime ResolveByNetEntityId"
+    );
+    assert!(
+        !text.contains("ListedBinding("),
+        "ListBindings must not overlay Runtime tombstoned/cross_room conclusions"
     );
     assert!(
         text.contains("x32") || text.contains("NormalizeNetEntityId"),
@@ -561,5 +567,163 @@ fn bots_rs_spawns_bot_host_with_contract_args_and_reads_log_dir() {
             && !production.contains("write_hook_isolation_files")
             && !production.contains("BotHook.csproj"),
         "bots.rs must not inject a startup hook or generate hook csproj"
+    );
+}
+
+fn host_runtime_clock_src() -> String {
+    fs::read_to_string(
+        process_root()
+            .parent()
+            .expect("modules")
+            .join("host-runtime/src/clock.rs"),
+    )
+    .expect("clock.rs")
+}
+
+fn host_entry_src() -> String {
+    fs::read_to_string(
+        process_root()
+            .parent()
+            .expect("modules")
+            .parent()
+            .expect("repo")
+            .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs"),
+    )
+    .expect("HostEntry.cs")
+}
+
+fn production_entity_chat_rs() -> Vec<(PathBuf, String)> {
+    let mut files = Vec::new();
+    collect_text_files(&process_root().join("src/entity_chat"), &mut files);
+    files
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| name != "bots.rs")
+        })
+        .filter_map(|path| fs::read_to_string(&path).ok().map(|text| (path, text)))
+        .collect()
+}
+
+#[test]
+fn production_system_clock_has_no_advance_ms_backdoor() {
+    let clock = host_runtime_clock_src();
+    let trait_body = rust_fn_src(&clock, "pub trait HostClock");
+    assert!(
+        !trait_body.contains("advance_ms"),
+        "HostClock must not declare advance_ms; production clocks have no test backdoor"
+    );
+    let system = rust_fn_src(&clock, "impl HostClock for SystemMonotonicClock");
+    assert!(
+        !system.contains("advance_ms"),
+        "SystemMonotonicClock must not implement advance_ms"
+    );
+}
+
+#[test]
+fn host_crate_has_no_account_keyed_maps() {
+    let mut hits = Vec::new();
+    for (path, text) in production_entity_chat_rs() {
+        for (index, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            let account_map = (trimmed.contains("HashMap") || trimmed.contains("BTreeMap"))
+                && (trimmed.contains("account") || trimmed.contains("Account"));
+            if account_map || trimmed.contains("account_sessions") {
+                hits.push(format!("{}:{}:{trimmed}", path.display(), index + 1));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "host crate must not keep an account-keyed HashMap/BTreeMap: {hits:?}"
+    );
+}
+
+#[test]
+fn forward_path_has_no_from_utf8_lossy() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    let wire = fs::read_to_string(process_root().join("src/entity_chat/wire.rs")).expect("wire.rs");
+    assert!(
+        !host.contains("from_utf8_lossy"),
+        "host.rs must not lossy-convert Runtime frames"
+    );
+    assert!(
+        !wire.contains("from_utf8_lossy"),
+        "wire.rs must not lossy-convert Runtime frames"
+    );
+}
+
+#[test]
+fn host_does_not_increment_its_own_tick_id() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    assert!(
+        !host.contains("self.tick_id = self.tick_id.saturating_add(1)"),
+        "Tick number must come from Runtime, not a host counter"
+    );
+    assert!(
+        !host.contains("tick_id: u64"),
+        "host session state must not own a logical tick_id"
+    );
+}
+
+#[test]
+fn host_entry_holds_world_manager_not_private_world_field() {
+    let text = host_entry_src();
+    assert!(
+        !text.contains("GetField(\"_world\"") && !text.contains("\"_world\""),
+        "HostEntry must not reflect ChatCommandRuntime._world"
+    );
+    assert!(
+        text.contains("ServerBootstrap") && text.contains("WorldManager"),
+        "HostEntry must boot Runtime WorldManager via ServerBootstrap"
+    );
+    assert!(
+        text.contains("CreateFromSnapshot") || text.contains("Restore("),
+        "HostEntry restore must use WorldManager.CreateFromSnapshot"
+    );
+}
+
+#[test]
+fn host_entry_does_not_overlay_list_bindings() {
+    let text = host_entry_src();
+    assert!(
+        !text.contains("private static Dictionary<string, object?>? ListedBinding"),
+        "delete the ListBindings fallback that covers tombstoned/cross_room"
+    );
+}
+
+#[test]
+fn owner_loop_pumps_wall_clock() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    assert!(
+        host.contains("recv_timeout") && host.contains("drive_wall"),
+        "owner loop must pump_wall_clock on a timeout, not only when harness posts work"
+    );
+}
+
+#[test]
+fn ci_cargo_entity_chat_includes_ubuntu() {
+    let yml = fs::read_to_string(
+        process_root()
+            .parent()
+            .expect("modules")
+            .parent()
+            .expect("repo")
+            .join(".github/workflows/repository-policy.yml"),
+    )
+    .expect("workflow");
+    let start = yml
+        .find("  cargo-entity-chat:\n")
+        .expect("cargo-entity-chat job");
+    let rest = &yml[start + 1..];
+    let end = rest.find("\n  cargo-").unwrap_or(rest.len());
+    let job = &rest[..end];
+    assert!(
+        job.contains("ubuntu-latest"),
+        "Cargo entity-chat job must compile on ubuntu-latest, got {job}"
     );
 }

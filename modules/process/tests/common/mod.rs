@@ -226,18 +226,19 @@ impl RuntimeSurface for ScriptedRuntime {
         room_id: &str,
         entity_type: BoundEntityKind,
     ) -> RuntimeAdmit {
-        if let Some(live) = self.retained.get(account_id) {
-            if live.live_connection.is_some() {
-                return RuntimeAdmit::reject("invalid_binding_shape");
-            }
-            return RuntimeAdmit::reject("invalid_binding_shape");
-        }
-        if self
+        if let Some(existing) = self
             .by_connection
             .values()
-            .any(|row| row.account_id == account_id && row.room_id != room_id)
+            .find(|row| row.account_id == account_id)
+            .cloned()
         {
-            return RuntimeAdmit::reject("cross_room_reference");
+            return RuntimeAdmit::already_online(existing);
+        }
+        if let Some(live) = self.retained.get(account_id) {
+            if live.live_connection.is_some() {
+                return RuntimeAdmit::already_online(live.binding.clone());
+            }
+            return RuntimeAdmit::reject("binding_not_found");
         }
         let binding = RuntimeBinding {
             account_id: account_id.to_owned(),
@@ -413,8 +414,8 @@ impl RuntimeSurface for ScriptedRuntime {
         }
     }
 
-    fn run_tick(&mut self, _room_id: &str, tick_id: u64) -> RuntimeTick {
-        self.tick = tick_id;
+    fn run_tick(&mut self, _room_id: &str, _tick_id: u64) -> RuntimeTick {
+        self.tick = self.tick.saturating_add(1);
         self.revision += 1;
         let pending = std::mem::take(&mut self.pending_chats);
         self.run_tick_input_counts.push(pending.len());
@@ -428,7 +429,7 @@ impl RuntimeSurface for ScriptedRuntime {
             };
         }
         let event_count = pending.len() as u64;
-        self.events_by_tick.insert(tick_id, pending);
+        self.events_by_tick.insert(self.tick, pending);
         RuntimeTick::committed(self.tick, self.revision, event_count)
     }
 

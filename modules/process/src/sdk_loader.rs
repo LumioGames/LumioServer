@@ -24,6 +24,7 @@ use crate::wire::BUILD_INFO_SIDECAR;
 /// ABI version requested from `lumio_engine_get_api_v1`.
 pub const ABI_VERSION: u32 = 1;
 /// The only exported SDK symbol; everything else hangs off the root table.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const ENTRY_SYMBOL: &str = "lumio_engine_get_api_v1";
 
 /// SDK status codes (architecture repo `engine/abi/native-abi.json`).
@@ -111,8 +112,10 @@ pub(crate) struct ClrCall {
     pub written: u32,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 type GetApiV1 = unsafe extern "C" fn(u32, *mut *const RootApiV1) -> i32;
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LoadLibraryW(filename: *const u16) -> isize;
@@ -171,6 +174,8 @@ pub enum LoadError {
     LibraryLoadFailed(PathBuf),
     /// `ping` probe failed (status or marker mismatch).
     PingFailed(String),
+    /// Native SDK loader is Windows-only (kernel32).
+    UnsupportedPlatform,
 }
 
 impl Display for LoadError {
@@ -203,6 +208,9 @@ impl Display for LoadError {
             Self::EntryMissing => write!(f, "export `{ENTRY_SYMBOL}` not found in DLL"),
             Self::LibraryLoadFailed(path) => write!(f, "LoadLibraryW failed: {}", path.display()),
             Self::PingFailed(detail) => write!(f, "SDK ping failed: {detail}"),
+            Self::UnsupportedPlatform => {
+                write!(f, "BLOCKED: native SDK loader is Windows-only")
+            }
         }
     }
 }
@@ -291,6 +299,7 @@ pub fn verify_sidecar(native_path: &Path) -> Result<BuildInfo, LoadError> {
 /// # Errors
 ///
 /// See [`LoadError`]; the message names the mismatching field.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn verify_root_table(root: &RootApiV1, info: &BuildInfo) -> Result<(), LoadError> {
     if root.abi_version != ABI_VERSION {
         return Err(LoadError::InvalidRootTable(format!(
@@ -513,14 +522,18 @@ impl SdkLease {
 impl Drop for SdkLease {
     fn drop(&mut self) {
         if self.module != 0 {
-            // SAFETY: the module handle came from LoadLibraryW and each
-            // successful load is balanced by exactly one FreeLibrary; all CLR
-            // hosts are destroyed before the lease drops.
-            unsafe { FreeLibrary(self.module) };
+            #[cfg(windows)]
+            {
+                // SAFETY: the module handle came from LoadLibraryW and each
+                // successful load is balanced by exactly one FreeLibrary; all CLR
+                // hosts are destroyed before the lease drops.
+                unsafe { FreeLibrary(self.module) };
+            }
         }
     }
 }
 
+#[cfg(windows)]
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -539,29 +552,39 @@ fn utf8_null(value: &str) -> Vec<u8> {
 /// See [`LoadError`]; every failure is fatal at startup (exit code 1).
 pub fn load(native_path: &Path) -> Result<SdkLease, LoadError> {
     let info = verify_sidecar(native_path)?;
-    let wide = wide_null(&native_path.to_string_lossy());
-    // SAFETY: `wide` is a valid null-terminated UTF-16 path; LoadLibraryW only
-    // reads it. The returned handle is owned by the SdkLease below.
-    let module = unsafe { LoadLibraryW(wide.as_ptr()) };
-    if module == 0 {
-        return Err(LoadError::LibraryLoadFailed(native_path.to_path_buf()));
+    #[cfg(not(windows))]
+    {
+        let _ = info;
+        let _ = native_path;
+        return Err(LoadError::UnsupportedPlatform);
     }
+    #[cfg(windows)]
+    {
+        let wide = wide_null(&native_path.to_string_lossy());
+        // SAFETY: `wide` is a valid null-terminated UTF-16 path; LoadLibraryW only
+        // reads it. The returned handle is owned by the SdkLease below.
+        let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+        if module == 0 {
+            return Err(LoadError::LibraryLoadFailed(native_path.to_path_buf()));
+        }
 
-    // SAFETY: the module handle is valid and non-zero; `load_entry` only uses
-    // it for GetProcAddress and the root-table fetch, and hands it back inside
-    // the returned lease (or it is freed by the caller below on error).
-    let lease = unsafe { load_entry(module, &info) };
-    match lease {
-        Ok(lease) => Ok(lease),
-        Err(error) => {
-            // SAFETY: module handle is valid (checked non-zero above) and this
-            // is the balancing FreeLibrary for our load.
-            unsafe { FreeLibrary(module) };
-            Err(error)
+        // SAFETY: the module handle is valid and non-zero; `load_entry` only uses
+        // it for GetProcAddress and the root-table fetch, and hands it back inside
+        // the returned lease (or it is freed by the caller below on error).
+        let lease = unsafe { load_entry(module, &info) };
+        match lease {
+            Ok(lease) => Ok(lease),
+            Err(error) => {
+                // SAFETY: module handle is valid (checked non-zero above) and this
+                // is the balancing FreeLibrary for our load.
+                unsafe { FreeLibrary(module) };
+                Err(error)
+            }
         }
     }
 }
 
+#[cfg(windows)]
 unsafe fn load_entry(module: isize, info: &BuildInfo) -> Result<SdkLease, LoadError> {
     let symbol = utf8_null(ENTRY_SYMBOL);
     // SAFETY: `symbol` is a valid null-terminated name and the module handle
@@ -797,6 +820,7 @@ mod tests {
 
     #[test]
     fn wide_and_utf8_buffers_are_null_terminated() {
+        #[cfg(windows)]
         assert_eq!(wide_null("a"), vec![0x61, 0]);
         assert_eq!(utf8_null("a"), b"a\0".to_vec());
     }

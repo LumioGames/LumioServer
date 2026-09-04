@@ -25,6 +25,8 @@ pub struct ClrGameplayConfig {
     pub entry_method: String,
     pub replication_assembly: PathBuf,
     pub ecs_assembly: PathBuf,
+    pub username_server_assembly: PathBuf,
+    pub instance_id: u64,
 }
 
 /// CoreCLR-backed [`RuntimeSurface`].
@@ -32,6 +34,8 @@ pub struct ClrGameplay {
     bridge: ClrBridge,
     replication_assembly: String,
     ecs_assembly: String,
+    username_server_assembly: String,
+    instance_id: u64,
     booted: bool,
 }
 
@@ -55,6 +59,11 @@ impl ClrGameplay {
             bridge,
             replication_assembly: config.replication_assembly.to_string_lossy().into_owned(),
             ecs_assembly: config.ecs_assembly.to_string_lossy().into_owned(),
+            username_server_assembly: config
+                .username_server_assembly
+                .to_string_lossy()
+                .into_owned(),
+            instance_id: config.instance_id,
             booted: false,
         })
     }
@@ -65,6 +74,8 @@ impl ClrGameplay {
                 "op": "boot",
                 "replicationAssembly": self.replication_assembly,
                 "ecsAssembly": self.ecs_assembly,
+                "usernameServerAssembly": self.username_server_assembly,
+                "instanceId": self.instance_id,
             });
             let body = self
                 .bridge
@@ -105,26 +116,37 @@ fn kind_from(value: Option<&str>) -> BoundEntityKind {
 
 fn binding_from(value: &Value) -> Option<RuntimeBinding> {
     Some(RuntimeBinding {
-        account_id: value.get("accountId")?.as_str()?.to_owned(),
+        account_id: value
+            .get("accountId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
         room_id: value.get("roomId")?.as_str()?.to_owned(),
         net_entity_id: value.get("netEntityId")?.as_str()?.to_owned(),
         entity_type: kind_from(value.get("entityType").and_then(Value::as_str)),
-        connection_generation: value.get("connectionGeneration")?.as_u64()?,
+        connection_generation: value
+            .get("connectionGeneration")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     })
 }
 
 fn admit_from(value: Value) -> RuntimeAdmit {
+    let code = value.get("code").and_then(Value::as_str);
+    let outcome = value.get("outcome").and_then(Value::as_str);
+    let binding = value.get("binding").and_then(binding_from);
+    if code == Some("account_already_online") || outcome == Some("account_already_online") {
+        if let Some(binding) = binding {
+            return RuntimeAdmit::already_online(binding);
+        }
+        return RuntimeAdmit::reject("account_already_online");
+    }
     if value.get("ok").and_then(Value::as_bool) == Some(true) {
-        if let Some(binding) = value.get("binding").and_then(binding_from) {
+        if let Some(binding) = binding {
             return RuntimeAdmit::ok(binding);
         }
     }
-    RuntimeAdmit::reject(
-        value
-            .get("code")
-            .and_then(Value::as_str)
-            .unwrap_or("invalid_request"),
-    )
+    RuntimeAdmit::reject(code.unwrap_or("invalid_request"))
 }
 
 impl RuntimeSurface for ClrGameplay {
@@ -204,20 +226,13 @@ impl RuntimeSurface for ClrGameplay {
         net_entity_id: &str,
     ) -> Option<RuntimeBinding> {
         let net_entity_id = normalize_net_entity_id(net_entity_id);
-        if let Some(binding) = self
-            .call(json!({
-                "op": "resolve",
-                "roomId": room_id,
-                "netEntityId": net_entity_id
-            }))
-            .ok()
-            .and_then(|value| value.get("binding").and_then(binding_from))
-        {
-            return Some(binding);
-        }
-        self.list_bindings(room_id)
-            .into_iter()
-            .find(|row| normalize_net_entity_id(&row.net_entity_id) == net_entity_id)
+        self.call(json!({
+            "op": "resolve",
+            "roomId": room_id,
+            "netEntityId": net_entity_id
+        }))
+        .ok()
+        .and_then(|value| value.get("binding").and_then(binding_from))
     }
 
     fn query_attribute(&mut self, request: &RuntimeQuery) -> QueryResult {

@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::clr::ClrGameplayConfig;
+use super::DEFAULT_INSTANCE_ID;
 
 /// Account Server + CoreCLR files required to replay the suite.
 pub struct ReplayArtifacts {
@@ -53,6 +54,21 @@ pub fn discover() -> Result<ReplayArtifacts, String> {
             "BLOCKED: Lumio.GameRuntime.Ecs.dll not found (set LUMIO_RUNTIME_ECS_DLL)".to_owned()
         })
     })?;
+    let username = env_file("LUMIO_USERNAME_SERVER_DLL").or_else(|_| {
+        runtime_dll(&repo, "Lumio.GameRuntime.Samples.Username.Server.dll").ok_or_else(|| {
+            "BLOCKED: Lumio.GameRuntime.Samples.Username.Server.dll not found (set LumioRuntimeRoot or LUMIO_USERNAME_SERVER_DLL)"
+                .to_owned()
+        })
+    })?;
+    let instance_id = std::env::var("LumioInstanceId")
+        .or_else(|_| std::env::var("LUMIO_INSTANCE_ID"))
+        .ok()
+        .and_then(|text| {
+            u64::from_str_radix(text.trim_start_matches("0x"), 16)
+                .ok()
+                .or_else(|| text.parse().ok())
+        })
+        .unwrap_or(DEFAULT_INSTANCE_ID);
 
     let hostfxr = env_file("LUMIO_HOSTFXR").or_else(|_| {
         discover_hostfxr()
@@ -73,6 +89,8 @@ pub fn discover() -> Result<ReplayArtifacts, String> {
             entry_method: "LumioEntityChatEntry".to_owned(),
             replication_assembly: replication,
             ecs_assembly: ecs,
+            username_server_assembly: username,
+            instance_id,
         },
     })
 }
@@ -96,7 +114,8 @@ fn env_dir(var: &str) -> Result<PathBuf, String> {
 }
 
 fn runtime_dll(repo: &Path, file_name: &str) -> Option<PathBuf> {
-    let root = std::env::var("LUMIO_RUNTIME_ROOT")
+    let root = std::env::var("LumioRuntimeRoot")
+        .or_else(|_| std::env::var("LUMIO_RUNTIME_ROOT"))
         .map(PathBuf::from)
         .ok()
         .or_else(|| repo.parent().map(|parent| parent.join("LumioGameRuntime")))?;
@@ -108,10 +127,16 @@ fn runtime_dll(repo: &Path, file_name: &str) -> Option<PathBuf> {
             "modules/ecs/src/Lumio.GameRuntime.Ecs/bin/Debug/net10.0/{file_name}"
         )),
         root.join(format!(
+            "modules/ecs/samples/username/bin/Debug/net10.0/{file_name}"
+        )),
+        root.join(format!(
             "modules/replication/src/Lumio.GameRuntime.Replication/bin/Release/net10.0/{file_name}"
         )),
         root.join(format!(
             "modules/ecs/src/Lumio.GameRuntime.Ecs/bin/Release/net10.0/{file_name}"
+        )),
+        root.join(format!(
+            "modules/ecs/samples/username/bin/Release/net10.0/{file_name}"
         )),
     ])
 }
@@ -135,6 +160,8 @@ fn discover_hostfxr() -> Option<PathBuf> {
 fn hostfxr_name() -> &'static str {
     if cfg!(windows) {
         "hostfxr.dll"
+    } else if cfg!(target_os = "macos") {
+        "libhostfxr.dylib"
     } else {
         "libhostfxr.so"
     }

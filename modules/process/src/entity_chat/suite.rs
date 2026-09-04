@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use lumio_host_runtime::{HostClock, NativeAbiKernel, SharedClock};
+use lumio_host_runtime::{NativeAbiKernel, SharedClock};
 use serde_json::{json, Value};
 
 use super::account::{login_or_register, AccountServerProcess};
@@ -180,7 +180,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     };
     let host = EntityChatHost::new(
         RECONNECT_WINDOW_MS,
-        SharedClock::system(),
+        SharedClock::test(),
         gameplay,
         kernel,
         ADMISSION_KEY_ID,
@@ -578,6 +578,28 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
 
     let snapshot = host.capture_persist_snapshot(MAIN_ROOM.to_owned());
     let window_before = chat_events.len();
+    let census_before = host.census(MAIN_ROOM.to_owned());
+    let last_messages_path = out_dir.join("last-messages.jsonl");
+    let mut last_messages = String::new();
+    for net_entity_id in &census_before.net_entity_ids {
+        let last = host.query_attribute(AttributeQueryRequest {
+            caller_scope: AttributeQueryScope::ServerAuthoritative,
+            room_id: MAIN_ROOM.to_owned(),
+            net_entity_id: net_entity_id.clone(),
+            attribute_id: "ChatComponent.lastMessageText".to_owned(),
+            connection_generation: None,
+        });
+        last_messages.push_str(
+            &json!({
+                "kind": "snapshot.entity",
+                "netEntityId": net_entity_id,
+                "lastMessageText": last.value,
+            })
+            .to_string(),
+        );
+        last_messages.push('\n');
+    }
+    let _ = std::fs::write(&last_messages_path, &last_messages);
     let last_before = host.query_attribute(AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
         room_id: MAIN_ROOM.to_owned(),
@@ -595,7 +617,11 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     if !snapshot.bytes.is_empty() {
         host.restore_persist_snapshot(MAIN_ROOM.to_owned(), snapshot.clone());
     }
-    let history_max = 0;
+    let history_max = host
+        .log_lines()
+        .iter()
+        .filter(|line| line.contains("\"kind\":\"event\"") && line.contains("history"))
+        .count();
     let still_bound = host.try_self_lookup("c-browser".to_owned()).is_some();
     let last_after = host.query_attribute(AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
@@ -635,8 +661,11 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     scenarios.insert(
         "7".to_owned(),
         json!({
-            "ok": persist_ok && window_before > 0 && history_max == 0 && restored_window == Some(0),
-            "snapshotEntities": snapshot.bytes.len(),
+            "ok": persist_ok && window_before > 0 && history_max == 0 && restored_window == Some(0)
+                && process_b.as_ref().is_some_and(|row| {
+                    row.get("lastMessageTextEqual") == Some(&Value::Bool(true))
+                }),
+            "snapshotEntities": census_before.total,
             "historyCountMax": history_max,
             "restoredWindow": restored_window,
             "windowBeforeSnapshot": window_before,
@@ -733,8 +762,23 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let account_99 = previous_99.account_id;
     assert!(host.disconnect("c-bot99".to_owned()));
     host.clock().advance_ms(RECONNECT_WINDOW_MS + 1_000);
+    let expire_deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < expire_deadline {
+        if host
+            .log_lines()
+            .iter()
+            .any(|line| line.contains("\"kind\":\"expire\""))
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     host.drive_kernel();
-    let expired = 1_usize;
+    let expired = host
+        .log_lines()
+        .iter()
+        .filter(|line| line.contains("\"kind\":\"expire\""))
+        .count();
     let after_expiry = login_or_register(&account.uri(), "Bot99", TEST_PASSWORD, Some(&bot_claim))
         .await
         .unwrap_or_else(|_| empty_login());
@@ -910,6 +954,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         "scenarios": scenarios,
         "browserWindow": chat_events,
     });
+    write_server_log(out_dir, &host);
     write_evidence(out_dir, &evidence, &host_audit);
     evidence
 }
@@ -1053,6 +1098,8 @@ fn spawn_restore_process(snapshot_path: &Path, out_dir: &Path) -> Option<Value> 
             .get("process")
             .and_then(Value::as_str)
             .unwrap_or("lumio-entity-chat-replay"),
+        "lastMessageTextEqual": parsed.get("lastMessageTextEqual").cloned().unwrap_or(Value::Bool(false)),
+        "compared": parsed.get("compared").cloned(),
     }))
 }
 
@@ -1157,6 +1204,15 @@ fn write_evidence(out_dir: &Path, evidence: &Value, audit: &str) {
     );
     let _ = std::fs::write(out_dir.join("host-audit.ndjson"), audit);
     let _ = std::fs::write(out_dir.join("admit-trace.ndjson"), audit);
+}
+
+fn write_server_log(out_dir: &Path, host: &EntityChatHost) {
+    let mut body = String::new();
+    for line in host.log_lines() {
+        body.push_str(&line);
+        body.push('\n');
+    }
+    let _ = std::fs::write(out_dir.join("server.ndjson"), body);
 }
 
 fn write_blocked(out_dir: &Path, reason: &str) -> Value {

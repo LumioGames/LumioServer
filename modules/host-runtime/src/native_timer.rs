@@ -7,6 +7,7 @@ use std::ptr;
 
 use crate::kernel::{KernelError, KernelFired, KernelHandle, KernelTimer, TimerMode};
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const ENTRY_SYMBOL: &str = "lumio_engine_get_api_v1";
 const WALL_DISPATCH: u32 = 1;
 const TICK_DISPATCH: u32 = 2;
@@ -84,6 +85,7 @@ struct RootApiV1 {
         Option<unsafe extern "C" fn(*mut c_void, *mut TimerDrainRecord, u32, *mut u32) -> i32>,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 type GetApiV1 = unsafe extern "C" fn(u32, *mut *const RootApiV1) -> i32;
 
 #[cfg(windows)]

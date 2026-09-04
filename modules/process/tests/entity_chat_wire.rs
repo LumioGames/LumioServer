@@ -267,7 +267,10 @@ fn runtime_snapshot_failure_does_not_send_host_minted_empty_full_snapshot() {
         "c-bot01".to_owned(),
         credential(&keys, "Bot01", true),
     );
-    assert!(admit.accepted);
+    assert!(
+        !admit.accepted,
+        "Runtime empty/failed FullSnapshot must not admit as accepted, got {admit:?}"
+    );
     let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
     let frame = client.recv_text();
     assert!(
