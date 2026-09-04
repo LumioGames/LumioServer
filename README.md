@@ -105,7 +105,7 @@ Network Reactor(s)
 
 Envelope 至少包含 `protocolVersion、length、sequence、sessionId、productId、gameReleaseId、messageType、reliability、integrity、traceId`（拼写以架构源 `schemas/replication-envelope.schema.json` 为准）。Transport ACK 和 Replication Baseline ACK 分开；未知 Baseline、Gap、旧 Revision、Schema/Release 不匹配进入稳定错误和 Full Resync/拒绝路径。
 
-Session 一旦建立就固定 `productId + gameReleaseId`。Server 侧每连接记录（`ServerConnectionSession`）是 Host 私有状态，不得命名或建模为 Client 拥有的 `ClientReplicaSession`；Client ReplicaWorld 不属于 Server WorldSlot 的物理对象（架构源 ADR-001）。
+Session 一旦建立就固定 `productId + gameReleaseId`。Server 侧每连接记录（`ServerConnectionSession`）是 Host 私有状态，不得命名或建模为 Client 拥有的 `ClientReplicaSession`；客户端 World 不属于 Server WorldSlot 的物理对象（架构源 ADR-001）。
 
 ## Release Catalog、滚动更新与维护
 
