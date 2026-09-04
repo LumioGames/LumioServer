@@ -299,6 +299,7 @@ pub fn verify_sidecar(native_path: &Path) -> Result<BuildInfo, LoadError> {
 /// # Errors
 ///
 /// See [`LoadError`]; the message names the mismatching field.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn verify_root_table(root: &RootApiV1, info: &BuildInfo) -> Result<(), LoadError> {
     if root.abi_version != ABI_VERSION {
         return Err(LoadError::InvalidRootTable(format!(
